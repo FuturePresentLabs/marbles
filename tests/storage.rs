@@ -572,3 +572,40 @@ fn metadata_attaches_merges_and_deletes() {
         "create-time external_ref lands in metadata too"
     );
 }
+
+// ---- project removal ----
+
+#[test]
+fn drop_project_cascades_edges_in_both_directions() {
+    let db = Db::in_memory().unwrap();
+    db.ensure_project("gone", "/tmp/gone", "gone").unwrap();
+    db.ensure_project("stays", "/tmp/stays", "stays").unwrap();
+    let mut spec = new("doomed");
+    spec.project = Some("gone".into());
+    let a = db.create(&spec, 100).unwrap();
+    let b = {
+        let mut s = new("survivor");
+        s.project = Some("stays".into());
+        s.available_at = Some(0);
+        db.create(&s, 100).unwrap()
+    };
+    db.add_dep(&b, &a, "t", 100).unwrap(); // edge INTO the doomed store
+    let report = db.drop_project("gone").unwrap();
+    assert_eq!(report.issues, 1);
+    assert!(db.get(&a).is_err());
+    assert_eq!(
+        db.get(&b).unwrap().dependencies.len(),
+        0,
+        "dangling edge removed, survivor intact"
+    );
+    assert!(db.stats().unwrap().get("stays").is_some());
+}
+
+#[test]
+fn drop_unknown_project_is_not_silent() {
+    let db = Db::in_memory().unwrap();
+    assert!(matches!(
+        db.drop_project("nope"),
+        Err(marbles::db::Error::NoProject(_))
+    ));
+}

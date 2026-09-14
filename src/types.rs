@@ -258,9 +258,9 @@ fn ts_from(v: &serde_json::Value) -> Option<i64> {
     match v {
         serde_json::Value::Null => None,
         serde_json::Value::Number(n) => n.as_i64(),
-        serde_json::Value::String(s) => {
-            chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.timestamp())
-        }
+        serde_json::Value::String(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|d| d.timestamp()),
         _ => None,
     }
 }

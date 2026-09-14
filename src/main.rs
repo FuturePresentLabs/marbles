@@ -156,6 +156,11 @@ enum Command {
     },
     Stats,
     Projects,
+    /// Admin operations on a tracker store (local mode).
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
+    },
     /// Import a Beads export. JSONL (from `bd export`) or the `bd list --json` array shape.
     ///
     /// `--rewrite-prefix old:new` renames a whole store's ids — for the mistake where two
@@ -244,6 +249,12 @@ struct UpdateArgs {
     /// key=value sugar for one metadata key.
     #[arg(long = "set-metadata")]
     set_metadata: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum ProjectAction {
+    /// Delete a store and every issue/edge/history row that touched it.
+    Rm { slug: String },
 }
 
 #[derive(Subcommand)]
@@ -815,6 +826,23 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
             );
             Ok(())
         }
+        Command::Project { action } => match action {
+            ProjectAction::Rm { slug } => {
+                let db = require_local(
+                    mode,
+                    "project rm writes directly; run it where the database lives",
+                )?;
+                let report = db.drop_project(slug).map_err(|e| e.to_string())?;
+                println!(
+                    "{}",
+                    serde_json::to_string(
+                        &serde_json::json!({"removed": slug, "issues": report.issues})
+                    )
+                    .map_err(|e| e.to_string())?
+                );
+                Ok(())
+            }
+        },
         Command::Projects => {
             let value: serde_json::Value = mode
                 .call("projects.list", &serde_json::json!({}), |db| {
@@ -848,8 +876,8 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
                 db.ensure_project(
                     project,
                     &root
-                    .clone()
-                    .unwrap_or_else(|| format!("unhosted/{project}")),
+                        .clone()
+                        .unwrap_or_else(|| format!("unhosted/{project}")),
                     &prefix.clone().unwrap_or_else(|| project.clone()),
                 )
                 .map_err(|e| e.to_string())?;
@@ -865,16 +893,15 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
             } else {
                 if *dry_run || rewrite_prefix.is_some() {
                     return Err(
-                        "--dry-run/--rewrite-prefix apply to the JSONL import path only"
-                            .into(),
+                        "--dry-run/--rewrite-prefix apply to the JSONL import path only".into(),
                     );
                 }
                 if let Mode::Local(db) = &mode {
                     db.ensure_project(
                         project,
                         &root
-                    .clone()
-                    .unwrap_or_else(|| format!("unhosted/{project}")),
+                            .clone()
+                            .unwrap_or_else(|| format!("unhosted/{project}")),
                         &prefix.clone().unwrap_or_else(|| project.clone()),
                     )
                     .map_err(|e| e.to_string())?;

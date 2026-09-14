@@ -220,7 +220,11 @@ async fn human_import_preserves_ids_deps_and_refuses_agents() {
         Some(&agent),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "agents must not import: {body}");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "agents must not import: {body}"
+    );
 
     let (status, body) = call(
         &app,
@@ -237,13 +241,34 @@ async fn human_import_preserves_ids_deps_and_refuses_agents() {
     assert_eq!(report["statused"], 1); // the closed one
 
     // Original ids survive the move — references, ledgers, muscle memory.
-    let (status, body) = call(&app, "issues.get", serde_json::json!({"id": "demo-aaa"}), Some(&human)).await;
+    let (status, body) = call(
+        &app,
+        "issues.get",
+        serde_json::json!({"id": "demo-aaa"}),
+        Some(&human),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body.matches("demo-aaa").count() >= 1, true);
-    let (status, _) = call(&app, "issues.get", serde_json::json!({"id": "demo-bbb"}), Some(&human)).await;
+    let (status, _) = call(
+        &app,
+        "issues.get",
+        serde_json::json!({"id": "demo-bbb"}),
+        Some(&human),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     // Closed imports stay closed: ready shows only the open one.
-    let (_, body) = call(&app, "issues.ready", serde_json::json!({"project": "demo"}), Some(&human)).await;
-    assert!(body.contains("demo-aaa") && !body.contains("demo-bbb"), "{body}");
+    let (_, body) = call(
+        &app,
+        "issues.ready",
+        serde_json::json!({"project": "demo"}),
+        Some(&human),
+    )
+    .await;
+    assert!(
+        body.contains("demo-aaa") && !body.contains("demo-bbb"),
+        "{body}"
+    );
 }

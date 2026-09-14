@@ -185,6 +185,45 @@ impl Db {
         })
     }
 
+    /// Remove a whole store: its issues, every edge that touched them, and their
+    /// history. Used by scratch fixtures and CI to make runs independent of
+    /// leftovers. Edges *pointing in* from other stores are dropped too — a
+    /// dangling blocker from a store that no longer exists must not gate anyone.
+    pub fn drop_project(&self, slug: &str) -> Result<ProjectRemoval> {
+        let mut out = ProjectRemoval::default();
+        self.tx(|tx| {
+            let exists: Option<String> = tx
+                .query_row(
+                    "SELECT slug FROM project WHERE slug = ?1",
+                    params![slug],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if exists.is_none() {
+                return Err(Error::NoProject(slug.to_string()));
+            }
+            let mine = "(SELECT id FROM issue WHERE project = ?1)";
+            let issues: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM issue WHERE project = ?1",
+                params![slug],
+                |r| r.get(0),
+            )?;
+            tx.execute(
+                &format!("DELETE FROM history WHERE issue_id IN {mine}"),
+                params![slug],
+            )?;
+            tx.execute(
+                &format!("DELETE FROM dep WHERE issue_id IN {mine} OR depends_on IN {mine}"),
+                params![slug],
+            )?;
+            tx.execute("DELETE FROM issue WHERE project = ?1", params![slug])?;
+            tx.execute("DELETE FROM project WHERE slug = ?1", params![slug])?;
+            out.issues = issues;
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     pub fn projects(&self) -> Result<Vec<(String, String, String)>> {
         let mut out = Vec::new();
         self.query(|conn| {
@@ -812,6 +851,11 @@ impl Db {
                 .collect::<serde_json::Map<_, _>>()
         ))
     }
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct ProjectRemoval {
+    pub issues: i64,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
