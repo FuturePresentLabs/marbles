@@ -128,6 +128,9 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // WAL serializes writers correctly but returns SQLITE_BUSY immediately; give contended
+        // writes (sweeper vs daemon tick vs CLI on one machine) a few seconds to queue.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self {
             conn: Mutex::new(conn),
