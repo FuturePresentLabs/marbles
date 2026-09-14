@@ -21,6 +21,8 @@ fn new(title: &str) -> NewIssue {
         project: Some("demo".into()),
         available_at: None,
         created_by: Some("tester".into()),
+        metadata: None,
+        external_ref: None,
     }
 }
 
@@ -521,4 +523,52 @@ fn labels_round_trip_and_stage_labels_survive_updates() {
     assert!(issue.labels.contains(&"alfalfa:stage:red".to_string()));
     assert!(!issue.labels.contains(&"alfalfa:stage:specced".to_string()));
     assert!(issue.description.contains("note"));
+}
+
+// ---- metadata ----
+
+#[test]
+fn metadata_attaches_merges_and_deletes() {
+    let db = db_with_project();
+    let id = db
+        .create(
+            &NewIssue {
+                metadata: Some(
+                    serde_json::json!({"alfalfa_evidence": {"expenses": []}, "drop_me": 1}),
+                ),
+                external_ref: Some("gap:F-1".into()),
+                ..new("receipted")
+            },
+            100,
+        )
+        .unwrap();
+    let issue = db.get(&id).unwrap();
+    assert_eq!(
+        issue.metadata["alfalfa_evidence"]["expenses"],
+        serde_json::json!([])
+    );
+    assert_eq!(issue.external_ref.as_deref(), Some("gap:F-1"));
+    db.update(
+        &id,
+        &IssuePatch {
+            metadata: Some(serde_json::json!({"alfalfa_evidence": {"expenses": [{"id": "e1"}]}, "drop_me": null})),
+            ..Default::default()
+        },
+        "t",
+        150,
+    )
+    .unwrap();
+    let issue = db.get(&id).unwrap();
+    assert_eq!(
+        issue.metadata["alfalfa_evidence"]["expenses"][0]["id"],
+        "e1"
+    );
+    assert!(
+        issue.metadata.get("drop_me").is_none(),
+        "null deletes; merge is shallow"
+    );
+    assert_eq!(
+        issue.metadata["external_ref"], "gap:F-1",
+        "create-time external_ref lands in metadata too"
+    );
 }

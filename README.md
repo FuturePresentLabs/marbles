@@ -69,6 +69,9 @@ open ──(claim)──> in_progress ──(PR opened)──> review ──(mer
   held. Cycles are refused at edge-creation time.
 - **History is append-only.** Every create, claim, renew, release, status, and
   close is an event; a bead can always explain itself (`marbles history <id>`).
+- **Metadata is a first-class sidecar.** Tools attach structured receipts to
+  work (`--set-metadata key=value`, `--metadata @file`, RFC-7386 shallow merge,
+  null deletes) without inventing label grammars for JSON.
 
 ## Identity
 

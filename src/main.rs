@@ -180,7 +180,12 @@ enum Command {
 #[derive(clap::Args)]
 struct CreateArgs {
     title: String,
-    #[arg(short = 't', long, default_value = "task")]
+    #[arg(
+        short = 't',
+        long = "issue-type",
+        alias = "type",
+        default_value = "task"
+    )]
     issue_type: String,
     #[arg(short = 'p', long, default_value_t = 2)]
     priority: i64,
@@ -196,6 +201,12 @@ struct CreateArgs {
     id: Option<String>,
     #[arg(long)]
     project: Option<String>,
+    /// JSON object (inline, @file, or - for stdin) merged into the issue metadata.
+    #[arg(long)]
+    metadata: Option<String>,
+    /// Stable pointer to the external system this issue mirrors (gap findings, imports).
+    #[arg(long)]
+    external_ref: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -211,6 +222,12 @@ struct UpdateArgs {
     append_notes: Option<String>,
     #[arg(long)]
     title: Option<String>,
+    /// JSON object merged into metadata (null values delete keys).
+    #[arg(long)]
+    metadata: Option<String>,
+    /// key=value sugar for one metadata key.
+    #[arg(long = "set-metadata")]
+    set_metadata: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -417,6 +434,8 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
                 project: Some(project),
                 available_at: None,
                 created_by: Some(actor.clone()),
+                metadata: json_arg(args.metadata.as_deref())?,
+                external_ref: args.external_ref.clone(),
             };
             let id: String = match mode {
                 Mode::Local(db) => db.create(&spec, now()).map_err(|e| e.to_string())?,
@@ -494,6 +513,19 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
             Ok(())
         }
         Command::Update(args) => {
+            let metadata = match (json_arg(args.metadata.as_deref())?, &args.set_metadata) {
+                (base, Some(kv)) => {
+                    let (key, value) = kv
+                        .split_once('=')
+                        .ok_or_else(|| format!("--set-metadata wants key=value, got {kv}"))?;
+                    let mut base = base.unwrap_or_else(|| serde_json::json!({}));
+                    base.as_object_mut()
+                        .expect("json_arg built an object")
+                        .insert(key.to_string(), serde_json::json!(value));
+                    Some(base)
+                }
+                (base, None) => base,
+            };
             let patch = IssuePatch {
                 title: args.title.clone(),
                 description: args
@@ -506,6 +538,7 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
                 append_notes: args.append_notes.clone(),
                 available_at: None,
                 evidence: None,
+                metadata,
             };
             let body = serde_json::json!({"id": args.id, "patch": patch});
             let issue: Issue = mode
@@ -838,6 +871,22 @@ fn require_local<'a>(mode: &'a Mode, hint: &str) -> Result<&'a Arc<Db>, String> 
     match mode {
         Mode::Local(db) => Ok(db),
         Mode::Http(_) => Err(hint.to_string()),
+    }
+}
+
+/// Parse an optional JSON argument passed inline, as @file, or as `-`.
+fn json_arg(value: Option<&str>) -> Result<Option<serde_json::Value>, String> {
+    match value {
+        None => Ok(None),
+        Some(text) => {
+            let text = read_text_arg(Some(text))?;
+            let value: serde_json::Value = serde_json::from_str(&text)
+                .map_err(|e| format!("metadata must be a JSON object: {e}"))?;
+            if !value.is_object() {
+                return Err("metadata must be a JSON object".into());
+            }
+            Ok(Some(value))
+        }
     }
 }
 

@@ -43,7 +43,9 @@ CREATE TABLE IF NOT EXISTS issue(
   updated_at   INTEGER NOT NULL,
   closed_at    INTEGER,
   close_reason TEXT,
-  evidence_json TEXT NOT NULL DEFAULT '[]'
+  evidence_json TEXT NOT NULL DEFAULT '[]',
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  external_ref TEXT
 );
 CREATE INDEX IF NOT EXISTS issue_open ON issue(status, project);
 CREATE INDEX IF NOT EXISTS issue_expiry ON issue(expires_at);
@@ -242,15 +244,30 @@ impl Db {
                 },
             };
             let labels = serde_json::to_string(&spec.labels)?;
+            let metadata = match spec.metadata.clone().unwrap_or_else(|| serde_json::json!({})) {
+                serde_json::Value::Object(map) => serde_json::Value::Object(map),
+                other => other,
+            };
+            let metadata_json = if metadata.is_object() {
+                metadata.as_object().unwrap().clone()
+            } else {
+                return Err(Error::Bad("create metadata must be a JSON object".into()));
+            };
+            let mut metadata_json = metadata_json;
+            if let Some(reference) = &spec.external_ref {
+                metadata_json.insert("external_ref".into(), serde_json::json!(reference));
+            }
             let priority = if spec.priority == 0 { 2 } else { spec.priority };
             tx.execute(
                 "INSERT INTO issue(id, project, title, description, status, issue_type, priority,
-                                   parent, labels_json, available_at, created_by, created_at, updated_at)
-                 VALUES (?1,?2,?3,?4,'open',?6,?7,?8,?9,?10,?11,?5,?5)",
+                                   parent, labels_json, available_at, created_by, created_at, updated_at,
+                                   metadata_json, external_ref)
+                 VALUES (?1,?2,?3,?4,'open',?6,?7,?8,?9,?10,?11,?5,?5,?12,?13)",
                 params![
                     id, project, spec.title, spec.description, at, spec.issue_type,
                     priority, spec.parent, labels, grace_available,
-                    spec.created_by.clone().unwrap_or_default()
+                    spec.created_by.clone().unwrap_or_default(),
+                    serde_json::to_string(&metadata_json)?, spec.external_ref
                 ],
             )?;
             log_event(tx, &id, at, spec.created_by.as_deref().unwrap_or("system"), "created", &spec.title)?;
@@ -372,6 +389,30 @@ impl Db {
             if let Some(evidence) = &patch.evidence {
                 current.evidence = evidence.clone();
             }
+            if let Some(merge) = &patch.metadata {
+                let mut map = match std::mem::take(&mut current.metadata) {
+                    serde_json::Value::Object(map) => map,
+                    _ => serde_json::Map::new(),
+                };
+                match merge {
+                    serde_json::Value::Object(incoming) => {
+                        for (key, value) in incoming {
+                            if value.is_null() {
+                                map.remove(key);
+                            } else {
+                                map.insert(key.clone(), value.clone());
+                            }
+                        }
+                    }
+                    _ => return Err(Error::Bad("metadata patch must be a JSON object".into())),
+                }
+                current.metadata = serde_json::Value::Object(map);
+                current.external_ref = current
+                    .metadata
+                    .get("external_ref")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+            }
             let status_changed = patch.status.as_deref().is_some_and(|s| s != current.status);
             if let Some(status) = &patch.status {
                 current.status = status.clone();
@@ -386,12 +427,14 @@ impl Db {
                 .unwrap_or_else(|| (at + self.policy.edit_deferral_seconds).max(current.available_at.unwrap_or(0)));
             tx.execute(
                 "UPDATE issue SET title=?2, description=?3, priority=?4, status=?5, closed_at=?6,
-                        labels_json=?7, parent=?8, available_at=?9, updated_at=?10, evidence_json=?11
+                        labels_json=?7, parent=?8, available_at=?9, updated_at=?10, evidence_json=?11,
+                        metadata_json=?12, external_ref=?13
                  WHERE id=?1",
                 params![
                     id, current.title, current.description, current.priority, current.status,
                     current.closed_at, serde_json::to_string(&current.labels)?, current.parent,
-                    available_at, at, serde_json::to_string(&current.evidence)?
+                    available_at, at, serde_json::to_string(&current.evidence)?,
+                    serde_json::to_string(&current.metadata)?, current.external_ref
                 ],
             )?;
             if status_changed {
@@ -802,11 +845,13 @@ fn row_to_issue(conn: &rusqlite::Connection, id: &str) -> Result<Option<Issue>> 
         i64,
         String,
         Option<i64>,
+        String,
+        Option<String>,
     )> = conn
         .query_row(
             "SELECT id, title, description, status, issue_type, priority, parent, labels_json,
                     assignee, actor_kind, expires_at, available_at, created_at, updated_at, project,
-                    closed_at
+                    closed_at, metadata_json, external_ref
              FROM issue WHERE id = ?1",
             params![id],
             |r| {
@@ -827,6 +872,8 @@ fn row_to_issue(conn: &rusqlite::Connection, id: &str) -> Result<Option<Issue>> 
                     r.get(13)?,
                     r.get(14)?,
                     r.get(15)?,
+                    r.get(16)?,
+                    r.get(17)?,
                 ))
             },
         )
@@ -848,6 +895,8 @@ fn row_to_issue(conn: &rusqlite::Connection, id: &str) -> Result<Option<Issue>> 
         updated_at,
         project,
         closed_at,
+        metadata_json,
+        external_ref,
     )) = base
     else {
         return Ok(None);
@@ -878,8 +927,11 @@ fn row_to_issue(conn: &rusqlite::Connection, id: &str) -> Result<Option<Issue>> 
         params![id],
         |r| r.get(0),
     )?;
+    let metadata: serde_json::Value = serde_json::from_str(&metadata_json)?;
     Ok(Some(Issue {
         id,
+        metadata,
+        external_ref,
         title,
         description,
         status,

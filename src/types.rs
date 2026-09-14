@@ -96,6 +96,12 @@ pub struct Issue {
     pub issue_type: String,
     #[serde(default)]
     pub labels: Vec<String>,
+    /// Structured sidecar for tools that attach receipts to work (cost evidence, session
+    /// ownership, external refs). RFC-7386-lite: a shallow object merge; null values delete.
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_ref: Option<String>,
     /// Unresolved outbound blockers (open things this issue waits on).
     #[serde(default)]
     pub dependency_count: i64,
@@ -152,6 +158,10 @@ pub struct NewIssue {
     pub available_at: Option<i64>,
     #[serde(default)]
     pub created_by: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    pub external_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -172,6 +182,9 @@ pub struct IssuePatch {
     /// state where the evidence exists but nobody has merged it yet.
     #[serde(default)]
     pub evidence: Option<Vec<Evidence>>,
+    /// Shallow-merged into the stored metadata; null values remove their key.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -53,6 +53,8 @@ pub fn import(db: &Db, project: &str, rows: &[Issue]) -> Result<Report, String> 
             // Imported work predates the swarm policy; it does not get a grace period retroactively.
             available_at: Some(0),
             created_by: Some("marbles-import".to_string()),
+            metadata: None,
+            external_ref: None,
         };
         let created_at = if row.created_at > 0 {
             row.created_at
@@ -124,6 +126,8 @@ mod tests {
                 .collect(),
             parent: None,
             evidence: Vec::new(),
+            metadata: serde_json::json!({}),
+            external_ref: None,
             assignee: None,
             actor_kind: None,
             expires_at: None,
