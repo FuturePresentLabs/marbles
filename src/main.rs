@@ -847,7 +847,9 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
                 )?;
                 db.ensure_project(
                     project,
-                    &root.clone().unwrap_or_else(|| ".".into()),
+                    &root
+                    .clone()
+                    .unwrap_or_else(|| format!("unhosted/{project}")),
                     &prefix.clone().unwrap_or_else(|| project.clone()),
                 )
                 .map_err(|e| e.to_string())?;
@@ -870,7 +872,9 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
                 if let Mode::Local(db) = &mode {
                     db.ensure_project(
                         project,
-                        &root.clone().unwrap_or_else(|| ".".into()),
+                        &root
+                    .clone()
+                    .unwrap_or_else(|| format!("unhosted/{project}")),
                         &prefix.clone().unwrap_or_else(|| project.clone()),
                     )
                     .map_err(|e| e.to_string())?;

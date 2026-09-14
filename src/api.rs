@@ -443,8 +443,14 @@ async fn issues_import(
             "only a human principal may import a tracker".to_string(),
         )));
     }
+    // An HTTP import has no checkout to bind to; the placeholder keeps the
+    // per-project root unique until `marbles init` claims a real path.
     api.db
-        .ensure_project(&body.project, ".", &body.project)
+        .ensure_project(
+            &body.project,
+            &format!("unhosted/{}", body.project),
+            &body.project,
+        )
         .map_err(|e| ApiError(ApiErrorKind::Db(e)))?;
     crate::import::import(&api.db, &body.project, &body.rows)
         .map(Json)
