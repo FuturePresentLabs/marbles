@@ -121,16 +121,16 @@ pub struct Issue {
     #[serde(default)]
     pub actor_kind: Option<String>,
     /// Epoch seconds. The claim lapses at this instant unless heartbeated.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_ts_opt")]
     pub expires_at: Option<i64>,
     /// Epoch seconds. Ready-set eligibility starts here: creation grace plus edit deferral.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_ts_opt")]
     pub available_at: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_ts_opt")]
     pub closed_at: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_ts")]
     pub created_at: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_ts")]
     pub updated_at: i64,
     #[serde(default)]
     pub project: String,
@@ -249,4 +249,34 @@ impl Default for Policy {
             max_ttl_seconds: 7 * 24 * 3600,
         }
     }
+}
+
+/// A timestamp in a foreign export may be epoch seconds (marbles-native)
+/// or an RFC-3339 string (what `bd list --json` actually emits). Accept
+/// both; unreadable values land on 0/None rather than failing the row.
+fn ts_from(v: &serde_json::Value) -> Option<i64> {
+    match v {
+        serde_json::Value::Null => None,
+        serde_json::Value::Number(n) => n.as_i64(),
+        serde_json::Value::String(s) => {
+            chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.timestamp())
+        }
+        _ => None,
+    }
+}
+
+fn de_ts<'de, D>(d: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(ts_from(&v).unwrap_or(0))
+}
+
+fn de_ts_opt<'de, D>(d: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(ts_from(&v))
 }

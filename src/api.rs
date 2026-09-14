@@ -47,6 +47,7 @@ impl Api {
             .route("/v1/claims.release", post(claims_release))
             .route("/v1/claims.sweep", post(claims_sweep))
             .route("/v1/history.get", post(history_get))
+            .route("/v1/issues.import", post(issues_import))
             .route("/v1/stats", post(stats))
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&self),
@@ -423,6 +424,33 @@ async fn claims_release(
 
 /// Sweeping requeues other people's work; it is an operator action, and agent tokens — including
 /// a daemon's — may not perform it.
+#[derive(Deserialize)]
+struct ImportBody {
+    project: String,
+    rows: Vec<Issue>,
+}
+
+/// Bulk Beads-era import over HTTP. Human principals only, same posture as
+/// sweeps: an import rewrites history, so it is never an agent-side door.
+async fn issues_import(
+    State(api): State<Arc<Api>>,
+    Extension(principal): Extension<Principal>,
+    Json(body): Json<ImportBody>,
+) -> Res<crate::import::Report> {
+    if principal.kind != ActorKind::Human {
+        return Err(ApiError(ApiErrorKind::Status(
+            StatusCode::FORBIDDEN,
+            "only a human principal may import a tracker".to_string(),
+        )));
+    }
+    api.db
+        .ensure_project(&body.project, ".", &body.project)
+        .map_err(|e| ApiError(ApiErrorKind::Db(e)))?;
+    crate::import::import(&api.db, &body.project, &body.rows)
+        .map(Json)
+        .map_err(|e| ApiError(ApiErrorKind::Status(StatusCode::BAD_REQUEST, e)))
+}
+
 async fn claims_sweep(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,

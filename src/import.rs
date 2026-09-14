@@ -18,13 +18,17 @@ pub fn read_export(path: &str) -> Result<Vec<Issue>, String> {
     } else {
         text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
     }
+    parse_rows(&text).map_err(|e| format!("{path}: {e}"))
+}
+
+pub fn parse_rows(text: &str) -> Result<Vec<Issue>, String> {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Export {
         Array(Vec<Issue>),
         Wrapped { issues: Vec<Issue> },
     }
-    let export: Export = serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
+    let export: Export = serde_json::from_str(text).map_err(|e| e.to_string())?;
     Ok(match export {
         Export::Array(rows) => rows,
         Export::Wrapped { issues } => issues,
@@ -95,7 +99,7 @@ pub fn import(db: &Db, project: &str, rows: &[Issue]) -> Result<Report, String> 
     Ok(report)
 }
 
-#[derive(Debug, Default, PartialEq, serde::Serialize)]
+#[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Report {
     pub issues: i64,
     pub deps: i64,
@@ -183,5 +187,25 @@ mod tests {
             .map(|i| i.id)
             .collect();
         assert_eq!(ready, vec!["demo-b"]);
+    }
+}
+
+#[cfg(test)]
+mod bd_shape_tests {
+    use super::*;
+
+    #[test]
+    fn real_bd_timestamps_parse() {
+        let json = r#"[{"id":"x-1","title":"t","status":"closed","priority":2,
+            "issue_type":"task","created_at":"2026-03-14T20:22:24.512074Z",
+            "updated_at":"2026-03-15T01:02:03Z","closed_at":"2026-03-15T01:02:03Z",
+            "dependency_count":0,"dependent_count":0,"owner":"o","comment_count":0,
+            "close_reason":"done","started_at":null,"assignee":null,"description":""}]"#;
+        let rows = parse_rows(json).expect("bd export must parse");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].created_at > 1_700_000_000);
+        assert!(rows[0].closed_at.unwrap() > 0);
+        // null started_at etc. must not break anything:
+        let _ = rows[0].available_at;
     }
 }

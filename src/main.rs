@@ -824,18 +824,23 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
             root,
             prefix,
         } => {
-            let db = require_local(
-                mode,
-                "import-bd writes directly; run it where the database lives",
-            )?;
-            db.ensure_project(
-                project,
-                &root.clone().unwrap_or_else(|| ".".into()),
-                &prefix.clone().unwrap_or_else(|| project.clone()),
-            )
-            .map_err(|e| e.to_string())?;
+            if let Mode::Local(db) = &mode {
+                db.ensure_project(
+                    project,
+                    &root.clone().unwrap_or_else(|| ".".into()),
+                    &prefix.clone().unwrap_or_else(|| project.clone()),
+                )
+                .map_err(|e| e.to_string())?;
+                // In server mode the project must already be registered
+                // (`marbles init` with MARBLES_URL); the API enforces it.
+            }
             let rows = marbles::import::read_export(file)?;
-            let report = marbles::import::import(db, project, &rows)?;
+            let body = serde_json::json!({"project": project, "rows": rows});
+            let report = mode
+                .call("issues.import", &body, |db| {
+                    marbles::import::import(db, project, &rows)
+                })
+                .await?;
             println!(
                 "{}",
                 serde_json::to_string(&report).map_err(|e| e.to_string())?
@@ -868,13 +873,6 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
             );
             Ok(())
         }
-    }
-}
-
-fn require_local<'a>(mode: &'a Mode, hint: &str) -> Result<&'a Arc<Db>, String> {
-    match mode {
-        Mode::Local(db) => Ok(db),
-        Mode::Http(_) => Err(hint.to_string()),
     }
 }
 

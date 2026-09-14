@@ -200,3 +200,50 @@ async fn a_second_agent_watching_the_list_sees_the_first_agents_claim() {
         "the merged view knows who owns what"
     );
 }
+
+#[tokio::test]
+async fn human_import_preserves_ids_deps_and_refuses_agents() {
+    let (app, dir) = app();
+    let agent = token_file(dir.path(), "agent-worker");
+    let human = token_file(dir.path(), "human-avery");
+
+    let rows = serde_json::json!([
+        {"id": "demo-aaa", "title": "open work", "status": "open", "priority": 1,
+         "issue_type": "feature", "dependencies": [], "closed_at": null},
+        {"id": "demo-bbb", "title": "shipped work", "status": "closed", "priority": 2,
+         "issue_type": "task", "dependencies": [{"depends_on_id": "demo-aaa"}], "closed_at": null},
+    ]);
+    let (status, body) = call(
+        &app,
+        "issues.import",
+        serde_json::json!({"project": "demo", "rows": rows}),
+        Some(&agent),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "agents must not import: {body}");
+
+    let (status, body) = call(
+        &app,
+        "issues.import",
+        serde_json::json!({"project": "demo", "rows": rows}),
+        Some(&human),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(report["issues"], 2);
+    assert_eq!(report["deps"], 1);
+    assert_eq!(report["missing_deps"], 0);
+    assert_eq!(report["statused"], 1); // the closed one
+
+    // Original ids survive the move — references, ledgers, muscle memory.
+    let (status, body) = call(&app, "issues.get", serde_json::json!({"id": "demo-aaa"}), Some(&human)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.matches("demo-aaa").count() >= 1, true);
+    let (status, _) = call(&app, "issues.get", serde_json::json!({"id": "demo-bbb"}), Some(&human)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Closed imports stay closed: ready shows only the open one.
+    let (_, body) = call(&app, "issues.ready", serde_json::json!({"project": "demo"}), Some(&human)).await;
+    assert!(body.contains("demo-aaa") && !body.contains("demo-bbb"), "{body}");
+}
