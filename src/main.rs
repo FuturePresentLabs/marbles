@@ -199,6 +199,10 @@ struct CreateArgs {
     /// Stable id for idempotent creation (crash between write and receipt recovery).
     #[arg(long)]
     id: Option<String>,
+    /// Epoch seconds to override the creation grace (0 = swarm-visible immediately).
+    /// Machine-created pipeline work uses this; humans keep the default deferral.
+    #[arg(long)]
+    available_at: Option<i64>,
     #[arg(long)]
     project: Option<String>,
     /// JSON object (inline, @file, or - for stdin) merged into the issue metadata.
@@ -432,7 +436,7 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
                 parent: args.parent.clone(),
                 id: args.id.clone(),
                 project: Some(project),
-                available_at: None,
+                available_at: args.available_at,
                 created_by: Some(actor.clone()),
                 metadata: json_arg(args.metadata.as_deref())?,
                 external_ref: args.external_ref.clone(),
