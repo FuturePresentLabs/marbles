@@ -673,10 +673,44 @@ impl Db {
         if evidence.is_empty() {
             return Err(Error::NoEvidence(id.to_string()));
         }
+        self.check_blockers(id)?;
         self.close_unchecked(id, reason, evidence, actor, at)
     }
 
-    pub(super) fn close_unchecked(
+    /// Refuse to close past a blocker that has not reached a terminal state — the invariant
+    /// that keeps the dependency graph honest on the normal path.
+    fn check_blockers(&self, id: &str) -> Result<()> {
+        let mut out = Ok(());
+        self.query(|conn| {
+            let mut stmt = conn.prepare("SELECT depends_on FROM dep WHERE issue_id = ?1")?;
+            let blockers: Vec<String> = stmt
+                .query_map(params![id], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            drop(stmt);
+            for blocker in blockers {
+                let status: Option<String> = conn
+                    .query_row(
+                        "SELECT status FROM issue WHERE id = ?1",
+                        params![blocker],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if status.as_deref().is_some_and(|s| !is_terminal(s)) {
+                    out = Err(Error::Bad(format!(
+                        "{id} still waits on {blocker}; close it first or remove the dependency"
+                    )));
+                    return Ok(());
+                }
+            }
+            Ok(())
+        })?;
+        out
+    }
+
+    /// Close without the evidence or blocker gates. Only the importer (landing source state it
+    /// does not own) and supersession (whose gate is the operator's decision, already made)
+    /// may call this.
+    pub(crate) fn close_unchecked(
         &self,
         id: &str,
         reason: Option<&str>,
@@ -685,21 +719,6 @@ impl Db {
         at: i64,
     ) -> Result<Issue> {
         self.tx(|tx| {
-            let mut stmt = tx.prepare("SELECT depends_on FROM dep WHERE issue_id = ?1")?;
-            let blockers: Vec<String> = stmt
-                .query_map(params![id], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            drop(stmt);
-            for blocker in blockers {
-                let status: Option<String> = tx
-                    .query_row("SELECT status FROM issue WHERE id = ?1", params![blocker], |r| r.get(0))
-                    .optional()?;
-                if status.as_deref().is_some_and(|s| !is_terminal(s)) {
-                    return Err(Error::Bad(format!(
-                        "{id} still waits on {blocker}; close it first or remove the dependency"
-                    )));
-                }
-            }
             // Evidence accumulates: the PR recorded at `review` and the merge receipt added
             // now are both part of the delivery history of this issue.
             let existing: Vec<Evidence> = serde_json::from_str(

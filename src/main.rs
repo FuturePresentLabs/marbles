@@ -156,7 +156,13 @@ enum Command {
     },
     Stats,
     Projects,
-    /// Import a Beads export: `bd list --all --json > beads.json && marbles import-bd beads.json`
+    /// Import a Beads export. JSONL (from `bd export`) or the `bd list --json` array shape.
+    ///
+    /// `--rewrite-prefix old:new` renames a whole store's ids — for the mistake where two
+    /// independent trackers were configured with the same prefix (e.g. `pedalkernel-pro` sharing
+    /// `pedalkernel`). Ids are otherwise kept verbatim. Re-running is safe: matching rows are
+    /// `unchanged`, and a row that exists with different content aborts as a conflict without
+    /// writing anything.
     ImportBd {
         file: String,
         #[arg(long)]
@@ -165,6 +171,12 @@ enum Command {
         root: Option<String>,
         #[arg(long)]
         prefix: Option<String>,
+        /// Rename ids on the way in, e.g. `--rewrite-prefix pedalkernel:pedalkernel-pro`.
+        #[arg(long, value_parser = parse_pair)]
+        rewrite_prefix: Option<(String, String)>,
+        /// Validate and report without writing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Install or refresh the managed instruction block in AGENTS.md/CLAUDE.md.
     Setup {
@@ -823,28 +835,64 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
             project,
             root,
             prefix,
+            rewrite_prefix,
+            dry_run,
         } => {
-            if let Mode::Local(db) = &mode {
+            let jsonl = looks_like_jsonl(file)?;
+            let report = if jsonl {
+                let db = require_local(
+                    mode,
+                    "JSONL import (with --rewrite-prefix/--dry-run) writes directly; \
+                     run it where the database lives, or convert to the array form for HTTP",
+                )?;
                 db.ensure_project(
                     project,
                     &root.clone().unwrap_or_else(|| ".".into()),
                     &prefix.clone().unwrap_or_else(|| project.clone()),
                 )
                 .map_err(|e| e.to_string())?;
-                // In server mode the project must already be registered
-                // (`marbles init` with MARBLES_URL); the API enforces it.
-            }
-            let rows = marbles::import::read_export(file)?;
-            let body = serde_json::json!({"project": project, "rows": rows});
-            let report = mode
-                .call("issues.import", &body, |db| {
-                    marbles::import::import(db, project, &rows)
-                })
-                .await?;
+                let rows = marbles::jsonl::read_jsonl(file).map_err(|e| e.to_string())?;
+                let pair = rewrite_prefix
+                    .as_ref()
+                    .map(|(a, b)| (a.as_str(), b.as_str()));
+                serde_json::to_value(
+                    marbles::jsonl::import(db, project, &rows, pair, *dry_run)
+                        .map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?
+            } else {
+                if *dry_run || rewrite_prefix.is_some() {
+                    return Err(
+                        "--dry-run/--rewrite-prefix apply to the JSONL import path only"
+                            .into(),
+                    );
+                }
+                if let Mode::Local(db) = &mode {
+                    db.ensure_project(
+                        project,
+                        &root.clone().unwrap_or_else(|| ".".into()),
+                        &prefix.clone().unwrap_or_else(|| project.clone()),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    // In server mode the project must already be registered
+                    // (`marbles init` with MARBLES_URL); the API enforces it.
+                }
+                let rows = marbles::import::read_export(file)?;
+                let body = serde_json::json!({"project": project, "rows": rows});
+                let imported: marbles::import::Report = mode
+                    .call("issues.import", &body, |db| {
+                        marbles::import::import(db, project, &rows)
+                    })
+                    .await?;
+                serde_json::to_value(imported).map_err(|e| e.to_string())?
+            };
             println!(
                 "{}",
-                serde_json::to_string(&report).map_err(|e| e.to_string())?
+                serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
             );
+            if *dry_run {
+                eprintln!("dry run: nothing written");
+            }
             Ok(())
         }
         Command::Setup {
@@ -874,6 +922,40 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+fn require_local<'a>(mode: &'a Mode, hint: &str) -> Result<&'a Arc<Db>, String> {
+    match mode {
+        Mode::Local(db) => Ok(db),
+        Mode::Http(_) => Err(hint.to_string()),
+    }
+}
+
+/// clap value parser for `old:new`.
+fn parse_pair(text: &str) -> Result<(String, String), String> {
+    let (from, to) = text
+        .split_once(':')
+        .ok_or_else(|| format!("--rewrite-prefix wants old:new, got {text:?}"))?;
+    if from.is_empty() || to.is_empty() {
+        return Err(format!(
+            "--rewrite-prefix parts must be non-empty: {text:?}"
+        ));
+    }
+    Ok((from.to_string(), to.to_string()))
+}
+
+/// JSONL if any line begins with `{` and carries `_type`; the array form begins with `[`.
+fn looks_like_jsonl(path: &str) -> Result<bool, String> {
+    let mut buf = [0u8; 8192];
+    let mut file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let n = std::io::Read::read(&mut file, &mut buf).unwrap_or(0);
+    let head = String::from_utf8_lossy(&buf[..n]);
+    let first = head
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or_default();
+    Ok(first.starts_with('{') && first.contains("\"_type\""))
 }
 
 /// Parse an optional JSON argument passed inline, as @file, or as `-`.

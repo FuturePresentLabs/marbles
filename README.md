@@ -145,13 +145,31 @@ in the begin-line so drift is visible. Profiles:
 ## Migrating from Beads
 
 ```bash
-bd list --all --json > beads.json
-marbles import-bd beads.json --project myrepo
+bd export > beads.jsonl            # one store from inside its git checkout
+mb import-bd beads.jsonl --project myrepo [--dry-run]
 ```
 
-IDs, statuses, labels, and dependency edges are preserved verbatim, so every
-reference in commits, docs, and run ledgers stays valid. The importer reports
-edges pointing outside the export rather than failing on them.
+Ids, statuses, labels, metadata, close reasons, and dependency edges are
+preserved verbatim, so every reference in commits, docs, and run ledgers stays
+valid. The importer is written to survive being interesting:
+
+- **Re-runnable.** A crash mid-import is resume, not cleanup: rows are marked
+  with provenance (`metadata.marbles_import`) and re-encountered rows are
+  `unchanged`, never conflicts. The whole thing aborts *before writing* on any
+  real conflict and lists the offending ids.
+- **Prefix surgery.** `--rewrite-prefix old:new` fixes the one genuine
+  migration hazard — two independent stores that were configured with the same
+  prefix — by renaming one store's ids (and their dependency edges) at import.
+  This is the fix for a misconfiguration; ids within one store never change.
+- **A store is a store.** `marbles` treats each project as an independent
+  tracker — the successor to one `.beads` database, not a database *of*
+  databases. A portfolio (e.g. AlfAlpha's Pedalkernel project referencing both
+  `pedalkernel` and `pedalkernel-pro` trackers) composes stores at read time.
+- **Source state lands as-is.** If the export says a bead closed while its
+  blocker is still open, the importer refuses to *reorder your history* into
+  its own invariants: it closes with an explicit exception note and reports
+  `exception_closed`. Status names it doesn't recognize abort rather than
+  guess. `_type:memory` records (beads wisps) are skipped with a count.
 
 ## Layout & status
 

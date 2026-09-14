@@ -17,6 +17,7 @@ pub mod client;
 pub mod config;
 pub mod db;
 pub mod import;
+pub mod jsonl;
 pub mod setup;
 pub mod time;
 pub mod types;
