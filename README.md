@@ -91,7 +91,7 @@ other people's holds; releasing a live claim requires being its holder.
 
 ## Install
 
-From source (Rust 1.85+):
+From source (Rust 1.88+):
 
 ```bash
 cargo install --path .            # installs `marbles`
