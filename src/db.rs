@@ -5,8 +5,9 @@
 //! are not the server talk to the server. Cross-project queries (the merged portfolio view) are
 //! just queries, because the projects share a database instead of syncing a lineage.
 
-use std::path::Path;
-use std::sync::Mutex;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, TimeZone, Utc};
@@ -96,6 +97,95 @@ pub struct Db {
     conn: Mutex<Connection>,
     policy: Policy,
     week: WorkWeek,
+}
+
+/// Lazily opened, physically separate company stores for hosted operation.
+///
+/// The company id comes exclusively from the verified principal. Keeping each
+/// tenant in its own SQLite file makes the isolation boundary visible to
+/// operators and backups instead of relying on every query to remember an RLS
+/// predicate.
+pub struct CompanyStores {
+    root: PathBuf,
+    open: Mutex<BTreeMap<String, Arc<Db>>>,
+}
+
+impl CompanyStores {
+    pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
+        let root = root.into();
+        std::fs::create_dir_all(&root)
+            .map_err(|e| Error::Bad(format!("creating {}: {e}", root.display())))?;
+        let stores = Self {
+            root,
+            open: Mutex::new(BTreeMap::new()),
+        };
+        for entry in std::fs::read_dir(&stores.root)
+            .map_err(|e| Error::Bad(format!("reading {}: {e}", stores.root.display())))?
+        {
+            let entry = entry.map_err(|e| Error::Bad(format!("reading company store: {e}")))?;
+            if !entry
+                .file_type()
+                .map_err(|e| Error::Bad(format!("reading company store type: {e}")))?
+                .is_dir()
+            {
+                continue;
+            }
+            let Some(company) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            validate_company_id(&company)?;
+            if entry.path().join("marbles.db").is_file() {
+                stores.for_company(&company)?;
+            }
+        }
+        Ok(stores)
+    }
+
+    pub fn for_company(&self, company_id: &str) -> Result<Arc<Db>> {
+        validate_company_id(company_id)?;
+        let mut stores = self
+            .open
+            .lock()
+            .map_err(|_| Error::Bad("company store lock poisoned".into()))?;
+        if let Some(db) = stores.get(company_id) {
+            return Ok(Arc::clone(db));
+        }
+        let company_root = self.root.join(company_id);
+        std::fs::create_dir_all(&company_root).map_err(|e| {
+            Error::Bad(format!(
+                "creating company store {}: {e}",
+                company_root.display()
+            ))
+        })?;
+        let db = Arc::new(Db::open(company_root.join("marbles.db"))?);
+        stores.insert(company_id.to_owned(), Arc::clone(&db));
+        Ok(db)
+    }
+
+    pub fn sweep_open(&self, now: i64) -> Result<Vec<(String, SweepReport)>> {
+        let stores = self
+            .open
+            .lock()
+            .map_err(|_| Error::Bad("company store lock poisoned".into()))?;
+        stores
+            .iter()
+            .map(|(company, db)| Ok((company.clone(), db.sweep(now)?)))
+            .collect()
+    }
+}
+
+fn validate_company_id(company_id: &str) -> Result<()> {
+    if company_id.is_empty()
+        || company_id.len() > 128
+        || !company_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err(Error::Bad(
+            "OIDC company id is not a safe store name".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn now() -> i64 {

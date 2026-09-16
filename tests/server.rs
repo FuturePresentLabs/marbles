@@ -8,7 +8,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use marbles::api::Api;
 use marbles::auth::{Auth, AuthConfig};
-use marbles::db::Db;
+use marbles::db::{CompanyStores, Db};
 use marbles::types::*;
 use tower::ServiceExt; // oneshot
 
@@ -20,6 +20,7 @@ fn app() -> (Router, tempfile::TempDir) {
     marbles::auth::mint_token(&dir.path().join("tokens"), ActorKind::Human, "avery").unwrap();
     let api = Arc::new(Api {
         db: Arc::clone(&db),
+        company_stores: None,
         auth: Arc::new(Auth::new(AuthConfig::default(), dir.path().join("tokens"))),
     });
     (api.router(), dir)
@@ -65,6 +66,24 @@ async fn an_unauthenticated_request_is_refused_before_it_reaches_the_store() {
     let _ = dir;
     let (status, _) = call(&app, "issues.list", serde_json::json!({}), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn hosted_company_stores_reject_credentials_without_a_verified_company() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::in_memory().unwrap());
+    let stores = Arc::new(CompanyStores::new(dir.path().join("companies")).unwrap());
+    marbles::auth::mint_token(&dir.path().join("tokens"), ActorKind::Human, "avery").unwrap();
+    let token = token_file(dir.path(), "human-avery");
+    let app = Arc::new(Api {
+        db,
+        company_stores: Some(stores),
+        auth: Arc::new(Auth::new(AuthConfig::default(), dir.path().join("tokens"))),
+    })
+    .router();
+    let (status, body) = call(&app, "stats", serde_json::json!({}), Some(&token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("not scoped to an FPL Auth company"));
 }
 
 #[tokio::test]

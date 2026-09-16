@@ -17,15 +17,31 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{Auth, Principal};
-use crate::db::{Db, Error as DbError, SweepReport};
+use crate::db::{CompanyStores, Db, Error as DbError, SweepReport};
 use crate::types::*;
 
 pub struct Api {
+    /// Workstation/default store. Hosted deployments set `company_stores` and
+    /// this file is never selected for an OIDC principal.
     pub db: Arc<Db>,
+    pub company_stores: Option<Arc<CompanyStores>>,
     pub auth: Arc<Auth>,
 }
 
 impl Api {
+    fn db_for(&self, principal: &Principal) -> Result<Arc<Db>, ApiError> {
+        let Some(stores) = &self.company_stores else {
+            return Ok(Arc::clone(&self.db));
+        };
+        let company = principal.company_id.as_deref().ok_or_else(|| {
+            ApiError(ApiErrorKind::Status(
+                StatusCode::FORBIDDEN,
+                "credential is not scoped to an FPL Auth company".into(),
+            ))
+        })?;
+        stores.for_company(company).map_err(ApiError::from)
+    }
+
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
             .route("/healthz", axum::routing::get(|| async { "ok" }))
@@ -126,20 +142,20 @@ struct EnsureProject {
 
 async fn projects_ensure(
     State(api): State<Arc<Api>>,
-    Extension(_principal): Extension<Principal>,
+    Extension(principal): Extension<Principal>,
     Json(body): Json<EnsureProject>,
 ) -> Res<serde_json::Value> {
-    api.db
+    api.db_for(&principal)?
         .ensure_project(&body.slug, &body.root, &body.prefix)?;
     Ok(Json(serde_json::json!({"slug": body.slug})))
 }
 
 async fn projects_list(
     State(api): State<Arc<Api>>,
-    Extension(_principal): Extension<Principal>,
+    Extension(principal): Extension<Principal>,
     Json(_body): Json<Empty>,
 ) -> Res<serde_json::Value> {
-    let rows = api.db.projects()?;
+    let rows = api.db_for(&principal)?.projects()?;
     Ok(Json(serde_json::json!(
         rows.into_iter()
             .map(|(slug, root, prefix)| {
@@ -157,9 +173,9 @@ async fn issues_create(
     Json(mut spec): Json<NewIssue>,
 ) -> Res<OkId> {
     if spec.created_by.is_none() {
-        spec.created_by = Some(principal.name);
+        spec.created_by = Some(principal.name.clone());
     }
-    let id = api.db.create(&spec, crate::db::now())?;
+    let id = api.db_for(&principal)?.create(&spec, crate::db::now())?;
     Ok(Json(OkId { id }))
 }
 
@@ -175,10 +191,10 @@ struct IdBody {
 
 async fn issues_get(
     State(api): State<Arc<Api>>,
-    Extension(_principal): Extension<Principal>,
+    Extension(principal): Extension<Principal>,
     Json(body): Json<IdBody>,
 ) -> Res<Issue> {
-    Ok(Json(api.db.get(&body.id)?))
+    Ok(Json(api.db_for(&principal)?.get(&body.id)?))
 }
 
 #[derive(Deserialize)]
@@ -193,10 +209,10 @@ struct ListBody {
 
 async fn issues_list(
     State(api): State<Arc<Api>>,
-    Extension(_principal): Extension<Principal>,
+    Extension(principal): Extension<Principal>,
     Json(body): Json<ListBody>,
 ) -> Res<Vec<Issue>> {
-    Ok(Json(api.db.list(
+    Ok(Json(api.db_for(&principal)?.list(
         body.project.as_deref(),
         body.all,
         body.id.as_deref(),
@@ -205,11 +221,12 @@ async fn issues_list(
 
 async fn issues_ready(
     State(api): State<Arc<Api>>,
-    Extension(_principal): Extension<Principal>,
+    Extension(principal): Extension<Principal>,
     Json(body): Json<ListBody>,
 ) -> Res<Vec<Issue>> {
     Ok(Json(
-        api.db.ready(body.project.as_deref(), crate::db::now())?,
+        api.db_for(&principal)?
+            .ready(body.project.as_deref(), crate::db::now())?,
     ))
 }
 
@@ -224,7 +241,7 @@ async fn issues_update(
     Extension(principal): Extension<Principal>,
     Json(body): Json<UpdateBody>,
 ) -> Res<Issue> {
-    Ok(Json(api.db.update(
+    Ok(Json(api.db_for(&principal)?.update(
         &body.id,
         &body.patch,
         &principal.name,
@@ -263,7 +280,7 @@ async fn issues_close(
     if let Some(ack) = body.ack {
         evidence.push(Evidence::ack(ack));
     }
-    Ok(Json(api.db.close(
+    Ok(Json(api.db_for(&principal)?.close(
         &body.id,
         body.reason.as_deref(),
         &evidence,
@@ -283,7 +300,7 @@ async fn issues_supersede(
     Extension(principal): Extension<Principal>,
     Json(body): Json<SupersedeBody>,
 ) -> Res<serde_json::Value> {
-    api.db.supersede(
+    api.db_for(&principal)?.supersede(
         &body.id,
         &body.replacement,
         &principal.name,
@@ -307,8 +324,12 @@ async fn deps_add(
     Extension(principal): Extension<Principal>,
     Json(body): Json<DepBody>,
 ) -> Res<serde_json::Value> {
-    api.db
-        .add_dep(&body.child, &body.parent, &principal.name, crate::db::now())?;
+    api.db_for(&principal)?.add_dep(
+        &body.child,
+        &body.parent,
+        &principal.name,
+        crate::db::now(),
+    )?;
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
@@ -317,8 +338,12 @@ async fn deps_remove(
     Extension(principal): Extension<Principal>,
     Json(body): Json<DepBody>,
 ) -> Res<serde_json::Value> {
-    api.db
-        .remove_dep(&body.child, &body.parent, &principal.name, crate::db::now())?;
+    api.db_for(&principal)?.remove_dep(
+        &body.child,
+        &body.parent,
+        &principal.name,
+        crate::db::now(),
+    )?;
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
@@ -333,7 +358,7 @@ async fn labels_add(
     Extension(principal): Extension<Principal>,
     Json(body): Json<LabelBody>,
 ) -> Res<serde_json::Value> {
-    api.db
+    api.db_for(&principal)?
         .add_label(&body.id, &body.label, &principal.name, crate::db::now())?;
     Ok(Json(serde_json::json!({"ok": true})))
 }
@@ -343,8 +368,12 @@ async fn labels_remove(
     Extension(principal): Extension<Principal>,
     Json(body): Json<LabelBody>,
 ) -> Res<serde_json::Value> {
-    api.db
-        .remove_label(&body.id, &body.label, &principal.name, crate::db::now())?;
+    api.db_for(&principal)?.remove_label(
+        &body.id,
+        &body.label,
+        &principal.name,
+        crate::db::now(),
+    )?;
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
@@ -376,7 +405,7 @@ async fn claims_claim(
         actor_kind: principal.kind,
         ttl_seconds: body.ttl_seconds,
     };
-    Ok(Json(api.db.claim(&req, crate::db::now())?))
+    Ok(Json(api.db_for(&principal)?.claim(&req, crate::db::now())?))
 }
 
 async fn claims_touch(
@@ -390,7 +419,9 @@ async fn claims_touch(
         ActorKind::Human => principal.name.clone(),
         ActorKind::Agent => body.assignee.clone().unwrap_or(principal.name.clone()),
     };
-    let expires = api.db.touch(&body.id, &holder, crate::db::now())?;
+    let expires = api
+        .db_for(&principal)?
+        .touch(&body.id, &holder, crate::db::now())?;
     Ok(Json(
         serde_json::json!({"id": body.id, "expires_at": expires}),
     ))
@@ -402,7 +433,8 @@ async fn claims_release(
     Json(body): Json<ClaimBody>,
 ) -> Res<serde_json::Value> {
     // Releasing someone else's live claim would be a steal; check the holder before clearing.
-    let issue = api.db.get(&body.id)?;
+    let db = api.db_for(&principal)?;
+    let issue = db.get(&body.id)?;
     if let Some(holder) = &issue.assignee {
         let owns = match principal.kind {
             ActorKind::Human => holder == &principal.name,
@@ -417,8 +449,7 @@ async fn claims_release(
             )));
         }
     }
-    api.db
-        .release(&body.id, &principal.name, crate::db::now())?;
+    db.release(&body.id, &principal.name, crate::db::now())?;
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
@@ -445,14 +476,14 @@ async fn issues_import(
     }
     // An HTTP import has no checkout to bind to; the placeholder keeps the
     // per-project root unique until `marbles init` claims a real path.
-    api.db
-        .ensure_project(
-            &body.project,
-            &format!("unhosted/{}", body.project),
-            &body.project,
-        )
-        .map_err(|e| ApiError(ApiErrorKind::Db(e)))?;
-    crate::import::import(&api.db, &body.project, &body.rows)
+    let db = api.db_for(&principal)?;
+    db.ensure_project(
+        &body.project,
+        &format!("unhosted/{}", body.project),
+        &body.project,
+    )
+    .map_err(|e| ApiError(ApiErrorKind::Db(e)))?;
+    crate::import::import(&db, &body.project, &body.rows)
         .map(Json)
         .map_err(|e| ApiError(ApiErrorKind::Status(StatusCode::BAD_REQUEST, e)))
 }
@@ -468,23 +499,23 @@ async fn claims_sweep(
             "only a human principal may sweep claims".to_string(),
         )));
     }
-    Ok(Json(api.db.sweep(crate::db::now())?))
+    Ok(Json(api.db_for(&principal)?.sweep(crate::db::now())?))
 }
 
 // ---- history & stats ----
 
 async fn history_get(
     State(api): State<Arc<Api>>,
-    Extension(_principal): Extension<Principal>,
+    Extension(principal): Extension<Principal>,
     Json(body): Json<IdBody>,
 ) -> Res<Vec<HistoryEvent>> {
-    Ok(Json(api.db.history(&body.id)?))
+    Ok(Json(api.db_for(&principal)?.history(&body.id)?))
 }
 
 async fn stats(
     State(api): State<Arc<Api>>,
-    Extension(_principal): Extension<Principal>,
+    Extension(principal): Extension<Principal>,
     Json(_body): Json<Empty>,
 ) -> Res<serde_json::Value> {
-    Ok(Json(api.db.stats()?))
+    Ok(Json(api.db_for(&principal)?.stats()?))
 }

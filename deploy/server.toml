@@ -1,0 +1,7 @@
+listen = "0.0.0.0:7878"
+company_store_root = "/data/companies"
+
+[auth]
+oidc_issuer = "https://sso.fpl.dev"
+oidc_audience = "marbles"
+company_claim = "company_id"

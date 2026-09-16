@@ -12,6 +12,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen: default_listen(),
+            company_store_root: None,
             auth: AuthConfig::default(),
         }
     }
@@ -21,6 +22,11 @@ impl Default for ServerConfig {
 pub struct ServerConfig {
     #[serde(default = "default_listen")]
     pub listen: String,
+    /// Hosted mode: route every authenticated request to
+    /// `<company_store_root>/<verified-company-id>/marbles.db`.
+    /// When absent, retain the single local database used by workstation mode.
+    #[serde(default)]
+    pub company_store_root: Option<PathBuf>,
     #[serde(default)]
     pub auth: AuthConfig,
 }

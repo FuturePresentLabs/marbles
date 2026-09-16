@@ -15,6 +15,7 @@
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
+use std::{collections::BTreeMap, str};
 
 use serde::{Deserialize, Serialize};
 
@@ -162,6 +163,8 @@ impl Auth {
             client_id: Option<String>,
             #[serde(default)]
             azp: Option<String>,
+            #[serde(flatten)]
+            extra: BTreeMap<String, serde_json::Value>,
         }
         let claims = jsonwebtoken::decode::<Claims>(token, &decoding, &validation)
             .ok()?
@@ -177,7 +180,13 @@ impl Auth {
                 ActorKind::Human
             },
             name: caller_client.unwrap_or(claims.sub),
-            company_id: self.config.company_claim.as_ref().and_then(|_| None),
+            company_id: self
+                .config
+                .company_claim
+                .as_deref()
+                .and_then(|claim| claim_value(&claims.extra, claim))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
         })
     }
 
@@ -212,6 +221,19 @@ impl Auth {
         }
         Some(jwks)
     }
+}
+
+fn claim_value<'a>(
+    claims: &'a BTreeMap<String, serde_json::Value>,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
+    let mut parts = path.split('.');
+    let first = parts.next()?;
+    let mut value = claims.get(first)?;
+    for part in parts {
+        value = value.as_object()?.get(part)?;
+    }
+    Some(value)
 }
 
 fn decoding_from_jwk(key: &Jwk) -> Option<jsonwebtoken::DecodingKey> {
@@ -276,6 +298,23 @@ pub fn mint_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_company_claim_supports_a_bounded_nested_path() {
+        let claims = BTreeMap::from([
+            ("company_id".into(), serde_json::json!("fpl")),
+            ("tenant".into(), serde_json::json!({"id": "agora"})),
+        ]);
+        assert_eq!(
+            claim_value(&claims, "company_id"),
+            Some(&serde_json::json!("fpl"))
+        );
+        assert_eq!(
+            claim_value(&claims, "tenant.id"),
+            Some(&serde_json::json!("agora"))
+        );
+        assert_eq!(claim_value(&claims, "tenant.missing"), None);
+    }
 
     #[test]
     fn static_token_names_are_the_identity() {

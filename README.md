@@ -91,7 +91,7 @@ other people's holds; releasing a live claim requires being its holder.
 
 ## Install
 
-From source (Rust 1.85+):
+From source (Rust 1.88+):
 
 ```bash
 cargo install --path .            # installs `marbles`
@@ -127,6 +127,11 @@ The server binds loopback by default; put your TLS at the edge, same as
 everything else you run. A 60-second sweeper requeues expired agent leases and
 escalates expired human holds. Sandboxes get one agent token and zero file
 access to the database — that's the point.
+
+Hosted deployments set `company_store_root` and `company_claim`. Each verified
+company claim is routed to `<company_store_root>/<company_id>/marbles.db`; an
+unscoped credential is rejected instead of falling back to a shared database.
+The checked-in `deploy/server.toml` is the FPL Auth production shape.
 
 ### Instruction files (`marbles setup`)
 
@@ -175,8 +180,8 @@ valid. The importer is written to survive being interesting:
 
 Single binary (`src/main.rs`), `axum` + `rusqlite(WAL)` + bearer-token auth.
 v0.x: interface-first; the HTTP contract and JSON shapes are what we intend to
-freeze before 1.0. Postgres-backed storage and per-company scoping (RLS on the
-OIDC company claim) are the known next steps — the store is one module precisely
-so swapping engines is a deploy, not a rewrite.
+freeze before 1.0. Hosted mode uses one physical SQLite store per OIDC company.
+Postgres remains a possible future engine; the store is one module precisely so
+swapping engines is a deploy, not a rewrite.
 
 MIT. Go build it.

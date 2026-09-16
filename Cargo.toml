@@ -2,7 +2,7 @@
 name        = "marbles"
 version     = "0.1.0"
 edition     = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license     = "MIT"
 description = "A small, single-writer issue tracker for fleets of coding agents — the interface of Beads, without Dolt."
 repository  = "https://github.com/FuturePresentLabs/marbles"
