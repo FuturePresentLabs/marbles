@@ -5,3 +5,4 @@ company_store_root = "/data/companies"
 oidc_issuer = "https://sso.fpl.dev"
 oidc_audience = "marbles"
 company_claim = "company_id"
+agent_client_ids = []

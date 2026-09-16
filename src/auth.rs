@@ -39,6 +39,7 @@ pub struct AuthConfig {
     /// Optional override; defaults to `<issuer>/.well-known/openid-configuration`.
     pub jwks_uri: Option<String>,
     /// `client_id`s that are agents; anything else authenticated is a human.
+    #[serde(default)]
     pub agent_client_ids: Vec<String>,
     /// OIDC claim carrying the company/tenant, if the issuer emits one.
     pub company_claim: Option<String>,
