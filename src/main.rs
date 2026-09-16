@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand};
 use marbles::auth::Auth;
 use marbles::client::Client;
 use marbles::config;
-use marbles::db::{Db, now};
+use marbles::db::{CompanyStores, Db, now};
 use marbles::setup::Profile;
 use marbles::types::*;
 
@@ -386,25 +386,50 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
             let db = Arc::new(
                 Db::open(config::db_path()).map_err(|e| format!("opening database: {e}"))?,
             );
+            let company_stores = cfg
+                .company_store_root
+                .map(CompanyStores::new)
+                .transpose()
+                .map_err(|e| format!("opening company stores: {e}"))?
+                .map(Arc::new);
             let auth = Arc::new(Auth::new(cfg.auth, config::token_dir()));
             let api = Arc::new(marbles::api::Api {
                 db: Arc::clone(&db),
+                company_stores: company_stores.clone(),
                 auth,
             });
             let listener = tokio::net::TcpListener::bind(&listen)
                 .await
                 .map_err(|e| format!("binding {listen}: {e}"))?;
             println!(
-                "marbles serving on http://{listen} (db {}, tokens {})",
+                "marbles serving on http://{listen} (db {}, company stores {}, tokens {})",
                 config::db_path().display(),
+                company_stores
+                    .as_ref()
+                    .map(|_| "enabled")
+                    .unwrap_or("disabled"),
                 config::token_dir().display()
             );
             let sweeper_db = Arc::clone(&db);
+            let sweeper_companies = company_stores;
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
                 loop {
                     tick.tick().await;
-                    match sweeper_db.sweep(now()) {
+                    let result = match &sweeper_companies {
+                        Some(stores) => stores.sweep_open(now()).map(|reports| {
+                            reports.into_iter().fold(
+                                marbles::db::SweepReport::default(),
+                                |mut all, (_, report)| {
+                                    all.requeued.extend(report.requeued);
+                                    all.escalated.extend(report.escalated);
+                                    all
+                                },
+                            )
+                        }),
+                        None => sweeper_db.sweep(now()),
+                    };
+                    match result {
                         Ok(report) => {
                             if !report.requeued.is_empty() || !report.escalated.is_empty() {
                                 eprintln!(

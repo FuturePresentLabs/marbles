@@ -1,6 +1,6 @@
 //! The behavior the design decisions were made for. Each test names the decision it protects.
 
-use marbles::db::{Db, now};
+use marbles::db::{CompanyStores, Db, now};
 use marbles::types::*;
 
 fn db_with_project() -> Db {
@@ -608,4 +608,37 @@ fn drop_unknown_project_is_not_silent() {
         db.drop_project("nope"),
         Err(marbles::db::Error::NoProject(_))
     ));
+}
+
+#[test]
+fn companies_get_physically_separate_stores_that_survive_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let stores = CompanyStores::new(root.path()).unwrap();
+    let one = stores.for_company("one").unwrap();
+    let two = stores.for_company("two").unwrap();
+    one.ensure_project("shared", "/one/shared", "one").unwrap();
+    two.ensure_project("shared", "/two/shared", "two").unwrap();
+    let mut spec = new("only company one can see this");
+    spec.project = Some("shared".into());
+    let id = one.create(&spec, 100).unwrap();
+    assert!(two.get(&id).is_err());
+    assert!(root.path().join("one/marbles.db").is_file());
+    assert!(root.path().join("two/marbles.db").is_file());
+
+    drop(one);
+    drop(two);
+    drop(stores);
+    let reopened = CompanyStores::new(root.path()).unwrap();
+    assert_eq!(
+        reopened.for_company("one").unwrap().get(&id).unwrap().title,
+        "only company one can see this"
+    );
+}
+
+#[test]
+fn company_store_names_cannot_escape_the_storage_root() {
+    let root = tempfile::tempdir().unwrap();
+    let stores = CompanyStores::new(root.path()).unwrap();
+    assert!(stores.for_company("../other").is_err());
+    assert!(stores.for_company("").is_err());
 }

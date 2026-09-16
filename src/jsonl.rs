@@ -183,7 +183,7 @@ pub fn import(
     let mut id_map: BTreeMap<String, String> = BTreeMap::new();
     for row in rows.iter().filter(|r| r.get("_skip").is_none()) {
         let (id, original) = id_of(row)?;
-        let status = normalize_status(row["status"].as_str().unwrap_or("open"))?;
+        normalize_status(row["status"].as_str().unwrap_or("open"))?;
         match db.get(id.as_str()).ok() {
             Some(existing) => {
                 // Resume rule: a row carrying this importer's mark in the same project is a
