@@ -22,4 +22,4 @@ jobs:
           docker build --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" --label "org.opencontainers.image.revision=${GITHUB_SHA}" -t "${image}:latest" -t "${image}:sha-${GITHUB_SHA}" .
           docker push "${image}:latest"
           docker push "${image}:sha-${GITHUB_SHA}"
-          docker manifest inspect "${image}:sha-${GITHUB_SHA}" >/dev/null
+          sudo docker manifest inspect "${image}:sha-${GITHUB_SHA}" >/dev/null
