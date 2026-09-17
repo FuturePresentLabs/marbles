@@ -30,6 +30,8 @@ pub struct ClientConfig {
     pub refresh_token: String,
     pub id_token: String,
     pub expires_at: i64,
+    #[serde(skip, default = "persist_by_default")]
+    persist: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,11 +51,49 @@ fn default_redirect_uri() -> String {
     DEFAULT_REDIRECT_URI.to_owned()
 }
 
+fn persist_by_default() -> bool {
+    true
+}
+
+fn env_config() -> Result<Option<ClientConfig>, String> {
+    let refresh_token = match std::env::var("MARBLES_OIDC_REFRESH_TOKEN") {
+        Ok(value) if !value.trim().is_empty() => value,
+        Ok(_) | Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(err) => return Err(format!("reading MARBLES_OIDC_REFRESH_TOKEN: {err}")),
+    };
+    let required = |name: &str| {
+        std::env::var(name)
+            .map_err(|err| format!("{name} is required with MARBLES_OIDC_REFRESH_TOKEN: {err}"))
+            .and_then(|value| {
+                if value.trim().is_empty() {
+                    Err(format!("{name} must not be empty"))
+                } else {
+                    Ok(value)
+                }
+            })
+    };
+    Ok(Some(ClientConfig {
+        url: std::env::var("MARBLES_URL")
+            .unwrap_or_else(|_| "https://marbles.fpl.dev".to_owned()),
+        issuer: std::env::var("MARBLES_OIDC_ISSUER").unwrap_or_else(|_| default_issuer()),
+        client_id: required("MARBLES_OIDC_CLIENT_ID")?,
+        client_secret: required("MARBLES_OIDC_CLIENT_SECRET")?,
+        redirect_uri: default_redirect_uri(),
+        refresh_token,
+        id_token: String::new(),
+        expires_at: 0,
+        persist: false,
+    }))
+}
+
 pub fn client_config_path() -> PathBuf {
     config::state_dir().join("client.toml")
 }
 
 pub fn load() -> Result<Option<ClientConfig>, String> {
+    if let Some(config) = env_config()? {
+        return Ok(Some(config));
+    }
     let path = client_config_path();
     match fs::read_to_string(&path) {
         Ok(text) => toml::from_str(&text)
@@ -170,8 +210,11 @@ pub async fn login(
         refresh_token: tokens.refresh_token,
         id_token: tokens.id_token,
         expires_at: chrono::Utc::now().timestamp() + tokens.expires_in,
+        persist: true,
     };
-    save(&cfg)?;
+    if cfg.persist {
+        save(&cfg)?;
+    }
     Ok(cfg)
 }
 
