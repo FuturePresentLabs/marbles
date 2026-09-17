@@ -69,6 +69,18 @@ enum Command {
     Login {
         #[arg(long, default_value = "owner")]
         name: String,
+        /// OIDC issuer for remote login.
+        #[arg(long)]
+        issuer: Option<String>,
+        /// OIDC client id for remote login.
+        #[arg(long)]
+        client_id: Option<String>,
+        /// OIDC client secret for remote login.
+        #[arg(long, env = "MARBLES_CLIENT_SECRET", hide_env_values = true)]
+        client_secret: Option<String>,
+        /// Local callback registered for the OIDC client.
+        #[arg(long)]
+        redirect_uri: Option<String>,
     },
     /// Mint a local agent token (for daemons/sandboxes).
     AgentToken {
@@ -272,10 +284,54 @@ enum LabelAction {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    let mode = if let Some(url) = &cli.url {
-        let token = cli.token.clone().unwrap_or_default();
+    if let Command::Login {
+        issuer,
+        client_id,
+        client_secret: Some(secret),
+        redirect_uri,
+        ..
+    } = &cli.command
+    {
+        let url = cli.url.as_deref().unwrap_or("https://marbles.fpl.dev");
+        return match marbles::oidc::login(
+            url,
+            issuer.as_deref(),
+            client_id.as_deref(),
+            secret,
+            redirect_uri.as_deref(),
+        )
+        .await
+        {
+            Ok(_) => {
+                println!("signed in to {url}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => fail(err),
+        };
+    }
+    let saved = match marbles::oidc::load() {
+        Ok(value) => value,
+        Err(err) => return fail(err),
+    };
+    let effective_url = cli
+        .url
+        .clone()
+        .or_else(|| saved.as_ref().map(|value| value.url.clone()));
+    let mode = if let Some(url) = &effective_url {
+        let token = if let Some(token) = cli.token.clone() {
+            token
+        } else if let Some(saved) = saved {
+            match marbles::oidc::valid_token(saved).await {
+                Ok((_, token)) => token,
+                Err(err) => return fail(err),
+            }
+        } else {
+            String::new()
+        };
         if token.is_empty() {
-            return fail("MARBLES_URL is set but no token: pass --token or MARBLES_TOKEN");
+            return fail(
+                "remote Marbles has no credential; run `mb --url <url> login --client-secret <secret>`",
+            );
         }
         Mode::Http(Client::new(url, &token))
     } else {
@@ -446,7 +502,7 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
                 .await
                 .map_err(|e| format!("server: {e}"))
         }
-        Command::Login { name } => {
+        Command::Login { name, .. } => {
             let (path, secret) =
                 marbles::auth::mint_token(&config::token_dir(), ActorKind::Human, name)
                     .map_err(|e| e.to_string())?;
