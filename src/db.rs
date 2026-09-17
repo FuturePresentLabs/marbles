@@ -133,8 +133,8 @@ impl CompanyStores {
             let Some(company) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            validate_company_id(&company)?;
             if entry.path().join("marbles.db").is_file() {
+                validate_company_id(&company)?;
                 stores.for_company(&company)?;
             }
         }
