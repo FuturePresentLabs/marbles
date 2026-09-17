@@ -642,3 +642,14 @@ fn company_store_names_cannot_escape_the_storage_root() {
     assert!(stores.for_company("../other").is_err());
     assert!(stores.for_company("").is_err());
 }
+
+#[test]
+fn company_stores_ignore_ext4_housekeeping_directories() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("lost+found")).unwrap();
+
+    let stores = CompanyStores::new(root.path()).unwrap();
+    stores.for_company("fpl").unwrap();
+
+    assert!(root.path().join("fpl/marbles.db").is_file());
+}
