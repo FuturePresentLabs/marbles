@@ -12,7 +12,7 @@
 //!   `human-<name>` or `agent-<name>` — created by `marbles login` / `marbles agent-token`.
 //!   This is how one machine runs the fleet without an IdP.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use std::{collections::BTreeMap, str};
@@ -110,6 +110,12 @@ impl Auth {
         let entries = std::fs::read_dir(&self.token_dir).ok()?;
         for entry in entries.flatten() {
             let path = entry.path();
+            if path.file_name().and_then(|name| name.to_str()) == Some("companies") {
+                if let Some(principal) = self.company_static_token(&path, token) {
+                    return Some(principal);
+                }
+                continue;
+            }
             let Some(stem) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
@@ -129,6 +135,45 @@ impl Auth {
                         kind: ActorKind::Agent,
                         name: name.into(),
                         company_id: None,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// Hosted service tokens live under `tokens/companies/<company>/agent-<name>`.
+    ///
+    /// The directory is operator-owned server state: callers cannot select a company in an HTTP
+    /// request. Keeping the existing top-level token format unscoped preserves workstation mode,
+    /// while this one bounded level gives hosted daemons an explicit tenant boundary.
+    fn company_static_token(&self, companies: &Path, token: &str) -> Option<Principal> {
+        for company in std::fs::read_dir(companies).ok()?.flatten() {
+            let company_name = company.file_name();
+            let Some(company_id) = company_name.to_str() else {
+                continue;
+            };
+            let company_id = company_id.to_owned();
+            if company_id.is_empty() || company_id == "." || company_id == ".." {
+                continue;
+            }
+            for entry in std::fs::read_dir(company.path()).ok()?.flatten() {
+                let path = entry.path();
+                let Some(name) = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_prefix("agent-"))
+                else {
+                    continue;
+                };
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                if content.trim() == token {
+                    return Some(Principal {
+                        kind: ActorKind::Agent,
+                        name: name.to_owned(),
+                        company_id: Some(company_id),
                     });
                 }
             }
@@ -339,6 +384,30 @@ mod tests {
         assert_eq!(auth.static_token(&human).unwrap().kind, ActorKind::Human);
         assert_eq!(auth.static_token(&agent).unwrap().kind, ActorKind::Agent);
         assert!(auth.static_token("nope").is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn hosted_agent_token_is_scoped_by_its_operator_owned_company_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "marbles-company-auth-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let company = dir.join("companies/fpl");
+        std::fs::create_dir_all(&company).unwrap();
+        std::fs::write(company.join("agent-alfalfad"), "company-secret\n").unwrap();
+        std::fs::write(company.join("human-not-allowed"), "human-secret\n").unwrap();
+
+        let auth = Auth::new(AuthConfig::default(), dir.clone());
+        let principal = auth
+            .static_token("company-secret")
+            .expect("company agent token resolves");
+        assert_eq!(principal.kind, ActorKind::Agent);
+        assert_eq!(principal.name, "alfalfad");
+        assert_eq!(principal.company_id.as_deref(), Some("fpl"));
+        assert!(auth.static_token("human-secret").is_none());
+
         std::fs::remove_dir_all(dir).ok();
     }
 }
