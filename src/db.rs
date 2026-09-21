@@ -63,6 +63,19 @@ CREATE TABLE IF NOT EXISTS history(
   event    TEXT NOT NULL,
   detail   TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS outbound_event(
+  seq             INTEGER PRIMARY KEY,
+  issue_id        TEXT NOT NULL,
+  project         TEXT NOT NULL,
+  occurred_at     INTEGER NOT NULL,
+  event           TEXT NOT NULL,
+  delivered_at    INTEGER,
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER NOT NULL,
+  last_error      TEXT
+);
+CREATE INDEX IF NOT EXISTS outbound_event_pending
+  ON outbound_event(delivered_at, next_attempt_at, seq);
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -97,6 +110,16 @@ pub struct Db {
     conn: Mutex<Connection>,
     policy: Policy,
     week: WorkWeek,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct OutboundEvent {
+    pub seq: i64,
+    pub issue_id: String,
+    pub project: String,
+    pub occurred_at: i64,
+    pub event: String,
+    pub attempts: i64,
 }
 
 /// Lazily opened, physically separate company stores for hosted operation.
@@ -171,6 +194,17 @@ impl CompanyStores {
             .iter()
             .map(|(company, db)| Ok((company.clone(), db.sweep(now)?)))
             .collect()
+    }
+
+    pub fn open_stores(&self) -> Result<Vec<(String, Arc<Db>)>> {
+        let stores = self
+            .open
+            .lock()
+            .map_err(|_| Error::Bad("company store lock poisoned".into()))?;
+        Ok(stores
+            .iter()
+            .map(|(company, db)| (company.clone(), Arc::clone(db)))
+            .collect())
     }
 }
 
@@ -299,6 +333,10 @@ impl Db {
                 |r| r.get(0),
             )?;
             tx.execute(
+                &format!("DELETE FROM outbound_event WHERE issue_id IN {mine}"),
+                params![slug],
+            )?;
+            tx.execute(
                 &format!("DELETE FROM history WHERE issue_id IN {mine}"),
                 params![slug],
             )?;
@@ -325,6 +363,54 @@ impl Db {
             Ok(())
         })?;
         Ok(out)
+    }
+
+    pub fn pending_events(&self, at: i64, limit: usize) -> Result<Vec<OutboundEvent>> {
+        let mut out = Vec::new();
+        self.query(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT seq, issue_id, project, occurred_at, event, attempts
+                 FROM outbound_event
+                 WHERE delivered_at IS NULL AND next_attempt_at <= ?1
+                 ORDER BY seq LIMIT ?2",
+            )?;
+            out = stmt
+                .query_map(params![at, limit as i64], |row| {
+                    Ok(OutboundEvent {
+                        seq: row.get(0)?,
+                        issue_id: row.get(1)?,
+                        project: row.get(2)?,
+                        occurred_at: row.get(3)?,
+                        event: row.get(4)?,
+                        attempts: row.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    pub fn mark_event_delivered(&self, seq: i64, at: i64) -> Result<()> {
+        self.tx(|tx| {
+            tx.execute(
+                "UPDATE outbound_event SET delivered_at=?2, attempts=attempts+1,
+                 last_error=NULL WHERE seq=?1 AND delivered_at IS NULL",
+                params![seq, at],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn mark_event_failed(&self, seq: i64, next_attempt_at: i64, error: &str) -> Result<()> {
+        self.tx(|tx| {
+            tx.execute(
+                "UPDATE outbound_event SET attempts=attempts+1, next_attempt_at=?2,
+                 last_error=?3 WHERE seq=?1 AND delivered_at IS NULL",
+                params![seq, next_attempt_at, error],
+            )?;
+            Ok(())
+        })
     }
 
     fn prefix_for(&self, conn: &rusqlite::Connection, project: &str) -> Result<String> {
@@ -969,6 +1055,12 @@ fn log_event(
     tx.execute(
         "INSERT INTO history(issue_id, ts, actor, event, detail) VALUES (?1,?2,?3,?4,?5)",
         params![id, ts, actor, event, detail],
+    )?;
+    let seq = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO outbound_event(seq, issue_id, project, occurred_at, event, next_attempt_at)
+         SELECT ?1, i.id, i.project, ?2, ?3, ?2 FROM issue i WHERE i.id=?4",
+        params![seq, ts, event, id],
     )?;
     Ok(())
 }
