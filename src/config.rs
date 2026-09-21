@@ -128,7 +128,10 @@ mod tests {
         .unwrap();
         let (root, project) = discover_project(&deep).unwrap();
         assert_eq!(project.slug, "demo");
-        assert_eq!(project.server_url.as_deref(), Some("https://marbles.fpl.dev"));
+        assert_eq!(
+            project.server_url.as_deref(),
+            Some("https://marbles.fpl.dev")
+        );
         assert!(root.ends_with("a"));
     }
 }

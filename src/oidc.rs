@@ -73,8 +73,7 @@ fn env_config() -> Result<Option<ClientConfig>, String> {
             })
     };
     Ok(Some(ClientConfig {
-        url: std::env::var("MARBLES_URL")
-            .unwrap_or_else(|_| "https://marbles.fpl.dev".to_owned()),
+        url: std::env::var("MARBLES_URL").unwrap_or_else(|_| "https://marbles.fpl.dev".to_owned()),
         issuer: std::env::var("MARBLES_OIDC_ISSUER").unwrap_or_else(|_| default_issuer()),
         client_id: required("MARBLES_OIDC_CLIENT_ID")?,
         client_secret: required("MARBLES_OIDC_CLIENT_SECRET")?,

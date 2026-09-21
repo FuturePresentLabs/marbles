@@ -466,7 +466,9 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
                     .arg("export")
                     .current_dir(&dir)
                     .output()
-                    .map_err(|e| format!("legacy .beads store found but `bd export` could not run: {e}"))?;
+                    .map_err(|e| {
+                        format!("legacy .beads store found but `bd export` could not run: {e}")
+                    })?;
                 if !output.status.success() {
                     return Err(format!(
                         "legacy .beads export failed: {}",
@@ -475,8 +477,8 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
                 }
                 let export = String::from_utf8(output.stdout)
                     .map_err(|e| format!("bd export was not UTF-8: {e}"))?;
-                let rows = marbles::jsonl::parse_jsonl(&export, "bd export")
-                    .map_err(|e| e.to_string())?;
+                let rows =
+                    marbles::jsonl::parse_jsonl(&export, "bd export").map_err(|e| e.to_string())?;
                 let report = marbles::jsonl::import(db, &slug, &rows, None, false)
                     .map_err(|e| e.to_string())?;
                 std::fs::write(
@@ -501,8 +503,7 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
                 let path = dir.join("AGENTS.md");
                 let existing = std::fs::read_to_string(&path).unwrap_or_default();
                 let next = marbles::setup::apply(&existing, profile, env!("CARGO_PKG_VERSION"));
-                std::fs::write(&path, next)
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                std::fs::write(&path, next).map_err(|e| format!("{}: {e}", path.display()))?;
                 if !*quiet {
                     println!("installed Marbles instructions in {}", path.display());
                 }
