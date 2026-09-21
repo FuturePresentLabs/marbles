@@ -360,7 +360,7 @@ async fn main() -> ExitCode {
         };
         Mode::Local(db)
     };
-    match run(&cli, &mode).await {
+    match run(&cli, &mode, effective_url.as_deref()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => fail(message),
     }
@@ -407,7 +407,7 @@ fn project_for(cli: &Cli) -> Result<String, String> {
     ))
 }
 
-async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
+async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), String> {
     let actor = cli.actor.clone().unwrap_or_else(actor_default);
     match &cli.command {
         Command::Init {
@@ -608,7 +608,7 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
             Ok(())
         }
         Command::Url => {
-            println!("{}", config::server_config().listen);
+            println!("{}", reported_url(effective_url));
             Ok(())
         }
         Command::Create(args) => {
@@ -1122,6 +1122,27 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
             );
             Ok(())
         }
+    }
+}
+
+/// The URL the current command is actually using. Remote client selection is resolved before
+/// `run`; only genuine local mode falls back to the server's loopback listen address.
+fn reported_url(effective_url: Option<&str>) -> String {
+    effective_url
+        .map(str::to_owned)
+        .unwrap_or_else(|| config::server_config().listen)
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::reported_url;
+
+    #[test]
+    fn url_reports_the_selected_remote_instead_of_the_local_listen_default() {
+        assert_eq!(
+            reported_url(Some("https://marbles.fpl.dev")),
+            "https://marbles.fpl.dev"
+        );
     }
 }
 
