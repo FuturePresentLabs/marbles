@@ -45,6 +45,7 @@ impl Api {
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
             .route("/healthz", axum::routing::get(|| async { "ok" }))
+            .route("/metrics", axum::routing::get(metrics))
             .route("/v1/projects.ensure", post(projects_ensure))
             .route("/v1/projects.list", post(projects_list))
             .route("/v1/issues.create", post(issues_create))
@@ -71,6 +72,23 @@ impl Api {
             ))
             .with_state(self)
     }
+}
+
+async fn metrics(
+    State(api): State<Arc<Api>>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Response, ApiError> {
+    let body = api
+        .db_for(&principal)?
+        .prometheus_metrics(crate::db::now())?;
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response())
 }
 
 async fn require_principal(State(api): State<Arc<Api>>, mut req: Request, next: Next) -> Response {
