@@ -22,5 +22,6 @@ pub mod oidc;
 pub mod setup;
 pub mod time;
 pub mod types;
+pub mod webhook;
 
 pub use db::{Db, Error};

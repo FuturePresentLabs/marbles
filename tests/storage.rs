@@ -26,6 +26,27 @@ fn new(title: &str) -> NewIssue {
     }
 }
 
+#[test]
+fn mutation_history_is_atomically_available_for_webhook_delivery() {
+    let db = db_with_project();
+    let id = db.create(&new("publish me"), 100).unwrap();
+
+    let pending = db.pending_events(100, 10).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].issue_id, id);
+    assert_eq!(pending[0].project, "demo");
+    assert_eq!(pending[0].event, "created");
+
+    db.mark_event_failed(pending[0].seq, 105, "receiver unavailable")
+        .unwrap();
+    assert!(db.pending_events(104, 10).unwrap().is_empty());
+    let retried = db.pending_events(105, 10).unwrap();
+    assert_eq!(retried[0].attempts, 1);
+
+    db.mark_event_delivered(retried[0].seq, 106).unwrap();
+    assert!(db.pending_events(1_000, 10).unwrap().is_empty());
+}
+
 // ---- claims ----
 
 #[test]

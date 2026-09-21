@@ -137,6 +137,23 @@ company claim is routed to `<company_store_root>/<company_id>/marbles.db`; an
 unscoped credential is rejected instead of falling back to a shared database.
 The checked-in `deploy/server.toml` is the FPL Auth production shape.
 
+An optional signed webhook wakes an event-driven consumer without making that consumer part of
+the mutation transaction:
+
+```toml
+[webhook]
+url = "http://alfalfad:8787/api/v1/webhooks/marbles"
+secret_file = "/run/secrets/marbles-webhook"
+timeout_seconds = 5
+```
+
+Every history mutation appends an outbox row in the same SQLite transaction. The dispatcher signs
+the exact JSON body with HMAC-SHA256 in `X-Marbles-Signature`, retries failures with bounded
+exponential backoff, and marks only a successful 2xx response delivered. Rotate by accepting old
+and new receiver secrets during a deployment, changing the mounted sender secret, then removing
+the old receiver secret. Polling remains the consumer's reconciliation path; webhook delivery is
+a latency optimization, not a second source of truth.
+
 ### Initialization and instruction files
 
 `mb init` owns Marbles repository integration. It registers the project, installs the managed

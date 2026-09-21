@@ -518,6 +518,7 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
         }
         Command::Serve { addr } => {
             let cfg = config::server_config();
+            let webhook = cfg.webhook.clone();
             let listen = addr.clone().unwrap_or(cfg.listen);
             let db = Arc::new(
                 Db::open(config::db_path()).map_err(|e| format!("opening database: {e}"))?,
@@ -534,6 +535,14 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
                 company_stores: company_stores.clone(),
                 auth,
             });
+            if let Some(webhook) = webhook {
+                let publisher = marbles::webhook::Publisher::new(
+                    webhook,
+                    Arc::clone(&db),
+                    company_stores.clone(),
+                )?;
+                tokio::spawn(publisher.run());
+            }
             let listener = tokio::net::TcpListener::bind(&listen)
                 .await
                 .map_err(|e| format!("binding {listen}: {e}"))?;

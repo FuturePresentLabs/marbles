@@ -8,11 +8,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthConfig;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookConfig {
+    pub url: String,
+    pub secret_file: PathBuf,
+    #[serde(default = "default_webhook_timeout_seconds")]
+    pub timeout_seconds: u64,
+}
+
+fn default_webhook_timeout_seconds() -> u64 {
+    5
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen: default_listen(),
             company_store_root: None,
+            webhook: None,
             auth: AuthConfig::default(),
         }
     }
@@ -27,6 +40,9 @@ pub struct ServerConfig {
     /// When absent, retain the single local database used by workstation mode.
     #[serde(default)]
     pub company_store_root: Option<PathBuf>,
+    /// Optional signed event sink. Delivery is backed by each store's transactional outbox.
+    #[serde(default)]
+    pub webhook: Option<WebhookConfig>,
     #[serde(default)]
     pub auth: AuthConfig,
 }
