@@ -1027,6 +1027,110 @@ impl Db {
                 .collect::<serde_json::Map<_, _>>()
         ))
     }
+
+    /// Render tracker-owned pipeline measurements from durable issue/history timestamps.
+    ///
+    /// These are recomputed from the ledger on every scrape: a process restart cannot reset a
+    /// throughput total or turn an unknown duration into zero. Issue ids and assignees are never
+    /// labels; project/status/event are the bounded operational dimensions.
+    pub fn prometheus_metrics(&self, at: i64) -> Result<String> {
+        let mut out = String::from(
+            "# HELP marbles_issues Current issues by project and status.\n\
+             # TYPE marbles_issues gauge\n\
+             # HELP marbles_queue_oldest_age_seconds Age of the oldest currently ready issue.\n\
+             # TYPE marbles_queue_oldest_age_seconds gauge\n\
+             # HELP marbles_claims_active Current unexpired claims by project and actor kind.\n\
+             # TYPE marbles_claims_active gauge\n\
+             # HELP marbles_events_total Durable tracker transitions by project and event.\n\
+             # TYPE marbles_events_total counter\n\
+             # HELP marbles_claim_latency_seconds Time from issue creation to first claim.\n\
+             # TYPE marbles_claim_latency_seconds summary\n\
+             # HELP marbles_cycle_time_seconds Time from issue creation to evidence-backed close.\n\
+             # TYPE marbles_cycle_time_seconds summary\n\
+             # HELP marbles_review_time_seconds Time from first review state to close.\n\
+             # TYPE marbles_review_time_seconds summary\n",
+        );
+        self.query(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT project, status, COUNT(*) FROM issue GROUP BY project, status ORDER BY project, status",
+            )?;
+            for row in stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })? {
+                let (project, status, count) = row?;
+                out.push_str(&format!(
+                    "marbles_issues{{project=\"{}\",status=\"{}\"}} {}\n",
+                    prometheus_label(&project), prometheus_label(&status), count
+                ));
+            }
+
+            let ready = "i.status='open' AND COALESCE(i.available_at,0) <= ?1 AND NOT EXISTS (SELECT 1 FROM dep d JOIN issue p ON p.id=d.depends_on WHERE d.issue_id=i.id AND p.status != 'closed')";
+            let mut stmt = conn.prepare(&format!(
+                "SELECT i.project, ?1 - MIN(i.created_at) FROM issue i WHERE {ready} GROUP BY i.project"
+            ))?;
+            for row in stmt.query_map(params![at], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+                let (project, age) = row?;
+                out.push_str(&format!("marbles_queue_oldest_age_seconds{{project=\"{}\"}} {}\n", prometheus_label(&project), age.max(0)));
+            }
+
+            let mut stmt = conn.prepare(
+                "SELECT project, actor_kind, COUNT(*) FROM issue WHERE assignee IS NOT NULL AND expires_at > ?1 GROUP BY project, actor_kind",
+            )?;
+            for row in stmt.query_map(params![at], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))? {
+                let (project, kind, count) = row?;
+                out.push_str(&format!("marbles_claims_active{{project=\"{}\",actor_kind=\"{}\"}} {}\n", prometheus_label(&project), prometheus_label(&kind), count));
+            }
+
+            let mut stmt = conn.prepare(
+                "SELECT i.project, h.event, COUNT(*) FROM history h JOIN issue i ON i.id=h.issue_id GROUP BY i.project, h.event",
+            )?;
+            for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))? {
+                let (project, event, count) = row?;
+                out.push_str(&format!("marbles_events_total{{project=\"{}\",event=\"{}\"}} {}\n", prometheus_label(&project), prometheus_label(&event), count));
+            }
+
+            append_duration_summary(conn, &mut out, "marbles_claim_latency_seconds", "SELECT i.project, SUM(first_claim - i.created_at), COUNT(*) FROM issue i JOIN (SELECT issue_id, MIN(ts) AS first_claim FROM history WHERE event='claimed' GROUP BY issue_id) h ON h.issue_id=i.id WHERE first_claim >= i.created_at GROUP BY i.project")?;
+            append_duration_summary(conn, &mut out, "marbles_cycle_time_seconds", "SELECT project, SUM(closed_at - created_at), COUNT(*) FROM issue WHERE closed_at IS NOT NULL AND closed_at >= created_at GROUP BY project")?;
+            append_duration_summary(conn, &mut out, "marbles_review_time_seconds", "SELECT i.project, SUM(i.closed_at - h.first_review), COUNT(*) FROM issue i JOIN (SELECT issue_id, MIN(ts) AS first_review FROM history WHERE event='status' AND detail='→ review' GROUP BY issue_id) h ON h.issue_id=i.id WHERE i.closed_at IS NOT NULL AND i.closed_at >= h.first_review GROUP BY i.project")?;
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
+
+fn append_duration_summary(
+    conn: &Connection,
+    out: &mut String,
+    metric: &str,
+    sql: &str,
+) -> Result<()> {
+    let mut stmt = conn.prepare(sql)?;
+    for row in stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })? {
+        let (project, sum, count) = row?;
+        let project = prometheus_label(&project);
+        out.push_str(&format!(
+            "{metric}_sum{{project=\"{project}\"}} {}\n",
+            sum.max(0)
+        ));
+        out.push_str(&format!(
+            "{metric}_count{{project=\"{project}\"}} {}\n",
+            count
+        ));
+    }
+    Ok(())
+}
+
+fn prometheus_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('"', "\\\"")
 }
 
 #[derive(Debug, Default, serde::Serialize)]

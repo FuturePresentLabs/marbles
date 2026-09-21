@@ -27,6 +27,47 @@ fn new(title: &str) -> NewIssue {
 }
 
 #[test]
+fn prometheus_metrics_derive_latency_and_capacity_without_issue_id_labels() {
+    let db = db_with_project();
+    let id = db.create(&new("deliver"), 100).unwrap();
+    db.claim(
+        &ClaimRequest {
+            id: id.clone(),
+            assignee: "worker".into(),
+            actor_kind: ActorKind::Agent,
+            ttl_seconds: Some(100),
+        },
+        110,
+    )
+    .unwrap();
+    db.update(
+        &id,
+        &IssuePatch {
+            status: Some("review".into()),
+            ..Default::default()
+        },
+        "worker",
+        130,
+    )
+    .unwrap();
+    db.close(&id, None, &[Evidence::commit("deadbeef")], "reviewer", 150)
+        .unwrap();
+    let mut waiting = new("waiting");
+    waiting.available_at = Some(0);
+    db.create(&waiting, 120).unwrap();
+
+    let rendered = db.prometheus_metrics(200).unwrap();
+    assert!(rendered.contains("marbles_claim_latency_seconds_sum{project=\"demo\"} 10"));
+    assert!(rendered.contains("marbles_cycle_time_seconds_sum{project=\"demo\"} 50"));
+    assert!(rendered.contains("marbles_review_time_seconds_sum{project=\"demo\"} 20"));
+    assert!(rendered.contains("marbles_queue_oldest_age_seconds{project=\"demo\"} 80"));
+    assert!(
+        !rendered.contains(&id),
+        "issue ids must never become labels"
+    );
+}
+
+#[test]
 fn mutation_history_is_atomically_available_for_webhook_delivery() {
     let db = db_with_project();
     let id = db.create(&new("publish me"), 100).unwrap();
