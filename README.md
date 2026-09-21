@@ -98,6 +98,10 @@ cargo install --path .            # installs `marbles`
 marbles --version
 ```
 
+Tagged releases publish checksum-addressed archives for Linux and macOS on both x86-64 and
+ARM64. On an FPL workstation, `fpl install marbles` selects and verifies the correct archive,
+then exposes both `marbles` and `mb` in `~/.local/bin`.
+
 ### Local, single operator
 
 ```bash
@@ -138,7 +142,9 @@ The checked-in `deploy/server.toml` is the FPL Auth production shape.
 `mb init` owns Marbles repository integration. It registers the project, installs the managed
 Marbles block in `AGENTS.md`, and, when `.beads/` is present, runs an idempotent `bd export`
 migration automatically. Use `--no-hooks` or `--no-migrate-beads` only for deliberately managed
-environments. `marbles setup` remains available for explicitly changing the profile later.
+environments. FPL-managed repositories persist `server_url = "https://marbles.fpl.dev"`; tokens
+remain in the user's credential store. `marbles setup` remains available for explicitly changing
+the profile later.
 
 ### Instruction files (`marbles setup`)
 

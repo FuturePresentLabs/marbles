@@ -67,6 +67,9 @@ enum Command {
         /// Managed instruction profile installed by init.
         #[arg(long, default_value = "conservative")]
         profile: String,
+        /// Persist the Marbles service endpoint in project.toml.
+        #[arg(long)]
+        server_url: Option<String>,
     },
     /// Start the server (fleet mode).
     Serve {
@@ -325,7 +328,14 @@ async fn main() -> ExitCode {
     let effective_url = cli
         .url
         .clone()
-        .or_else(|| saved.as_ref().map(|value| value.url.clone()));
+        .or_else(|| saved.as_ref().map(|value| value.url.clone()))
+        .or_else(|| {
+            if matches!(&cli.command, Command::Init { .. }) {
+                return None;
+            }
+            let dir = std::env::current_dir().ok()?.join(&cli.dir);
+            config::discover_project(&dir).and_then(|(_, project)| project.server_url)
+        });
     let mode = if let Some(url) = &effective_url {
         let token = if let Some(token) = cli.token.clone() {
             token
@@ -407,6 +417,7 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
             no_hooks,
             no_migrate_beads,
             profile,
+            server_url,
         } => {
             let dir = std::env::current_dir().unwrap_or_default().join(&cli.dir);
             let dir = dir.canonicalize().unwrap_or(dir);
@@ -424,7 +435,13 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
             std::fs::create_dir_all(&marbles_dir).map_err(|e| e.to_string())?;
             std::fs::write(
                 marbles_dir.join("project.toml"),
-                format!("slug = \"{slug}\"\nprefix = \"{prefix}\"\n"),
+                format!(
+                    "slug = \"{slug}\"\nprefix = \"{prefix}\"\n{}",
+                    server_url
+                        .as_ref()
+                        .map(|url| format!("server_url = \"{url}\"\n"))
+                        .unwrap_or_default()
+                ),
             )
             .map_err(|e| e.to_string())?;
             match mode {

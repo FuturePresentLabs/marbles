@@ -68,6 +68,8 @@ pub fn server_config() -> ServerConfig {
 pub struct ProjectFile {
     pub slug: String,
     pub prefix: String,
+    #[serde(default)]
+    pub server_url: Option<String>,
 }
 
 pub const PROJECT_FILE: &str = ".marbles/project.toml";
@@ -121,11 +123,12 @@ mod tests {
         std::fs::create_dir_all(project_root.join(".marbles")).unwrap();
         std::fs::write(
             project_root.join(".marbles/project.toml"),
-            "slug = \"demo\"\nprefix = \"demo\"\n",
+            "slug = \"demo\"\nprefix = \"demo\"\nserver_url = \"https://marbles.fpl.dev\"\n",
         )
         .unwrap();
         let (root, project) = discover_project(&deep).unwrap();
         assert_eq!(project.slug, "demo");
+        assert_eq!(project.server_url.as_deref(), Some("https://marbles.fpl.dev"));
         assert!(root.ends_with("a"));
     }
 }

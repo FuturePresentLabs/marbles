@@ -1,0 +1,86 @@
+name: Release CLI
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cli:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-13
+            target: x86_64-apple-darwin
+          - runner: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo test --locked --all-targets
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package marbles and mb
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive="marbles-${version}-${{ matrix.target }}.tar.gz"
+          stage="$(mktemp -d)"
+          install -m 0755 "target/${{ matrix.target }}/release/marbles" "$stage/marbles"
+          cp "$stage/marbles" "$stage/mb"
+          tar -C "$stage" -czf "$archive" marbles mb
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marbles-${{ matrix.target }}
+          path: marbles-*.tar.gz*
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: marbles-*.tar.gz*
+
+  manifest:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: cli
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: marbles-*
+          merge-multiple: true
+          path: artifacts
+      - name: Build installer manifest
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          repo="${GITHUB_REPOSITORY}"
+          jq -n --arg version "$version" --arg repo "$repo" \
+            '{schema_version:1,artifacts:[{name:"marbles",version:$version,platforms:[]}]}' > latest.json
+          for checksum in artifacts/*.tar.gz.sha256; do
+            archive="$(basename "${checksum%.sha256}")"
+            target="${archive#marbles-${version}-}"
+            target="${target%.tar.gz}"
+            sha="$(awk "{print \$1}" "$checksum")"
+            url="https://github.com/${repo}/releases/download/${GITHUB_REF_NAME}/${archive}"
+            jq --arg target "$target" --arg url "$url" --arg sha "$sha" \
+              '.artifacts[0].platforms += [{target:$target,url:$url,sha256:$sha,format:"tar.gz"}]' \
+              latest.json > latest.json.next
+            mv latest.json.next latest.json
+          done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: latest.json

@@ -26,7 +26,14 @@ fn init_owns_hooks_and_migrates_a_legacy_beads_store() {
         std::env::var("PATH").unwrap_or_default()
     );
     let status = Command::new(env!("CARGO_BIN_EXE_marbles"))
-        .args(["-C", repo.to_str().unwrap(), "init", "--quiet"])
+        .args([
+            "-C",
+            repo.to_str().unwrap(),
+            "init",
+            "--quiet",
+            "--server-url",
+            "https://marbles.fpl.dev",
+        ])
         .env("MARBLES_HOME", &home)
         .env("PATH", path)
         .status()
@@ -34,6 +41,17 @@ fn init_owns_hooks_and_migrates_a_legacy_beads_store() {
     assert!(status.success());
     assert!(repo.join(".marbles/project.toml").is_file());
     assert!(repo.join(".marbles/beads-migrated").is_file());
+    assert!(
+        std::fs::read_to_string(repo.join(".marbles/project.toml"))
+            .unwrap()
+            .contains("server_url = \"https://marbles.fpl.dev\"")
+    );
+    // Inspect the local migration store without contacting the configured cloud endpoint.
+    std::fs::write(
+        repo.join(".marbles/project.toml"),
+        "slug = \"demo\"\nprefix = \"demo\"\n",
+    )
+    .unwrap();
     let agents = std::fs::read_to_string(repo.join("AGENTS.md")).unwrap();
     assert!(agents.contains("BEGIN MARBLES"));
 
