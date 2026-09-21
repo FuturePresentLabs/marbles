@@ -63,6 +63,12 @@ pub fn read_jsonl(path: &str) -> Result<Vec<Value>> {
         text =
             std::fs::read_to_string(path).map_err(|e| ImportError::Bad(format!("{path}: {e}")))?;
     }
+    parse_jsonl(&text, path)
+}
+
+/// Parse a Beads JSONL export already held in memory. This is used by `mb init`
+/// so migration never needs a durable intermediate export containing project data.
+pub fn parse_jsonl(text: &str, source: &str) -> Result<Vec<Value>> {
     let mut rows = Vec::new();
     for (n, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -70,7 +76,7 @@ pub fn read_jsonl(path: &str) -> Result<Vec<Value>> {
             continue;
         }
         let value: Value = serde_json::from_str(line)
-            .map_err(|e| ImportError::Bad(format!("{path}:{}: {e}", n + 1)))?;
+            .map_err(|e| ImportError::Bad(format!("{source}:{}: {e}", n + 1)))?;
         if value.get("_type").and_then(Value::as_str) == Some("issue") {
             rows.push(value);
         } else {

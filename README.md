@@ -102,7 +102,7 @@ marbles --version
 
 ```bash
 cd my-repo
-marbles init                       # writes .marbles/project.toml
+mb init                            # registers the project, installs its managed instructions
 marbles create "Fix the thing" -p 1
 marbles ready                      # eligible work, already
 marbles list --json
@@ -132,6 +132,13 @@ Hosted deployments set `company_store_root` and `company_claim`. Each verified
 company claim is routed to `<company_store_root>/<company_id>/marbles.db`; an
 unscoped credential is rejected instead of falling back to a shared database.
 The checked-in `deploy/server.toml` is the FPL Auth production shape.
+
+### Initialization and instruction files
+
+`mb init` owns Marbles repository integration. It registers the project, installs the managed
+Marbles block in `AGENTS.md`, and, when `.beads/` is present, runs an idempotent `bd export`
+migration automatically. Use `--no-hooks` or `--no-migrate-beads` only for deliberately managed
+environments. `marbles setup` remains available for explicitly changing the profile later.
 
 ### Instruction files (`marbles setup`)
 

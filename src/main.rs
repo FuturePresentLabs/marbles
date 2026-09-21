@@ -58,6 +58,15 @@ enum Command {
         slug: Option<String>,
         #[arg(long)]
         quiet: bool,
+        /// Do not install the managed Marbles block in AGENTS.md.
+        #[arg(long)]
+        no_hooks: bool,
+        /// Skip automatic import when a legacy .beads store is present.
+        #[arg(long)]
+        no_migrate_beads: bool,
+        /// Managed instruction profile installed by init.
+        #[arg(long, default_value = "conservative")]
+        profile: String,
     },
     /// Start the server (fleet mode).
     Serve {
@@ -395,6 +404,9 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
             prefix,
             slug,
             quiet,
+            no_hooks,
+            no_migrate_beads,
+            profile,
         } => {
             let dir = std::env::current_dir().unwrap_or_default().join(&cli.dir);
             let dir = dir.canonicalize().unwrap_or(dir);
@@ -426,6 +438,48 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
                             &serde_json::json!({"slug": slug, "root": dir.to_string_lossy(), "prefix": prefix}),
                         )
                         .await?;
+                }
+            }
+            if !*no_migrate_beads && dir.join(".beads").is_dir() {
+                let db = require_local(
+                    mode,
+                    "automatic Beads migration currently requires local Marbles mode; unset MARBLES_URL or run `bd export | mb import-bd - --project <slug>` against the server",
+                )?;
+                let output = std::process::Command::new("bd")
+                    .arg("export")
+                    .current_dir(&dir)
+                    .output()
+                    .map_err(|e| format!("legacy .beads store found but `bd export` could not run: {e}"))?;
+                if !output.status.success() {
+                    return Err(format!(
+                        "legacy .beads export failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ));
+                }
+                let export = String::from_utf8(output.stdout)
+                    .map_err(|e| format!("bd export was not UTF-8: {e}"))?;
+                let rows = marbles::jsonl::parse_jsonl(&export, "bd export")
+                    .map_err(|e| e.to_string())?;
+                let report = marbles::jsonl::import(db, &slug, &rows, None, false)
+                    .map_err(|e| e.to_string())?;
+                if !*quiet {
+                    println!(
+                        "migrated Beads into {slug}: {} imported, {} unchanged, {} dependencies",
+                        report.imported, report.unchanged, report.deps
+                    );
+                }
+            }
+            if !*no_hooks {
+                let profile = Profile::parse(profile).ok_or_else(|| {
+                    format!("unknown profile {profile:?} (try conservative or maintainer)")
+                })?;
+                let path = dir.join("AGENTS.md");
+                let existing = std::fs::read_to_string(&path).unwrap_or_default();
+                let next = marbles::setup::apply(&existing, profile, env!("CARGO_PKG_VERSION"));
+                std::fs::write(&path, next)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                if !*quiet {
+                    println!("installed Marbles instructions in {}", path.display());
                 }
             }
             if !*quiet {
