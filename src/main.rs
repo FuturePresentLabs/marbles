@@ -462,6 +462,14 @@ async fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
                     .map_err(|e| e.to_string())?;
                 let report = marbles::jsonl::import(db, &slug, &rows, None, false)
                     .map_err(|e| e.to_string())?;
+                std::fs::write(
+                    marbles_dir.join("beads-migrated"),
+                    format!(
+                        "project = \"{slug}\"\nissues = {}\n",
+                        report.imported + report.unchanged
+                    ),
+                )
+                .map_err(|e| format!("writing Beads migration receipt: {e}"))?;
                 if !*quiet {
                     println!(
                         "migrated Beads into {slug}: {} imported, {} unchanged, {} dependencies",

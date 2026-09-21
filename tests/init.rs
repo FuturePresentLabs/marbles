@@ -33,6 +33,7 @@ fn init_owns_hooks_and_migrates_a_legacy_beads_store() {
         .unwrap();
     assert!(status.success());
     assert!(repo.join(".marbles/project.toml").is_file());
+    assert!(repo.join(".marbles/beads-migrated").is_file());
     let agents = std::fs::read_to_string(repo.join("AGENTS.md")).unwrap();
     assert!(agents.contains("BEGIN MARBLES"));
 
