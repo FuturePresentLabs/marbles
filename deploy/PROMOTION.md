@@ -11,3 +11,6 @@ image tag.
 
 Compatibility evidence is versioned with the deployment target and must be
 updated deliberately whenever the SQLite read/write contract changes.
+
+The Fab release history and Shroud rollout receipt are the authoritative
+deployment evidence; a mutable registry tag is not.
