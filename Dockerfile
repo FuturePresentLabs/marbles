@@ -2,7 +2,9 @@ FROM rust:1.88-bookworm AS builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --locked --release
+COPY tests ./tests
+RUN cargo test --locked --all-targets --all-features \
+ && cargo build --locked --release
 
 FROM debian:12-slim
 RUN apt-get update \
