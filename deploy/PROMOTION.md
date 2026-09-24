@@ -8,3 +8,6 @@ retains the existing `marbles-company-store` volume, waits for `/healthz`, and
 restores the previous image against the same bytes if the candidate is not
 ready. Do not replace this with a retire-then-create deployment or a mutable
 image tag.
+
+Compatibility evidence is versioned with the deployment target and must be
+updated deliberately whenever the SQLite read/write contract changes.
