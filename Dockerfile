@@ -1,6 +1,6 @@
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.88-slim-bookworm AS builder
 WORKDIR /src
-ENV CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_DEBUG=0
+ENV CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_DEBUG=0
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY tests ./tests
