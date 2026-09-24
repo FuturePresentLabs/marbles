@@ -1,9 +1,10 @@
 FROM rust:1.88-bookworm AS builder
 WORKDIR /src
+ENV CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_DEBUG=0
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY tests ./tests
-RUN cargo test --locked --all-targets --all-features \
+RUN cargo test --locked --release --all-targets --all-features \
  && cargo build --locked --release
 
 FROM debian:12-slim
