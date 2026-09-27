@@ -169,13 +169,13 @@ the profile later.
 into `AGENTS.md` (or `--target CLAUDE.md`), with the profile and a content hash
 in the begin-line so drift is visible. Profiles:
 
-- `conservative` (default): track work with `mb`; commit and push only when the
-  repo or user says so.
-- `maintainer` (the FPL fleet): agents commit verified work early and often,
-  rebase rather than rot, never leave a dirty worktree without a live claim,
-  move marbles to `review` with a PR link, and never close — closing is the
-  delivery loop's job with merge evidence. Push credentials and agent processes
-  do not cohabit.
+- `maintainer` (default, the FPL fleet): agents commit verified work early and
+  often, rebase rather than rot, never leave a dirty worktree without a live
+  claim, move marbles to `review` with a PR link, and never close — closing is
+  the delivery loop's job with merge evidence. Push credentials and agent
+  processes do not cohabit.
+- `conservative` (opt-in, for arbitrary/third-party users): track work with
+  `mb`; commit and push only when the repo or user says so.
 
 ## Migrating from Beads
 

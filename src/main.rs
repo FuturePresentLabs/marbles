@@ -65,7 +65,7 @@ enum Command {
         #[arg(long)]
         no_migrate_beads: bool,
         /// Managed instruction profile installed by init.
-        #[arg(long, default_value = "conservative")]
+        #[arg(long, default_value = "maintainer")]
         profile: String,
         /// Persist the Marbles service endpoint in project.toml.
         #[arg(long)]
@@ -209,7 +209,7 @@ enum Command {
     },
     /// Install or refresh the managed instruction block in AGENTS.md/CLAUDE.md.
     Setup {
-        #[arg(long, default_value = "conservative")]
+        #[arg(long, default_value = "maintainer")]
         profile: String,
         #[arg(long, default_value = "AGENTS.md")]
         target: String,
