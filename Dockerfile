@@ -1,6 +1,6 @@
 FROM rust:1.88-slim-bookworm AS builder
 RUN apt-get update \
- && apt-get install -y --no-install-recommends perl-modules \
+ && apt-get install -y --no-install-recommends perl \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 ENV CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_DEBUG=0
