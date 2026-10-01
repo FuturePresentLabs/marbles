@@ -1,4 +1,7 @@
 FROM rust:1.88-slim-bookworm AS builder
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends perl-modules \
+ && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 ENV CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_DEBUG=0
 COPY Cargo.toml Cargo.lock ./
@@ -14,6 +17,7 @@ RUN apt-get update \
  && useradd --system --uid 10001 --home /data --shell /usr/sbin/nologin marbles \
  && install -d -o marbles -g marbles -m 0700 /data/companies /data/tokens
 COPY --from=builder /src/target/release/marbles /usr/local/bin/marbles
+COPY --from=builder /src/target/release/marbles-pg-migrate /usr/local/bin/marbles-pg-migrate
 COPY --chown=marbles:marbles deploy/server.toml /data/server.toml
 USER marbles
 ENV HOME=/data MARBLES_HOME=/data
