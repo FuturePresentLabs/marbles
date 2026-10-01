@@ -18,7 +18,8 @@ use clap::{Parser, Subcommand};
 use marbles::auth::Auth;
 use marbles::client::Client;
 use marbles::config;
-use marbles::db::{CompanyStores, Db, now};
+use marbles::db::{CompanyStoreRegistry, CompanyStores, Db, now};
+use marbles::postgres_store::PostgresCompanyStores;
 use marbles::setup::Profile;
 use marbles::types::*;
 
@@ -520,15 +521,29 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             let cfg = config::server_config();
             let webhook = cfg.webhook.clone();
             let listen = addr.clone().unwrap_or(cfg.listen);
-            let db = Arc::new(
-                Db::open(config::db_path()).map_err(|e| format!("opening database: {e}"))?,
-            );
-            let company_stores = cfg
-                .company_store_root
-                .map(CompanyStores::new)
-                .transpose()
-                .map_err(|e| format!("opening company stores: {e}"))?
-                .map(Arc::new);
+            let database_url = std::env::var("DATABASE_URL")
+                .ok()
+                .filter(|url| !url.trim().is_empty());
+            // The API requires a workstation fallback store, but hosted OIDC requests always
+            // resolve through `company_stores`. Keep that fallback ephemeral in PostgreSQL mode
+            // so a production process never creates or mutates a shadow SQLite authority.
+            let db: Arc<dyn marbles::db::Store> = if database_url.is_some() {
+                Arc::new(Db::in_memory().map_err(|e| format!("opening fallback store: {e}"))?)
+            } else {
+                Arc::new(Db::open(config::db_path()).map_err(|e| format!("opening database: {e}"))?)
+            };
+            let company_stores: Option<Arc<dyn CompanyStoreRegistry>> = match database_url {
+                Some(url) => Some(Arc::new(
+                    PostgresCompanyStores::connect(&url)
+                        .map_err(|e| format!("opening hosted PostgreSQL store: {e}"))?,
+                )),
+                _ => cfg
+                    .company_store_root
+                    .map(CompanyStores::new)
+                    .transpose()
+                    .map_err(|e| format!("opening company stores: {e}"))?
+                    .map(|stores| Arc::new(stores) as Arc<dyn CompanyStoreRegistry>),
+            };
             let auth = Arc::new(Auth::new(cfg.auth, config::token_dir()));
             let api = Arc::new(marbles::api::Api {
                 db: Arc::clone(&db),
@@ -547,7 +562,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                 .await
                 .map_err(|e| format!("binding {listen}: {e}"))?;
             println!(
-                "marbles serving on http://{listen} (db {}, company stores {}, tokens {})",
+                "marbles serving on http://{listen} (db {}, hosted stores {}, tokens {})",
                 config::db_path().display(),
                 company_stores
                     .as_ref()

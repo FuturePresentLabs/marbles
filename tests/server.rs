@@ -19,7 +19,7 @@ fn app() -> (Router, tempfile::TempDir) {
     marbles::auth::mint_token(&dir.path().join("tokens"), ActorKind::Agent, "worker").unwrap();
     marbles::auth::mint_token(&dir.path().join("tokens"), ActorKind::Human, "avery").unwrap();
     let api = Arc::new(Api {
-        db: Arc::clone(&db),
+        db: db.clone(),
         company_stores: None,
         auth: Arc::new(Auth::new(AuthConfig::default(), dir.path().join("tokens"))),
     });

@@ -17,19 +17,19 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{Auth, Principal};
-use crate::db::{CompanyStores, Db, Error as DbError, SweepReport};
+use crate::db::{CompanyStoreRegistry, Error as DbError, Store, SweepReport};
 use crate::types::*;
 
 pub struct Api {
     /// Workstation/default store. Hosted deployments set `company_stores` and
     /// this file is never selected for an OIDC principal.
-    pub db: Arc<Db>,
-    pub company_stores: Option<Arc<CompanyStores>>,
+    pub db: Arc<dyn Store>,
+    pub company_stores: Option<Arc<dyn CompanyStoreRegistry>>,
     pub auth: Arc<Auth>,
 }
 
 impl Api {
-    fn db_for(&self, principal: &Principal) -> Result<Arc<Db>, ApiError> {
+    fn db_for(&self, principal: &Principal) -> Result<Arc<dyn Store>, ApiError> {
         let Some(stores) = &self.company_stores else {
             return Ok(Arc::clone(&self.db));
         };
@@ -135,7 +135,9 @@ impl IntoResponse for ApiError {
                     DbError::BadStatus(_) | DbError::Bad(_) | DbError::NoEvidence(_) => {
                         StatusCode::UNPROCESSABLE_ENTITY
                     }
-                    DbError::Sqlite(_) | DbError::Json(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                    DbError::Sqlite(_) | DbError::Postgres(_) | DbError::Json(_) => {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
                 };
                 (status, err.to_string())
             }
@@ -501,7 +503,7 @@ async fn issues_import(
         &body.project,
     )
     .map_err(|e| ApiError(ApiErrorKind::Db(e)))?;
-    crate::import::import(&db, &body.project, &body.rows)
+    crate::import::import(&*db, &body.project, &body.rows)
         .map(Json)
         .map_err(|e| ApiError(ApiErrorKind::Status(StatusCode::BAD_REQUEST, e)))
 }

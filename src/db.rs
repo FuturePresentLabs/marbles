@@ -82,6 +82,8 @@ CREATE INDEX IF NOT EXISTS outbound_event_pending
 pub enum Error {
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("postgres: {0}")]
+    Postgres(#[from] postgres::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("no issue {0}")]
@@ -105,6 +107,49 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Storage contract used by the hosted API.
+///
+/// Local operation deliberately remains a concrete [`Db`]. Hosted backends implement this
+/// narrow contract so transport/auth code cannot depend on SQLite internals.
+pub trait Store: Send + Sync {
+    fn ensure_project(&self, slug: &str, root: &str, prefix: &str) -> Result<()>;
+    fn projects(&self) -> Result<Vec<(String, String, String)>>;
+    fn pending_events(&self, at: i64, limit: usize) -> Result<Vec<OutboundEvent>>;
+    fn mark_event_delivered(&self, seq: i64, at: i64) -> Result<()>;
+    fn mark_event_failed(&self, seq: i64, next_attempt_at: i64, error: &str) -> Result<()>;
+    fn create(&self, spec: &NewIssue, at: i64) -> Result<String>;
+    fn get(&self, id: &str) -> Result<Issue>;
+    fn list(&self, project: Option<&str>, all: bool, only_id: Option<&str>) -> Result<Vec<Issue>>;
+    fn ready(&self, project: Option<&str>, at: i64) -> Result<Vec<Issue>>;
+    fn update(&self, id: &str, patch: &IssuePatch, actor: &str, at: i64) -> Result<Issue>;
+    fn add_label(&self, id: &str, label: &str, actor: &str, at: i64) -> Result<()>;
+    fn remove_label(&self, id: &str, label: &str, actor: &str, at: i64) -> Result<()>;
+    fn add_dep(&self, child: &str, parent: &str, actor: &str, at: i64) -> Result<()>;
+    fn remove_dep(&self, child: &str, parent: &str, actor: &str, at: i64) -> Result<()>;
+    fn claim(&self, req: &ClaimRequest, at: i64) -> Result<ClaimReceipt>;
+    fn touch(&self, id: &str, assignee: &str, at: i64) -> Result<i64>;
+    fn release(&self, id: &str, actor: &str, at: i64) -> Result<()>;
+    fn sweep(&self, at: i64) -> Result<SweepReport>;
+    fn close(
+        &self,
+        id: &str,
+        reason: Option<&str>,
+        evidence: &[Evidence],
+        actor: &str,
+        at: i64,
+    ) -> Result<Issue>;
+    fn supersede(&self, id: &str, replacement: &str, actor: &str, at: i64) -> Result<()>;
+    fn history(&self, id: &str) -> Result<Vec<HistoryEvent>>;
+    fn stats(&self) -> Result<serde_json::Value>;
+    fn prometheus_metrics(&self, at: i64) -> Result<String>;
+}
+
+pub trait CompanyStoreRegistry: Send + Sync {
+    fn for_company(&self, company_id: &str) -> Result<Arc<dyn Store>>;
+    fn sweep_open(&self, now: i64) -> Result<Vec<(String, SweepReport)>>;
+    fn open_stores(&self) -> Result<Vec<(String, Arc<dyn Store>)>>;
+}
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -130,7 +175,7 @@ pub struct OutboundEvent {
 /// predicate.
 pub struct CompanyStores {
     root: PathBuf,
-    open: Mutex<BTreeMap<String, Arc<Db>>>,
+    open: Mutex<BTreeMap<String, Arc<dyn Store>>>,
 }
 
 impl CompanyStores {
@@ -164,7 +209,7 @@ impl CompanyStores {
         Ok(stores)
     }
 
-    pub fn for_company(&self, company_id: &str) -> Result<Arc<Db>> {
+    pub fn for_company(&self, company_id: &str) -> Result<Arc<dyn Store>> {
         validate_company_id(company_id)?;
         let mut stores = self
             .open
@@ -180,7 +225,7 @@ impl CompanyStores {
                 company_root.display()
             ))
         })?;
-        let db = Arc::new(Db::open(company_root.join("marbles.db"))?);
+        let db: Arc<dyn Store> = Arc::new(Db::open(company_root.join("marbles.db"))?);
         stores.insert(company_id.to_owned(), Arc::clone(&db));
         Ok(db)
     }
@@ -196,7 +241,7 @@ impl CompanyStores {
             .collect()
     }
 
-    pub fn open_stores(&self) -> Result<Vec<(String, Arc<Db>)>> {
+    pub fn open_stores(&self) -> Result<Vec<(String, Arc<dyn Store>)>> {
         let stores = self
             .open
             .lock()
@@ -208,7 +253,21 @@ impl CompanyStores {
     }
 }
 
-fn validate_company_id(company_id: &str) -> Result<()> {
+impl CompanyStoreRegistry for CompanyStores {
+    fn for_company(&self, company_id: &str) -> Result<Arc<dyn Store>> {
+        CompanyStores::for_company(self, company_id)
+    }
+
+    fn sweep_open(&self, now: i64) -> Result<Vec<(String, SweepReport)>> {
+        CompanyStores::sweep_open(self, now)
+    }
+
+    fn open_stores(&self) -> Result<Vec<(String, Arc<dyn Store>)>> {
+        CompanyStores::open_stores(self)
+    }
+}
+
+pub(crate) fn validate_company_id(company_id: &str) -> Result<()> {
     if company_id.is_empty()
         || company_id.len() > 128
         || !company_id
@@ -1095,6 +1154,85 @@ impl Db {
             Ok(())
         })?;
         Ok(out)
+    }
+}
+
+impl Store for Db {
+    fn ensure_project(&self, slug: &str, root: &str, prefix: &str) -> Result<()> {
+        Db::ensure_project(self, slug, root, prefix)
+    }
+    fn projects(&self) -> Result<Vec<(String, String, String)>> {
+        Db::projects(self)
+    }
+    fn pending_events(&self, at: i64, limit: usize) -> Result<Vec<OutboundEvent>> {
+        Db::pending_events(self, at, limit)
+    }
+    fn mark_event_delivered(&self, seq: i64, at: i64) -> Result<()> {
+        Db::mark_event_delivered(self, seq, at)
+    }
+    fn mark_event_failed(&self, seq: i64, next_attempt_at: i64, error: &str) -> Result<()> {
+        Db::mark_event_failed(self, seq, next_attempt_at, error)
+    }
+    fn create(&self, spec: &NewIssue, at: i64) -> Result<String> {
+        Db::create(self, spec, at)
+    }
+    fn get(&self, id: &str) -> Result<Issue> {
+        Db::get(self, id)
+    }
+    fn list(&self, project: Option<&str>, all: bool, only_id: Option<&str>) -> Result<Vec<Issue>> {
+        Db::list(self, project, all, only_id)
+    }
+    fn ready(&self, project: Option<&str>, at: i64) -> Result<Vec<Issue>> {
+        Db::ready(self, project, at)
+    }
+    fn update(&self, id: &str, patch: &IssuePatch, actor: &str, at: i64) -> Result<Issue> {
+        Db::update(self, id, patch, actor, at)
+    }
+    fn add_label(&self, id: &str, label: &str, actor: &str, at: i64) -> Result<()> {
+        Db::add_label(self, id, label, actor, at)
+    }
+    fn remove_label(&self, id: &str, label: &str, actor: &str, at: i64) -> Result<()> {
+        Db::remove_label(self, id, label, actor, at)
+    }
+    fn add_dep(&self, child: &str, parent: &str, actor: &str, at: i64) -> Result<()> {
+        Db::add_dep(self, child, parent, actor, at)
+    }
+    fn remove_dep(&self, child: &str, parent: &str, actor: &str, at: i64) -> Result<()> {
+        Db::remove_dep(self, child, parent, actor, at)
+    }
+    fn claim(&self, req: &ClaimRequest, at: i64) -> Result<ClaimReceipt> {
+        Db::claim(self, req, at)
+    }
+    fn touch(&self, id: &str, assignee: &str, at: i64) -> Result<i64> {
+        Db::touch(self, id, assignee, at)
+    }
+    fn release(&self, id: &str, actor: &str, at: i64) -> Result<()> {
+        Db::release(self, id, actor, at)
+    }
+    fn sweep(&self, at: i64) -> Result<SweepReport> {
+        Db::sweep(self, at)
+    }
+    fn close(
+        &self,
+        id: &str,
+        reason: Option<&str>,
+        evidence: &[Evidence],
+        actor: &str,
+        at: i64,
+    ) -> Result<Issue> {
+        Db::close(self, id, reason, evidence, actor, at)
+    }
+    fn supersede(&self, id: &str, replacement: &str, actor: &str, at: i64) -> Result<()> {
+        Db::supersede(self, id, replacement, actor, at)
+    }
+    fn history(&self, id: &str) -> Result<Vec<HistoryEvent>> {
+        Db::history(self, id)
+    }
+    fn stats(&self) -> Result<serde_json::Value> {
+        Db::stats(self)
+    }
+    fn prometheus_metrics(&self, at: i64) -> Result<String> {
+        Db::prometheus_metrics(self, at)
     }
 }
 

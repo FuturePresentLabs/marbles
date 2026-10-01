@@ -12,7 +12,7 @@ use serde::Serialize;
 use sha2::Sha256;
 
 use crate::config::WebhookConfig;
-use crate::db::{CompanyStores, Db, OutboundEvent, now};
+use crate::db::{CompanyStoreRegistry, OutboundEvent, Store, now};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -31,15 +31,15 @@ pub struct Publisher {
     config: WebhookConfig,
     secret: Vec<u8>,
     client: reqwest::Client,
-    default_db: Arc<Db>,
-    companies: Option<Arc<CompanyStores>>,
+    default_db: Arc<dyn Store>,
+    companies: Option<Arc<dyn CompanyStoreRegistry>>,
 }
 
 impl Publisher {
     pub fn new(
         config: WebhookConfig,
-        default_db: Arc<Db>,
-        companies: Option<Arc<CompanyStores>>,
+        default_db: Arc<dyn Store>,
+        companies: Option<Arc<dyn CompanyStoreRegistry>>,
     ) -> Result<Self, String> {
         let secret = std::fs::read(&config.secret_file).map_err(|e| {
             format!(

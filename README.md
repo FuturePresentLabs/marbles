@@ -132,8 +132,8 @@ everything else you run. A 60-second sweeper requeues expired agent leases and
 escalates expired human holds. Sandboxes get one agent token and zero file
 access to the database — that's the point.
 
-Hosted deployments set `company_store_root` and `company_claim`. Each verified
-company claim is routed to `<company_store_root>/<company_id>/marbles.db`; an
+Hosted deployments set `DATABASE_URL` and `company_claim`. Each verified
+company claim is routed to company-scoped rows in PostgreSQL; an
 unscoped credential is rejected instead of falling back to a shared database.
 The checked-in `deploy/server.toml` is the FPL Auth production shape.
 
@@ -208,10 +208,10 @@ valid. The importer is written to survive being interesting:
 
 ## Layout & status
 
-Single binary (`src/main.rs`), `axum` + `rusqlite(WAL)` + bearer-token auth.
+Single binary (`src/main.rs`), `axum` + bearer-token auth, PostgreSQL for hosted
+operation, and `rusqlite(WAL)` for local operation and tests.
 v0.x: interface-first; the HTTP contract and JSON shapes are what we intend to
-freeze before 1.0. Hosted mode uses one physical SQLite store per OIDC company.
-Postgres remains a possible future engine; the store is one module precisely so
-swapping engines is a deploy, not a rewrite.
+freeze before 1.0. Legacy hosted installs without `DATABASE_URL` can still use
+one physical SQLite store per OIDC company during cutover.
 
 MIT. Go build it.

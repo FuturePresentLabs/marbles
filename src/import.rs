@@ -5,7 +5,7 @@ use std::io::Read;
 
 use serde::Deserialize;
 
-use crate::db::Db;
+use crate::db::Store;
 use crate::types::{Issue, NewIssue};
 
 /// Accepts either a bare array of beads or `{"issues": [...]}` — both are shapes `bd` has used.
@@ -38,7 +38,7 @@ pub fn parse_rows(text: &str) -> Result<Vec<Issue>, String> {
 /// Insert issues with their original ids and statuses, then the dependency edges. Ids are kept
 /// verbatim so every existing reference — commits, run ledgers, docs, muscle memory — stays
 /// valid across the move.
-pub fn import(db: &Db, project: &str, rows: &[Issue]) -> Result<Report, String> {
+pub fn import(db: &(impl Store + ?Sized), project: &str, rows: &[Issue]) -> Result<Report, String> {
     let mut report = Report::default();
     for row in rows {
         let spec = NewIssue {
@@ -110,6 +110,7 @@ pub struct Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Db;
 
     fn row(id: &str, status: &str, deps: &[&str]) -> Issue {
         Issue {
