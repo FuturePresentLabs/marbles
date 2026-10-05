@@ -53,9 +53,14 @@ CREATE TABLE IF NOT EXISTS marbles_history (
   actor TEXT NOT NULL,
   event TEXT NOT NULL,
   detail TEXT NOT NULL DEFAULT '',
-  PRIMARY KEY(company_id, seq),
-  FOREIGN KEY(company_id, issue_id) REFERENCES marbles_issue(company_id, id)
+  PRIMARY KEY(company_id, seq)
 );
+-- Audit history has the same retention contract as SQLite: references may
+-- outlive issues or identify legacy sentinels. Do not fabricate issue rows or
+-- discard historical events during migration. Live dependencies and outbox
+-- delivery retain their issue foreign keys.
+ALTER TABLE marbles_history
+  DROP CONSTRAINT IF EXISTS marbles_history_company_id_issue_id_fkey;
 CREATE TABLE IF NOT EXISTS marbles_outbound_event (
   company_id TEXT NOT NULL,
   seq BIGINT NOT NULL,

@@ -149,6 +149,14 @@ pub trait CompanyStoreRegistry: Send + Sync {
     fn for_company(&self, company_id: &str) -> Result<Arc<dyn Store>>;
     fn sweep_open(&self, now: i64) -> Result<Vec<(String, SweepReport)>>;
     fn open_stores(&self) -> Result<Vec<(String, Arc<dyn Store>)>>;
+    /// Read-only readiness check. Backends may probe their shared connection
+    /// even before the first authenticated tenant has opened a store.
+    fn health_check(&self) -> Result<()> {
+        for (_, store) in self.open_stores()? {
+            store.projects()?;
+        }
+        Ok(())
+    }
 }
 
 pub struct Db {

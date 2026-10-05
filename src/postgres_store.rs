@@ -24,7 +24,7 @@ impl PostgresCompanyStores {
         let connector = crate::postgres_migration::tls_connector()
             .map_err(|e| Error::Bad(format!("building PostgreSQL TLS connector: {e}")))?;
         let mut client = Client::connect(database_url, connector)?;
-        client.batch_execute(include_str!("postgres_schema.sql"))?;
+        crate::postgres_migration::install_schema(&mut client)?;
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
             open: Mutex::new(BTreeMap::new()),
@@ -33,6 +33,15 @@ impl PostgresCompanyStores {
 }
 
 impl CompanyStoreRegistry for PostgresCompanyStores {
+    fn health_check(&self) -> Result<()> {
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|_| Error::Bad("PostgreSQL client lock poisoned".into()))?;
+        client.query("SELECT 1 FROM marbles_project LIMIT 1", &[])?;
+        Ok(())
+    }
+
     fn for_company(&self, company_id: &str) -> Result<Arc<dyn Store>> {
         validate_company_id(company_id)?;
         let mut open = self

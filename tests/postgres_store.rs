@@ -157,3 +157,105 @@ fn hosted_postgres_store_is_transactional_and_company_scoped() {
     assert!(untouched.labels.is_empty());
     cleanup(&url, &companies);
 }
+
+#[test]
+fn sqlite_migration_preserves_binary_copy_values_and_refuses_populated_tenants() {
+    let Some(url) = test_url() else {
+        eprintln!("skipping migration integration: MARBLES_TEST_DATABASE_URL unset");
+        return;
+    };
+    let company = format!("migration-{}-{}", std::process::id(), marbles::db::now());
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join(&company);
+    std::fs::create_dir(&directory).unwrap();
+    let source = marbles::db::Db::open(directory.join("marbles.db")).unwrap();
+    source.ensure_project("copy", "/copy", "copy").unwrap();
+    let at = 1_800_000_000;
+    let issue = source
+        .create(
+            &NewIssue {
+                id: Some("copy-one".into()),
+                project: Some("copy".into()),
+                title: "UTF-8 → tabs\tand\nnewlines".into(),
+                ..Default::default()
+            },
+            at,
+        )
+        .unwrap();
+    source
+        .update(
+            &issue,
+            &IssuePatch {
+                metadata: Some(serde_json::json!({"text":"→\t\n\\"})),
+                ..Default::default()
+            },
+            "actor\t→\n",
+            at + 1,
+        )
+        .unwrap();
+    let events = source.pending_events(at + 2, 64).unwrap();
+    source
+        .mark_event_failed(events[0].seq, at + 3, "retry\t→\n")
+        .unwrap();
+    // Legacy dependency-removal calls intentionally retained audit records
+    // for the '_' sentinel without inventing an issue or an outbox delivery.
+    source.remove_dep("_", &issue, "legacy", at + 4).unwrap();
+    let reports = postgres_migration::migrate_root(root.path(), &url).unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].issues, 1);
+    assert_eq!(reports[0].history_events, 3);
+    let stores = PostgresCompanyStores::connect(&url).unwrap();
+    let target = stores.for_company(&company).unwrap();
+    assert_eq!(target.get(&issue).unwrap(), source.get(&issue).unwrap());
+    assert_eq!(
+        serde_json::to_value(target.history(&issue).unwrap()).unwrap(),
+        serde_json::to_value(source.history(&issue).unwrap()).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(target.history("_").unwrap()).unwrap(),
+        serde_json::to_value(source.history("_").unwrap()).unwrap()
+    );
+    assert_eq!(
+        target.pending_events(at + 4, 64).unwrap(),
+        source.pending_events(at + 4, 64).unwrap()
+    );
+    assert!(
+        postgres_migration::migrate_root(root.path(), &url)
+            .unwrap_err()
+            .contains("refusing to merge")
+    );
+    cleanup(&url, &[company]);
+}
+
+#[test]
+fn failed_binary_copy_rolls_back_the_entire_tenant_import() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let company = format!("rollback-{}-{}", std::process::id(), marbles::db::now());
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join(&company);
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("marbles.db");
+    let source = marbles::db::Db::open(&path).unwrap();
+    source.ensure_project("copy", "/copy", "copy").unwrap();
+    // An undeliverable outbox entry is not an audit-only historical event.
+    // PostgreSQL must reject it and roll back the earlier project import.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO outbound_event(seq,issue_id,project,occurred_at,event,next_attempt_at) VALUES(1,'missing','copy',1,'bad',1)",
+        [],
+    )
+    .unwrap();
+    assert!(postgres_migration::migrate_root(root.path(), &url).is_err());
+    let mut client = postgres_migration::connect(&url).unwrap();
+    let count: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM marbles_project WHERE company_id=$1",
+            &[&company],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 0, "failed COPY must not partially import the tenant");
+    cleanup(&url, &[company]);
+}

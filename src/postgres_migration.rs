@@ -8,12 +8,26 @@ use std::path::{Path, PathBuf};
 
 use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use openssl::x509::X509;
+use postgres::binary_copy::BinaryCopyInWriter;
+use postgres::types::Type;
 use postgres::{Client, Transaction};
 use postgres_openssl::MakeTlsConnector;
 use rusqlite::Connection;
 use serde::Serialize;
 
 const SCHEMA: &str = include_str!("postgres_schema.sql");
+
+pub(crate) fn install_schema(client: &mut Client) -> Result<(), postgres::Error> {
+    let mut tx = client.transaction()?;
+    // Multiple server processes and migration tools may start together. Fence
+    // schema initialization rather than racing CREATE/ALTER IF EXISTS checks.
+    tx.execute(
+        "SELECT pg_advisory_xact_lock(hashtext($1))",
+        &[&"marbles-schema"],
+    )?;
+    tx.batch_execute(SCHEMA)?;
+    tx.commit()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CompanyReport {
@@ -49,9 +63,8 @@ pub fn migrate_root(root: &Path, database_url: &str) -> Result<Vec<CompanyReport
         return Err(format!("no company stores found under {}", root.display()));
     }
     let mut client = connect(database_url)?;
-    client
-        .batch_execute(SCHEMA)
-        .map_err(|e| format!("installing PostgreSQL schema: {e}"))?;
+    install_schema(&mut client)
+        .map_err(|e| format!("installing PostgreSQL schema: {e}; cause: {e:?}"))?;
     let mut reports = Vec::with_capacity(stores.len());
     for (company_id, path) in stores {
         reports.push(migrate_company(&mut client, &company_id, &path)?);
@@ -274,6 +287,26 @@ fn copy_history(
         .prepare("SELECT seq,issue_id,ts,actor,event,detail FROM history ORDER BY seq")
         .map_err(|e| e.to_string())?;
     let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+    // These append-only tables contain most hosted data. Streaming COPY keeps
+    // the existing transaction/parity checks without one network round trip
+    // per historical event (production already contains over 500,000 rows).
+    let sink = tx
+        .copy_in(
+            "COPY marbles_history(company_id,seq,issue_id,ts,actor,event,detail) FROM STDIN BINARY",
+        )
+        .map_err(|e| format!("starting history copy: {e}"))?;
+    let mut writer = BinaryCopyInWriter::new(
+        sink,
+        &[
+            Type::TEXT,
+            Type::INT8,
+            Type::TEXT,
+            Type::INT8,
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+        ],
+    );
     while let Some(r) = rows.next().map_err(|e| e.to_string())? {
         let seq: i64 = r.get(0).map_err(|e| e.to_string())?;
         let issue: String = r.get(1).map_err(|e| e.to_string())?;
@@ -281,8 +314,13 @@ fn copy_history(
         let actor: String = r.get(3).map_err(|e| e.to_string())?;
         let event: String = r.get(4).map_err(|e| e.to_string())?;
         let detail: String = r.get(5).map_err(|e| e.to_string())?;
-        tx.execute("INSERT INTO marbles_history(company_id,seq,issue_id,ts,actor,event,detail) VALUES($1,$2,$3,$4,$5,$6,$7)",&[&company,&seq,&issue,&ts,&actor,&event,&detail]).map_err(|e|format!("copying history {seq}: {e}"))?;
+        writer
+            .write(&[&company, &seq, &issue, &ts, &actor, &event, &detail])
+            .map_err(|e| format!("copying history {seq}: {e}"))?;
     }
+    writer
+        .finish()
+        .map_err(|e| format!("finishing history copy: {e}"))?;
     Ok(())
 }
 
@@ -293,6 +331,23 @@ fn copy_outbound_events(
 ) -> Result<(), String> {
     let mut stmt=sqlite.prepare("SELECT seq,issue_id,project,occurred_at,event,delivered_at,attempts,next_attempt_at,last_error FROM outbound_event ORDER BY seq").map_err(|e|e.to_string())?;
     let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+    let sink = tx.copy_in("COPY marbles_outbound_event(company_id,seq,issue_id,project,occurred_at,event,delivered_at,attempts,next_attempt_at,last_error) FROM STDIN BINARY")
+        .map_err(|e| format!("starting outbox copy: {e}"))?;
+    let mut writer = BinaryCopyInWriter::new(
+        sink,
+        &[
+            Type::TEXT,
+            Type::INT8,
+            Type::TEXT,
+            Type::TEXT,
+            Type::INT8,
+            Type::TEXT,
+            Type::INT8,
+            Type::INT8,
+            Type::INT8,
+            Type::TEXT,
+        ],
+    );
     while let Some(r) = rows.next().map_err(|e| e.to_string())? {
         let seq: i64 = r.get(0).map_err(|e| e.to_string())?;
         let issue: String = r.get(1).map_err(|e| e.to_string())?;
@@ -303,8 +358,16 @@ fn copy_outbound_events(
         let attempts: i64 = r.get(6).map_err(|e| e.to_string())?;
         let next: i64 = r.get(7).map_err(|e| e.to_string())?;
         let error: Option<String> = r.get(8).map_err(|e| e.to_string())?;
-        tx.execute("INSERT INTO marbles_outbound_event(company_id,seq,issue_id,project,occurred_at,event,delivered_at,attempts,next_attempt_at,last_error) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",&[&company,&seq,&issue,&project,&occurred,&event,&delivered,&attempts,&next,&error]).map_err(|e|format!("copying outbound event {seq}: {e}"))?;
+        writer
+            .write(&[
+                &company, &seq, &issue, &project, &occurred, &event, &delivered, &attempts, &next,
+                &error,
+            ])
+            .map_err(|e| format!("copying outbound event {seq}: {e}"))?;
     }
+    writer
+        .finish()
+        .map_err(|e| format!("finishing outbox copy: {e}"))?;
     Ok(())
 }
 

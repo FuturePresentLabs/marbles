@@ -534,7 +534,9 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             };
             let company_stores: Option<Arc<dyn CompanyStoreRegistry>> = match database_url {
                 Some(url) => Some(Arc::new(
-                    PostgresCompanyStores::connect(&url)
+                    tokio::task::spawn_blocking(move || PostgresCompanyStores::connect(&url))
+                        .await
+                        .map_err(|_| "PostgreSQL startup worker failed".to_string())?
                         .map_err(|e| format!("opening hosted PostgreSQL store: {e}"))?,
                 )),
                 _ => cfg
@@ -576,7 +578,9 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
                 loop {
                     tick.tick().await;
-                    let result = match &sweeper_companies {
+                    let companies = sweeper_companies.clone();
+                    let db = Arc::clone(&sweeper_db);
+                    let result = tokio::task::spawn_blocking(move || match &companies {
                         Some(stores) => stores.sweep_open(now()).map(|reports| {
                             reports.into_iter().fold(
                                 marbles::db::SweepReport::default(),
@@ -587,7 +591,15 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                                 },
                             )
                         }),
-                        None => sweeper_db.sweep(now()),
+                        None => db.sweep(now()),
+                    })
+                    .await;
+                    let result = match result {
+                        Ok(result) => result,
+                        Err(_) => {
+                            eprintln!("sweep storage worker failed");
+                            continue;
+                        }
                     };
                     match result {
                         Ok(report) => {

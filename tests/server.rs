@@ -12,6 +12,115 @@ use marbles::db::{CompanyStores, Db};
 use marbles::types::*;
 use tower::ServiceExt; // oneshot
 
+#[tokio::test]
+async fn postgres_store_serves_authenticated_requests_without_nested_runtime_panics() {
+    use marbles::db::CompanyStoreRegistry;
+    use marbles::postgres_store::PostgresCompanyStores;
+
+    let Some(url) = std::env::var("MARBLES_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping PostgreSQL HTTP test: MARBLES_TEST_DATABASE_URL unset");
+        return;
+    };
+    let company = format!("http-pg-{}-{}", std::process::id(), marbles::db::now());
+    let tenant = company.clone();
+    let connect_url = url.clone();
+    let db = tokio::task::spawn_blocking(move || {
+        PostgresCompanyStores::connect(&connect_url)
+            .unwrap()
+            .for_company(&tenant)
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (_, token) =
+        marbles::auth::mint_token(&dir.path().join("tokens"), ActorKind::Human, "pg-test").unwrap();
+    let app = Arc::new(Api {
+        db,
+        company_stores: None,
+        auth: Arc::new(Auth::new(AuthConfig::default(), dir.path().join("tokens"))),
+    })
+    .router();
+    let health = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        call(
+            &app,
+            "projects.ensure",
+            serde_json::json!({"slug":"pg","root":"/pg","prefix":"pg"}),
+            Some(&token),
+        ),
+    )
+    .await
+    .expect("PostgreSQL HTTP operation timed out");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(&app, "projects.list", serde_json::json!({}), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("\"slug\":\"pg\""));
+    tokio::task::spawn_blocking(move || {
+        drop(app);
+        let mut client = marbles::postgres_migration::connect(&url).unwrap();
+        client
+            .execute(
+                "DELETE FROM marbles_project WHERE company_id=$1",
+                &[&company],
+            )
+            .unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn anonymous_health_fails_closed_when_hosted_storage_is_unavailable() {
+    struct OfflineRegistry;
+    impl marbles::db::CompanyStoreRegistry for OfflineRegistry {
+        fn for_company(&self, _: &str) -> marbles::db::Result<Arc<dyn marbles::db::Store>> {
+            Err(marbles::db::Error::Bad("private database failure".into()))
+        }
+        fn sweep_open(
+            &self,
+            _: i64,
+        ) -> marbles::db::Result<Vec<(String, marbles::db::SweepReport)>> {
+            Err(marbles::db::Error::Bad("private database failure".into()))
+        }
+        fn open_stores(&self) -> marbles::db::Result<Vec<(String, Arc<dyn marbles::db::Store>)>> {
+            Err(marbles::db::Error::Bad("private database failure".into()))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(Api {
+        db: Arc::new(Db::in_memory().unwrap()),
+        company_stores: Some(Arc::new(OfflineRegistry)),
+        auth: Arc::new(Auth::new(AuthConfig::default(), dir.path().join("tokens"))),
+    })
+    .router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), b"storage unavailable");
+}
+
 fn app() -> (Router, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(Db::in_memory().unwrap());

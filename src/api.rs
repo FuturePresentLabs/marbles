@@ -44,7 +44,7 @@ impl Api {
 
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
-            .route("/healthz", axum::routing::get(|| async { "ok" }))
+            .route("/healthz", axum::routing::get(health))
             .route("/metrics", axum::routing::get(metrics))
             .route("/v1/projects.ensure", post(projects_ensure))
             .route("/v1/projects.list", post(projects_list))
@@ -74,7 +74,122 @@ impl Api {
     }
 }
 
+async fn health(State(api): State<Arc<Api>>) -> Response {
+    let check = storage_call(move || {
+        match &api.company_stores {
+            Some(stores) => stores.health_check()?,
+            None => {
+                api.db.projects()?;
+            }
+        }
+        Ok(())
+    });
+    match tokio::time::timeout(std::time::Duration::from_secs(2), check).await {
+        Ok(Ok(())) => (StatusCode::OK, "ok").into_response(),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "storage unavailable").into_response(),
+    }
+}
+
 async fn metrics(
+    state: State<Arc<Api>>,
+    principal: Extension<Principal>,
+) -> Result<Response, ApiError> {
+    storage_call(move || metrics_blocking(state, principal)).await
+}
+
+// The Store contract is synchronous. PostgreSQL's client owns a Tokio runtime;
+// calling it directly in an async handler can panic and also blocks unrelated
+// requests. Keep authentication async and execute storage on blocking workers.
+async fn storage_call<T: Send + 'static>(
+    operation: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError> {
+    tokio::task::spawn_blocking(operation).await.map_err(|_| {
+        ApiError(ApiErrorKind::Status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage worker failed".into(),
+        ))
+    })?
+}
+
+macro_rules! storage_handler {
+    ($name:ident, $blocking:ident, $body:ty, $result:ty) => {
+        async fn $name(
+            state: State<Arc<Api>>,
+            principal: Extension<Principal>,
+            body: Json<$body>,
+        ) -> Res<$result> {
+            storage_call(move || $blocking(state, principal, body)).await
+        }
+    };
+}
+
+storage_handler!(
+    projects_ensure,
+    projects_ensure_blocking,
+    EnsureProject,
+    serde_json::Value
+);
+storage_handler!(
+    projects_list,
+    projects_list_blocking,
+    Empty,
+    serde_json::Value
+);
+storage_handler!(issues_create, issues_create_blocking, NewIssue, OkId);
+storage_handler!(issues_get, issues_get_blocking, IdBody, Issue);
+storage_handler!(issues_list, issues_list_blocking, ListBody, Vec<Issue>);
+storage_handler!(issues_ready, issues_ready_blocking, ListBody, Vec<Issue>);
+storage_handler!(issues_update, issues_update_blocking, UpdateBody, Issue);
+storage_handler!(issues_close, issues_close_blocking, CloseBody, Issue);
+storage_handler!(
+    issues_supersede,
+    issues_supersede_blocking,
+    SupersedeBody,
+    serde_json::Value
+);
+storage_handler!(deps_add, deps_add_blocking, DepBody, serde_json::Value);
+storage_handler!(
+    deps_remove,
+    deps_remove_blocking,
+    DepBody,
+    serde_json::Value
+);
+storage_handler!(
+    labels_add,
+    labels_add_blocking,
+    LabelBody,
+    serde_json::Value
+);
+storage_handler!(
+    labels_remove,
+    labels_remove_blocking,
+    LabelBody,
+    serde_json::Value
+);
+storage_handler!(claims_claim, claims_claim_blocking, ClaimBody, ClaimReceipt);
+storage_handler!(
+    claims_touch,
+    claims_touch_blocking,
+    ClaimBody,
+    serde_json::Value
+);
+storage_handler!(
+    claims_release,
+    claims_release_blocking,
+    ClaimBody,
+    serde_json::Value
+);
+storage_handler!(
+    issues_import,
+    issues_import_blocking,
+    ImportBody,
+    crate::import::Report
+);
+storage_handler!(claims_sweep, claims_sweep_blocking, Empty, SweepReport);
+storage_handler!(history_get, history_get_blocking, IdBody, Vec<HistoryEvent>);
+storage_handler!(stats, stats_blocking, Empty, serde_json::Value);
+
+fn metrics_blocking(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,
 ) -> Result<Response, ApiError> {
@@ -160,7 +275,7 @@ struct EnsureProject {
     prefix: String,
 }
 
-async fn projects_ensure(
+fn projects_ensure_blocking(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,
     Json(body): Json<EnsureProject>,
@@ -170,7 +285,7 @@ async fn projects_ensure(
     Ok(Json(serde_json::json!({"slug": body.slug})))
 }
 
-async fn projects_list(
+fn projects_list_blocking(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,
     Json(_body): Json<Empty>,
@@ -187,7 +302,7 @@ async fn projects_list(
 
 // ---- issues ----
 
-async fn issues_create(
+fn issues_create_blocking(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,
     Json(mut spec): Json<NewIssue>,
@@ -209,7 +324,7 @@ struct IdBody {
     id: String,
 }
 
-async fn issues_get(
+fn issues_get_blocking(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,
     Json(body): Json<IdBody>,
@@ -227,7 +342,7 @@ struct ListBody {
     id: Option<String>,
 }
 
-async fn issues_list(
+fn issues_list_blocking(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,
     Json(body): Json<ListBody>,
@@ -239,7 +354,7 @@ async fn issues_list(
     )?))
 }
 
-async fn issues_ready(
+fn issues_ready_blocking(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,
     Json(body): Json<ListBody>,
@@ -256,7 +371,7 @@ struct UpdateBody {
     patch: IssuePatch,
 }
 
-async fn issues_update(
+fn issues_update_blocking(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,
     Json(body): Json<UpdateBody>,
@@ -285,7 +400,7 @@ struct CloseBody {
     ack: Option<String>,
 }
 
-async fn issues_close(
+fn issues_close_blocking(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,
     Json(body): Json<CloseBody>,
@@ -315,7 +430,7 @@ struct SupersedeBody {
     replacement: String,
 }
 
-async fn issues_supersede(
+fn issues_supersede_blocking(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,
     Json(body): Json<SupersedeBody>,
@@ -339,7 +454,7 @@ struct DepBody {
     parent: String,
 }
 
-async fn deps_add(
+fn deps_add_blocking(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,
     Json(body): Json<DepBody>,
@@ -353,7 +468,7 @@ async fn deps_add(
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
-async fn deps_remove(
+fn deps_remove_blocking(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,
     Json(body): Json<DepBody>,
@@ -373,7 +488,7 @@ struct LabelBody {
     label: String,
 }
 
-async fn labels_add(
+fn labels_add_blocking(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,
     Json(body): Json<LabelBody>,
@@ -383,7 +498,7 @@ async fn labels_add(
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
-async fn labels_remove(
+fn labels_remove_blocking(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,
     Json(body): Json<LabelBody>,
@@ -411,7 +526,7 @@ struct ClaimBody {
     ttl_seconds: Option<i64>,
 }
 
-async fn claims_claim(
+fn claims_claim_blocking(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,
     Json(body): Json<ClaimBody>,
@@ -428,7 +543,7 @@ async fn claims_claim(
     Ok(Json(api.db_for(&principal)?.claim(&req, crate::db::now())?))
 }
 
-async fn claims_touch(
+fn claims_touch_blocking(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,
     Json(body): Json<ClaimBody>,
@@ -447,7 +562,7 @@ async fn claims_touch(
     ))
 }
 
-async fn claims_release(
+fn claims_release_blocking(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,
     Json(body): Json<ClaimBody>,
@@ -483,7 +598,7 @@ struct ImportBody {
 
 /// Bulk Beads-era import over HTTP. Human principals only, same posture as
 /// sweeps: an import rewrites history, so it is never an agent-side door.
-async fn issues_import(
+fn issues_import_blocking(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,
     Json(body): Json<ImportBody>,
@@ -508,7 +623,7 @@ async fn issues_import(
         .map_err(|e| ApiError(ApiErrorKind::Status(StatusCode::BAD_REQUEST, e)))
 }
 
-async fn claims_sweep(
+fn claims_sweep_blocking(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,
     Json(_body): Json<Empty>,
@@ -524,7 +639,7 @@ async fn claims_sweep(
 
 // ---- history & stats ----
 
-async fn history_get(
+fn history_get_blocking(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,
     Json(body): Json<IdBody>,
@@ -532,10 +647,41 @@ async fn history_get(
     Ok(Json(api.db_for(&principal)?.history(&body.id)?))
 }
 
-async fn stats(
+fn stats_blocking(
     State(api): State<Arc<Api>>,
     Extension(principal): Extension<Principal>,
     Json(_body): Json<Empty>,
 ) -> Res<serde_json::Value> {
     Ok(Json(api.db_for(&principal)?.stats()?))
+}
+
+#[cfg(test)]
+mod storage_worker_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn synchronous_client_runtime_is_safe_on_storage_worker() {
+        let value = storage_call(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            Ok(runtime.block_on(async { 42 }))
+        })
+        .await
+        .unwrap();
+        assert_eq!(value, 42);
+    }
+
+    #[tokio::test]
+    async fn worker_failure_is_visible_without_exposing_panic_details() {
+        let error = storage_call::<()>(|| panic!("private worker context"))
+            .await
+            .unwrap_err();
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"storage worker failed");
+    }
 }

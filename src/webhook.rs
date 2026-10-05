@@ -80,18 +80,25 @@ impl Publisher {
             None => vec![("local".to_string(), Arc::clone(&self.default_db))],
         };
         for (company, db) in stores {
-            for event in db.pending_events(now(), 64).map_err(|e| e.to_string())? {
-                match self.deliver(&company, &event).await {
-                    Ok(()) => db
-                        .mark_event_delivered(event.seq, now())
-                        .map_err(|e| e.to_string())?,
+            let pending_db = Arc::clone(&db);
+            let events = tokio::task::spawn_blocking(move || pending_db.pending_events(now(), 64))
+                .await
+                .map_err(|_| "outbox storage worker failed".to_string())?
+                .map_err(|e| e.to_string())?;
+            for event in events {
+                let outcome = self.deliver(&company, &event).await;
+                let update_db = Arc::clone(&db);
+                tokio::task::spawn_blocking(move || match outcome {
+                    Ok(()) => update_db.mark_event_delivered(event.seq, now()),
                     Err(error) => {
                         let exponent = event.attempts.clamp(0, 8) as u32;
                         let delay = 1_i64 << exponent;
-                        db.mark_event_failed(event.seq, now() + delay, &error)
-                            .map_err(|e| e.to_string())?;
+                        update_db.mark_event_failed(event.seq, now() + delay, &error)
                     }
-                }
+                })
+                .await
+                .map_err(|_| "outbox update worker failed".to_string())?
+                .map_err(|e| e.to_string())?;
             }
         }
         Ok(())
