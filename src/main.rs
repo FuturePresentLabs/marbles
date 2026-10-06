@@ -45,8 +45,17 @@ struct Cli {
     #[arg(long, env = "MARBLES_URL", global = true)]
     url: Option<String>,
     /// Bearer token (static local token or OIDC JWT).
-    #[arg(long, env = "MARBLES_TOKEN", global = true)]
+    #[arg(
+        long,
+        env = "MARBLES_TOKEN",
+        global = true,
+        hide_env_values = true,
+        conflicts_with = "token_file"
+    )]
     token: Option<String>,
+    /// Private file containing a scoped bearer token; read afresh on every invocation.
+    #[arg(long, env = "MARBLES_TOKEN_FILE", global = true)]
+    token_file: Option<PathBuf>,
     /// Machine-readable output.
     #[arg(long, global = true)]
     json: bool,
@@ -121,6 +130,12 @@ enum Command {
     },
     /// Print the server URL + how to point at it.
     Url,
+    /// Check the selected endpoint, or local store integrity when running locally.
+    Doctor {
+        /// Project to probe when talking to a hosted server.
+        #[arg(long)]
+        project: Option<String>,
+    },
     Create(Box<CreateArgs>),
     List {
         #[arg(long)]
@@ -257,8 +272,6 @@ enum Command {
         /// Destination path; must not already exist.
         to: PathBuf,
     },
-    /// Check integrity, settings, row counts, and WAL size (local mode only).
-    Doctor,
     /// Store identity: Ed25519 keypair, rotation, and the public `marbles.store/1` descriptor.
     Store {
         #[command(subcommand)]
@@ -640,7 +653,12 @@ async fn main() -> ExitCode {
             Err(err) => fail(err),
         };
     }
-    let saved = match marbles::oidc::load() {
+    // Explicit automation credentials must not depend on a stale browser profile.
+    let saved = match if cli.token.is_some() || cli.token_file.is_some() {
+        Ok(None)
+    } else {
+        marbles::oidc::load()
+    } {
         Ok(value) => value,
         Err(err) => return fail(err),
     };
@@ -655,10 +673,30 @@ async fn main() -> ExitCode {
             let dir = std::env::current_dir().ok()?.join(&cli.dir);
             config::discover_project(&dir).and_then(|(_, project)| project.server_url)
         });
+    if effective_url.is_some()
+        && matches!(
+            &cli.command,
+            Command::Login { .. } | Command::AgentToken { .. }
+        )
+    {
+        return fail(
+            "local token minting cannot enroll a hosted identity; use MARBLES_CLIENT_SECRET with hosted login, or an operator-provisioned company-scoped service bearer",
+        );
+    }
     let mode = if let Some(url) = &effective_url {
         let token = if let Some(token) = cli.token.clone() {
             token
+        } else if let Some(path) = &cli.token_file {
+            match read_bearer_file(path) {
+                Ok(token) => token,
+                Err(err) => return fail(err),
+            }
         } else if let Some(saved) = saved {
+            if saved.url.trim_end_matches('/') != url.trim_end_matches('/') {
+                return fail(
+                    "saved Marbles credentials belong to a different server; sign in there or supply an explicit scoped bearer token",
+                );
+            }
             match marbles::oidc::valid_token_with_timeout(saved, cli.timeout_ms).await {
                 Ok((_, token)) => token,
                 Err(err) => return fail(err),
@@ -668,7 +706,7 @@ async fn main() -> ExitCode {
         };
         if token.is_empty() {
             return fail(
-                "remote Marbles has no credential; run `mb --url <url> login --client-secret <secret>`",
+                "remote Marbles has no credential; use MARBLES_CLIENT_SECRET with `mb --url <url> login`, or MARBLES_TOKEN_FILE for a scoped service bearer",
             );
         }
         Mode::Http(Client::with_options(
@@ -1256,6 +1294,59 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
         }
         Command::Url => {
             println!("{}", reported_url(effective_url));
+            Ok(())
+        }
+        Command::Doctor { project } => {
+            let Mode::Http(client) = mode else {
+                let db = require_local(
+                    mode,
+                    "doctor reads the server's database file; run it on the host that owns --url",
+                )?;
+                let report = db.doctor().map_err(|e| e.to_string())?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+                    );
+                } else {
+                    println!("integrity:    {}", report.integrity);
+                    println!("quick check:  {}", report.quick_check);
+                    println!(
+                        "journal:      {} / synchronous {}",
+                        report.journal_mode, report.synchronous
+                    );
+                    println!(
+                        "storage:      {} bytes DB + {} bytes WAL",
+                        report.db_bytes, report.wal_bytes
+                    );
+                    println!(
+                        "rows:         {} projects, {} issues, {} deps, {} history, {} outbox pending",
+                        report.projects,
+                        report.issues,
+                        report.deps,
+                        report.history,
+                        report.outbox_pending
+                    );
+                    if !report.foreign_key_violations.is_empty() {
+                        println!("foreign keys: {}", report.foreign_key_violations.join("; "));
+                    }
+                }
+                return Ok(());
+            };
+            let project = project.clone().or_else(|| project_for(cli).ok());
+            if !client.health().await {
+                return Err("hosted Marbles health check failed; check routing and deployment before re-authenticating".into());
+            }
+            let rows: Vec<Issue> = client
+                .call("issues.ready", &serde_json::json!({"project":project}))
+                .await?;
+            let report = serde_json::json!({"mode":"hosted", "endpoint":effective_url,
+                "health":"ok", "authentication":"ok", "project":project, "ready_count":rows.len()});
+            if cli.json {
+                println!("{report}");
+            } else {
+                println!("Marbles hosted: health and authenticated access OK");
+            }
             Ok(())
         }
         Command::Create(args) => {
@@ -2203,42 +2294,6 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             }
             Ok(())
         }
-        Command::Doctor => {
-            let db = require_local(
-                mode,
-                "doctor reads the server's database file; run it on the host that owns --url",
-            )?;
-            let report = db.doctor().map_err(|e| e.to_string())?;
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
-                );
-            } else {
-                println!("integrity:    {}", report.integrity);
-                println!("quick check:  {}", report.quick_check);
-                println!(
-                    "journal:      {} / synchronous {}",
-                    report.journal_mode, report.synchronous
-                );
-                println!(
-                    "storage:      {} bytes DB + {} bytes WAL",
-                    report.db_bytes, report.wal_bytes
-                );
-                println!(
-                    "rows:         {} projects, {} issues, {} deps, {} history, {} outbox pending",
-                    report.projects,
-                    report.issues,
-                    report.deps,
-                    report.history,
-                    report.outbox_pending
-                );
-                if !report.foreign_key_violations.is_empty() {
-                    println!("foreign keys: {}", report.foreign_key_violations.join("; "));
-                }
-            }
-            Ok(())
-        }
         Command::Plan { action } => match action {
             PlanAction::Show { plan } => {
                 let view: marbles::plan::PlanView = mode
@@ -2915,6 +2970,30 @@ fn read_spec_arg(value: &str) -> Result<String, String> {
     }
 }
 
+fn read_bearer_file(path: &std::path::Path) -> Result<String, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("opening bearer file: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = file
+            .metadata()
+            .map_err(|e| e.to_string())?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err("bearer file must be private (chmod 0600)".into());
+        }
+    }
+    let mut value = String::new();
+    std::io::Read::read_to_string(&mut std::io::Read::take(file, 16385), &mut value)
+        .map_err(|e| format!("reading bearer file: {e}"))?;
+    let token = value.trim();
+    if token.is_empty() || value.len() > 16384 || token.chars().any(char::is_whitespace) {
+        return Err("bearer file must contain one nonempty token of at most 16 KiB".into());
+    }
+    Ok(token.to_owned())
+}
+
 fn require_local<'a>(mode: &'a Mode, hint: &str) -> Result<&'a Arc<Db>, String> {
     match mode {
         Mode::Local(db) => Ok(db),
@@ -3028,5 +3107,34 @@ mod cli_tests {
             reported_url(Some("https://marbles.fpl.dev")),
             "https://marbles.fpl.dev"
         );
+    }
+    #[test]
+    fn private_bearer_file_is_read_fresh_and_rejects_empty_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "first\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(super::read_bearer_file(&path).unwrap(), "first");
+        std::fs::write(&path, "rotated\n").unwrap();
+        assert_eq!(super::read_bearer_file(&path).unwrap(), "rotated");
+        std::fs::write(&path, " \n").unwrap();
+        assert!(super::read_bearer_file(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bearer_file_rejects_publicly_readable_secrets() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "private-value").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = super::read_bearer_file(&path).unwrap_err();
+        assert!(error.contains("0600"));
+        assert!(!error.contains("private-value"));
     }
 }

@@ -49,6 +49,7 @@ pub struct Auth {
     config: AuthConfig,
     token_dir: PathBuf,
     jwks: Mutex<Option<(Instant, Jwks)>>,
+    jwks_refresh: tokio::sync::Mutex<Option<Instant>>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -86,6 +87,7 @@ impl Auth {
             config,
             token_dir,
             jwks: Mutex::new(None),
+            jwks_refresh: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -185,7 +187,16 @@ impl Auth {
         let issuer = self.config.oidc_issuer.as_deref()?;
         let header = jsonwebtoken::decode_header(token).ok()?;
         let kid = header.kid?;
-        let jwks = self.jwks().await?;
+        let mut jwks = self.jwks(false).await?;
+        if !jwks
+            .keys
+            .iter()
+            .any(|key| key.kid.as_deref() == Some(kid.as_str()))
+        {
+            // A new signing key must not produce fifteen minutes of 401s. Refresh
+            // once on an unknown kid; a cooldown prevents arbitrary-kid fetch storms.
+            jwks = self.jwks(true).await?;
+        }
         let key = jwks
             .keys
             .iter()
@@ -236,18 +247,35 @@ impl Auth {
         })
     }
 
-    async fn jwks(&self) -> Option<Jwks> {
-        const TTL: std::time::Duration = std::time::Duration::from_secs(900);
-        if let Some((jwks, _)) = self
-            .jwks
+    fn cached_jwks(&self, ttl: std::time::Duration) -> Option<Jwks> {
+        self.jwks
             .lock()
             .ok()?
             .as_ref()
-            .filter(|(at, _)| at.elapsed() < TTL)
-            .map(|(at, jwks)| (jwks.clone(), *at))
-        {
+            .filter(|(at, _)| at.elapsed() < ttl)
+            .map(|(_, jwks)| jwks.clone())
+    }
+
+    async fn jwks(&self, force: bool) -> Option<Jwks> {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(900);
+        const COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+        let freshness = if force { COOLDOWN } else { TTL };
+        if let Some(jwks) = self.cached_jwks(freshness) {
             return Some(jwks);
         }
+        let mut attempt = self.jwks_refresh.lock().await;
+        if let Some(jwks) = self.cached_jwks(freshness) {
+            return Some(jwks);
+        }
+        if attempt.is_some_and(|at| at.elapsed() < COOLDOWN) {
+            return self.cached_jwks(TTL);
+        }
+        let result = self.fetch_jwks().await;
+        *attempt = Some(Instant::now());
+        result
+    }
+
+    async fn fetch_jwks(&self) -> Option<Jwks> {
         let uri = match &self.config.jwks_uri {
             Some(uri) => uri.clone(),
             None => {
@@ -304,7 +332,14 @@ fn decoding_from_jwk(key: &Jwk) -> Option<jsonwebtoken::DecodingKey> {
 
 async fn http_get_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    let client = CLIENT.get_or_init(reqwest::Client::new);
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("valid JWKS client configuration")
+    });
     let response = client.get(url).send().await.map_err(|e| e.to_string())?;
     let status = response.status();
     if !status.is_success() {
@@ -360,6 +395,82 @@ mod tests {
             Some(&serde_json::json!("agora"))
         );
         assert_eq!(claim_value(&claims, "tenant.missing"), None);
+    }
+
+    #[tokio::test]
+    async fn signing_key_rotation_refreshes_cached_keys_without_fetch_storms() {
+        use base64::Engine;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        let rsa = openssl::rsa::Rsa::generate(2048).unwrap();
+        let public_keys = serde_json::json!({"keys":[{"kid":"new", "kty":"RSA", "alg":"RS256",
+            "n":base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rsa.n().to_vec()),
+            "e":base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rsa.e().to_vec())}]});
+        let app = axum::Router::new().route(
+            "/keys",
+            axum::routing::get(move || {
+                let seen = seen.clone();
+                let public_keys = public_keys.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(public_keys)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}/keys", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let auth = Auth::new(
+            AuthConfig {
+                jwks_uri: Some(uri),
+                oidc_issuer: Some("https://issuer.example".into()),
+                oidc_audience: Some("marbles".into()),
+                company_claim: Some("company_id".into()),
+                ..Default::default()
+            },
+            dir.path().into(),
+        );
+        let old: Jwks =
+            serde_json::from_value(serde_json::json!({"keys":[{"kid":"old", "kty":"RSA"}]}))
+                .unwrap();
+        *auth.jwks.lock().unwrap() =
+            Some((Instant::now() - std::time::Duration::from_secs(6), old));
+        assert_eq!(
+            auth.jwks(false).await.unwrap().keys[0].kid.as_deref(),
+            Some("old")
+        );
+        let (a, b) = tokio::join!(auth.jwks(true), auth.jwks(true));
+        for result in [a, b] {
+            assert_eq!(result.unwrap().keys[0].kid.as_deref(), Some("new"));
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        auth.jwks(true).await.unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some("new".into());
+        let signing =
+            jsonwebtoken::EncodingKey::from_rsa_pem(&rsa.private_key_to_pem().unwrap()).unwrap();
+        let mut claims = serde_json::json!({"iss":"https://issuer.example", "aud":"marbles",
+            "sub":"owner@example.com", "company_id":"fpl", "exp":chrono::Utc::now().timestamp()+600});
+        let token = jsonwebtoken::encode(&header, &claims, &signing).unwrap();
+        let principal = auth.authenticate(Some(&token)).await.unwrap();
+        assert_eq!(principal.name, "owner@example.com");
+        assert_eq!(principal.company_id.as_deref(), Some("fpl"));
+        claims["aud"] = "other-service".into();
+        let wrong_audience = jsonwebtoken::encode(&header, &claims, &signing).unwrap();
+        assert!(auth.authenticate(Some(&wrong_audience)).await.is_none());
+        claims["aud"] = "marbles".into();
+        claims["exp"] = (chrono::Utc::now().timestamp() - 120).into();
+        let expired = jsonwebtoken::encode(&header, &claims, &signing).unwrap();
+        assert!(auth.authenticate(Some(&expired)).await.is_none());
+        server.abort();
     }
 
     #[test]

@@ -70,6 +70,8 @@ impl Client {
         let http = reqwest::Client::builder()
             .connect_timeout(timeout.min(Duration::from_millis(CONNECT_TIMEOUT_MS)))
             .timeout(timeout)
+            // Credentials must never follow a redirect to an unintended host.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {

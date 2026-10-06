@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -20,7 +21,7 @@ const DEFAULT_REDIRECT_URI: &str = "http://localhost:17878/callback";
 pub const DEFAULT_OIDC_TIMEOUT_MS: u64 = 8_000;
 const CONNECT_TIMEOUT_MS: u64 = 3_000;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     pub url: String,
     #[serde(default = "default_issuer")]
@@ -46,6 +47,22 @@ struct TokenResponse {
     id_token: Option<String>,
     #[serde(default = "default_expires_in")]
     expires_in: i64,
+}
+
+impl TokenResponse {
+    fn expiration(&self) -> Result<i64, String> {
+        let id_token = self
+            .id_token
+            .as_deref()
+            .ok_or_else(|| "issuer returned no id_token".to_owned())?;
+        if id_token.trim().is_empty() || self.expires_in <= 0 {
+            return Err("issuer returned an empty token or invalid lifetime".into());
+        }
+        chrono::Utc::now()
+            .timestamp()
+            .checked_add(self.expires_in)
+            .ok_or_else(|| "issuer returned an invalid token lifetime".to_owned())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,6 +96,8 @@ fn http_client(timeout_ms: u64) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .connect_timeout(timeout.min(std::time::Duration::from_millis(CONNECT_TIMEOUT_MS)))
         .timeout(timeout)
+        // Credentials must never follow an HTTP redirect to an unintended host.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("building OIDC HTTP client: {e}"))
 }
@@ -123,33 +142,82 @@ pub fn load() -> Result<Option<ClientConfig>, String> {
     }
     let path = client_config_path();
     match fs::read_to_string(&path) {
-        Ok(text) => toml::from_str(&text)
-            .map(Some)
-            .map_err(|e| format!("parsing {}: {e}", path.display())),
+        Ok(text) => toml::from_str(&text).map(Some).map_err(|_| {
+            format!(
+                "invalid credential configuration in {}; sign in again",
+                path.display()
+            )
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("reading {}: {e}", path.display())),
     }
 }
 
 fn save(value: &ClientConfig) -> Result<(), String> {
-    let path = client_config_path();
+    save_at(value, &client_config_path())
+}
+
+fn private_options() -> fs::OpenOptions {
+    let mut options = fs::OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+}
+
+fn save_at(value: &ClientConfig, path: &std::path::Path) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "invalid client config path".to_owned())?;
     fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
-    let temp = path.with_extension("toml.tmp");
-    fs::write(
-        &temp,
-        toml::to_string_pretty(value).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| format!("writing {}: {e}", temp.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("securing {}: {e}", temp.display()))?;
+    let temp = path.with_extension(format!("toml.{}.tmp", random_urlsafe(12)?));
+    let result = (|| {
+        let mut file = private_options()
+            .create_new(true)
+            .open(&temp)
+            .map_err(|e| format!("creating credential file: {e}"))?;
+        file.write_all(
+            toml::to_string_pretty(value)
+                .map_err(|e| e.to_string())?
+                .as_bytes(),
+        )
+        .map_err(|e| format!("writing credentials: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("syncing credentials: {e}"))?;
+        fs::rename(&temp, path).map_err(|e| format!("installing credentials: {e}"))?;
+        #[cfg(unix)]
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| format!("syncing credential directory: {e}"))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
     }
-    fs::rename(&temp, &path).map_err(|e| format!("installing {}: {e}", path.display()))
+    result
+}
+
+fn token_error(operation: &str, status: reqwest::StatusCode, body: &str) -> String {
+    // Never echo provider bodies: they can contain submitted credentials or tokens.
+    let code = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        });
+    let hint = match code.as_deref() {
+        Some("invalid_grant") => "session expired or revoked; sign in again",
+        Some("invalid_client" | "unauthorized_client") => {
+            "client registration is invalid; check the configured client"
+        }
+        _ => "provider rejected the request; retry or check the issuer",
+    };
+    format!("OIDC {operation} HTTP {}: {hint}", status.as_u16())
 }
 
 fn random_urlsafe(bytes: usize) -> Result<String, String> {
@@ -220,17 +288,15 @@ pub async fn login(
     let status = response.status();
     let body = response.text().await.map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(format!(
-            "OIDC token exchange HTTP {}: {}",
-            status.as_u16(),
-            body.trim()
-        ));
+        return Err(token_error("token exchange", status, &body));
     }
     let tokens: TokenResponse =
-        serde_json::from_str(&body).map_err(|e| format!("parsing OIDC token response: {e}"))?;
-    let refresh_token = tokens.refresh_token.ok_or_else(|| {
-        "OIDC login response omitted refresh_token; ensure the client requests the `offline_access` scope".to_string()
-    })?;
+        serde_json::from_str(&body).map_err(|_| "invalid OIDC token response".to_owned())?;
+    let expires_at = tokens.expiration()?;
+    let refresh_token = tokens
+        .refresh_token
+        .filter(|token| !token.is_empty())
+        .ok_or("issuer did not grant offline access; sign in with offline_access")?;
     let id_token = tokens
         .id_token
         .ok_or_else(|| "OIDC login response omitted id_token".to_string())?;
@@ -242,10 +308,11 @@ pub async fn login(
         redirect_uri: redirect_uri.to_owned(),
         refresh_token,
         id_token,
-        expires_at: chrono::Utc::now().timestamp() + tokens.expires_in,
+        expires_at,
         persist: true,
     };
     if cfg.persist {
+        let _lock = credential_lock(client_config_path()).await?;
         save(&cfg)?;
     }
     Ok(cfg)
@@ -256,10 +323,51 @@ pub async fn valid_token(cfg: ClientConfig) -> Result<(ClientConfig, String), St
 }
 
 pub async fn valid_token_with_timeout(
-    mut cfg: ClientConfig,
+    cfg: ClientConfig,
     timeout_ms: u64,
 ) -> Result<(ClientConfig, String), String> {
-    if cfg.expires_at > chrono::Utc::now().timestamp() + 60 {
+    valid_token_at_with_timeout(cfg, client_config_path(), timeout_ms).await
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+async fn valid_token_at(
+    cfg: ClientConfig,
+    path: PathBuf,
+) -> Result<(ClientConfig, String), String> {
+    valid_token_at_with_timeout(cfg, path, DEFAULT_OIDC_TIMEOUT_MS).await
+}
+
+async fn valid_token_at_with_timeout(
+    mut cfg: ClientConfig,
+    path: PathBuf,
+    timeout_ms: u64,
+) -> Result<(ClientConfig, String), String> {
+    let _lock = if cfg.persist {
+        Some(credential_lock(path.clone()).await?)
+    } else {
+        None
+    };
+    if cfg.persist {
+        match fs::read_to_string(&path) {
+            Ok(text) => {
+                let latest: ClientConfig = toml::from_str(&text)
+                    .map_err(|_| "invalid saved credentials; sign in again".to_owned())?;
+                if latest.url != cfg.url
+                    || latest.issuer != cfg.issuer
+                    || latest.client_id != cfg.client_id
+                {
+                    return Err(
+                        "saved Marbles profile changed during refresh; retry the command"
+                            .to_owned(),
+                    );
+                }
+                cfg = latest;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("reading saved credentials: {e}")),
+        }
+    }
+    if !cfg.id_token.is_empty() && cfg.expires_at > chrono::Utc::now().timestamp() + 60 {
         return Ok((cfg.clone(), cfg.id_token.clone()));
     }
     let response = http_client(timeout_ms)?
@@ -287,9 +395,11 @@ pub async fn valid_token_with_timeout(
         return Err(refresh_error(status.as_u16(), &body));
     }
     let tokens: TokenResponse =
-        serde_json::from_str(&body).map_err(|e| format!("parsing OIDC refresh: {e}"))?;
+        serde_json::from_str(&body).map_err(|_| "invalid OIDC refresh response".to_owned())?;
     apply_refresh(&mut cfg, tokens)?;
-    save(&cfg)?;
+    if cfg.persist {
+        save_at(&cfg, &path)?;
+    }
     Ok((cfg.clone(), cfg.id_token))
 }
 
@@ -312,11 +422,10 @@ fn refresh_error(status: u16, body: &str) -> String {
             "re-login required: OIDC refresh was rejected (invalid_grant{detail}); run `marbles login --client-secret <secret>` to mint new tokens"
         );
     }
-    let kind = oauth_error.unwrap_or("unknown");
-    format!(
-        "OIDC refresh rejected (HTTP {status}, {kind}): {}",
-        body.trim()
-    )
+    // Everything else is reported by kind and status only; provider bodies may carry secrets.
+    let status =
+        reqwest::StatusCode::from_u16(status).unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    token_error("refresh", status, body)
 }
 
 /// Apply a refresh response. A missing rotated refresh token keeps the current one; a missing
@@ -326,12 +435,59 @@ fn apply_refresh(cfg: &mut ClientConfig, tokens: TokenResponse) -> Result<(), St
         "re-login required: OIDC refresh response omitted id_token; run `marbles login --client-secret <secret>`"
             .to_string()
     })?;
-    if let Some(refresh_token) = tokens.refresh_token {
+    if id_token.trim().is_empty() {
+        return Err(
+            "re-login required: OIDC refresh response omitted id_token; run `marbles login --client-secret <secret>`"
+                .to_string(),
+        );
+    }
+    let expires_at = chrono::Utc::now()
+        .timestamp()
+        .checked_add(tokens.expires_in)
+        .filter(|_| tokens.expires_in > 0)
+        .ok_or_else(|| {
+            "OIDC refresh response had an invalid lifetime; retry the command or sign in again"
+                .to_string()
+        })?;
+    if let Some(refresh_token) = tokens.refresh_token.filter(|token| !token.is_empty()) {
         cfg.refresh_token = refresh_token;
     }
     cfg.id_token = id_token;
-    cfg.expires_at = chrono::Utc::now().timestamp() + tokens.expires_in;
+    cfg.expires_at = expires_at;
     Ok(())
+}
+
+async fn credential_lock(path: PathBuf) -> Result<fs::File, String> {
+    // Lock the sidecar, not client.toml (which is atomically replaced). Kernel locks
+    // release on process exit; no stale lock cleanup or secret-bearing lock file.
+    let lock_path = path.with_extension("refresh.lock");
+    tokio::task::spawn_blocking(move || {
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let file = private_options()
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .map_err(|e| format!("opening refresh lock: {e}"))?;
+        let began = Instant::now();
+        loop {
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => return Ok(file),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if began.elapsed() > Duration::from_secs(15) {
+                        return Err(
+                            "another Marbles process is refreshing; retry shortly".to_owned()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(e) => return Err(format!("locking credentials: {e}")),
+            }
+        }
+    })
+    .await
+    .map_err(|e| format!("refresh lock task: {e}"))?
 }
 
 struct Callback {
@@ -481,5 +637,167 @@ mod tests {
         let (out, token) = valid_token_with_timeout(cfg, 1).await.unwrap();
         assert_eq!(token, "still-fresh");
         assert_eq!(out.id_token, "still-fresh");
+    }
+
+    #[test]
+    fn invalid_token_lifetimes_cannot_replace_a_working_profile() {
+        for (id_token, expires_in) in [("", 3600), ("id", 0), ("id", -1), ("id", i64::MAX)] {
+            assert!(
+                TokenResponse {
+                    refresh_token: None,
+                    id_token: Some(id_token.into()),
+                    expires_in
+                }
+                .expiration()
+                .is_err()
+            );
+        }
+    }
+
+    fn expired(issuer: String, persist: bool) -> ClientConfig {
+        ClientConfig {
+            url: "https://marbles.example".into(),
+            issuer,
+            client_id: "marbles".into(),
+            client_secret: "private-client-secret".into(),
+            redirect_uri: default_redirect_uri(),
+            refresh_token: "initial-refresh".into(),
+            id_token: String::new(),
+            expires_at: 0,
+            persist,
+        }
+    }
+
+    async fn issuer(
+        rotates: bool,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    let mut response =
+                        serde_json::json!({"id_token":"fresh-id", "expires_in":3600});
+                    if rotates {
+                        response["refresh_token"] = "rotated-refresh".into();
+                    }
+                    axum::Json(response)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (url, count, task)
+    }
+
+    #[tokio::test]
+    async fn concurrent_expired_profiles_refresh_only_once_and_save_rotation() {
+        use std::sync::atomic::Ordering;
+        let (url, count, server) = issuer(true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.toml");
+        let cfg = expired(url, true);
+        save_at(&cfg, &path).unwrap();
+        let (first, second) = tokio::join!(
+            valid_token_at(cfg.clone(), path.clone()),
+            valid_token_at(cfg, path.clone())
+        );
+        assert_eq!(first.unwrap().1, "fresh-id");
+        assert_eq!(second.unwrap().1, "fresh-id");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let saved: ClientConfig = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.refresh_token, "rotated-refresh");
+        // A subsequent process uses the saved token without contacting the issuer.
+        valid_token_at(saved, path.clone()).await.unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn environment_refresh_never_overwrites_saved_profile() {
+        let (url, _, server) = issuer(true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.toml");
+        fs::write(&path, "unchanged browser profile").unwrap();
+        let (cfg, token) = valid_token_at(expired(url, false), path.clone())
+            .await
+            .unwrap();
+        assert_eq!(token, "fresh-id");
+        assert_eq!(cfg.refresh_token, "rotated-refresh");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "unchanged browser profile"
+        );
+        assert!(!path.with_extension("refresh.lock").exists());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn refresh_without_rotation_retains_refresh_token() {
+        let (url, _, server) = issuer(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, _) = valid_token_at(expired(url, false), dir.path().join("client.toml"))
+            .await
+            .unwrap();
+        assert_eq!(cfg.refresh_token, "initial-refresh");
+        server.abort();
+    }
+
+    #[test]
+    fn provider_errors_never_echo_secrets() {
+        let error = token_error(
+            "refresh",
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"invalid_grant","error_description":"private-refresh-token"}"#,
+        );
+        assert!(error.contains("sign in again"));
+        assert!(!error.contains("private-refresh-token"));
+        let error = token_error(
+            "refresh",
+            reqwest::StatusCode::BAD_REQUEST,
+            "private-refresh-token",
+        );
+        assert!(!error.contains("private-refresh-token"));
+    }
+
+    #[tokio::test]
+    async fn profile_switch_fails_without_overwriting_new_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.toml");
+        let stale = expired("https://old.example".into(), true);
+        let new = expired("https://new.example".into(), true);
+        save_at(&new, &path).unwrap();
+        assert!(
+            valid_token_at(stale, path.clone())
+                .await
+                .err()
+                .unwrap()
+                .contains("profile changed")
+        );
+        let saved: ClientConfig = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(saved.issuer, "https://new.example");
     }
 }
