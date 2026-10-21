@@ -2,10 +2,12 @@
 //! boundary is data, not connection state or a caller-controlled search path.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
 use postgres::{Client, GenericClient, Transaction};
+use postgres_openssl::MakeTlsConnector;
 
 use crate::db::{
     CompanyStoreRegistry, Error, OutboundEvent, Result, Store, SweepReport, now,
@@ -15,7 +17,7 @@ use crate::time::WorkWeek;
 use crate::types::*;
 
 pub struct PostgresCompanyStores {
-    client: Arc<Mutex<Client>>,
+    client: Arc<SharedClient>,
     open: Mutex<BTreeMap<String, Arc<dyn Store>>>,
 }
 
@@ -23,31 +25,158 @@ impl PostgresCompanyStores {
     pub fn connect(database_url: &str) -> Result<Self> {
         let connector = crate::postgres_migration::tls_connector()
             .map_err(|e| Error::Bad(format!("building PostgreSQL TLS connector: {e}")))?;
-        let mut client = Client::connect(database_url, connector)?;
+        let mut client = Client::connect(database_url, connector.clone())?;
         crate::postgres_migration::install_schema(&mut client)?;
         Ok(Self {
-            client: Arc::new(Mutex::new(client)),
+            client: Arc::new(SharedClient {
+                url: database_url.to_owned(),
+                connector,
+                client: Mutex::new(Some(client)),
+            }),
             open: Mutex::new(BTreeMap::new()),
         })
     }
 }
 
+/// Pause before re-dialing a connection the server dropped. Deliberately short and bounded:
+/// this repairs a transient blip; it is not an unbounded retry loop and never runs while a
+/// statement is in flight.
+const RECONNECT_PAUSE: Duration = Duration::from_millis(200);
+
+/// SQLSTATEs that mean "this connection is gone", not "your statement is wrong". 08xxx is the
+/// connection-exception class, 57P0x is administrative shutdown/crash recovery, and 53300 is
+/// too many connections, which a later re-dial can also clear.
+fn is_disconnect_sqlstate(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some(
+            "08000" | "08001" | "08003" | "08004" | "08006" | "57P01" | "57P02" | "57P03" | "53300"
+        )
+    )
+}
+
+/// A killed backend does not always deliver a FATAL message first: an idle socket can surface
+/// as a bare TCP reset. Treat those IO kinds as connection loss too, otherwise a real restart
+/// leaves the process permanently dead (the exact incident this fixes).
+fn is_disconnect_io_kind(kind: std::io::ErrorKind) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        kind,
+        ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::NotConnected
+            | ErrorKind::UnexpectedEof
+    )
+}
+
+fn is_disconnect(error: &postgres::Error) -> bool {
+    if error.is_closed() || is_disconnect_sqlstate(error.code().map(|code| code.code())) {
+        return true;
+    }
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            return is_disconnect_io_kind(io.kind());
+        }
+        source = cause.source();
+    }
+    false
+}
+
+/// Run `op` against a live connection in `slot`, replacing the connection exactly once if the
+/// server dropped it. On a failed reconnect the slot stays empty, so the next call tries again
+/// instead of pinning a dead handle forever.
+///
+/// `op` must be repeatable for the error classes `retryable` accepts: a single statement is
+/// rolled back by the dropped connection, and a transaction only retries failures raised
+/// before `COMMIT` was attempted (see `PostgresStore::transaction`).
+fn with_reconnect<C, T, E>(
+    slot: &mut Option<C>,
+    mut reconnect: impl FnMut() -> std::result::Result<C, E>,
+    mut op: impl FnMut(&mut C) -> std::result::Result<T, E>,
+    retryable: impl Fn(&E) -> bool,
+    pause: Duration,
+) -> std::result::Result<T, E> {
+    let mut client = match slot.take() {
+        Some(client) => client,
+        None => reconnect()?,
+    };
+    match op(&mut client) {
+        Ok(value) => {
+            *slot = Some(client);
+            Ok(value)
+        }
+        Err(error) if retryable(&error) => {
+            // Drop the known-dead handle before pausing so nothing can reuse it.
+            drop(client);
+            std::thread::sleep(pause);
+            let mut fresh = reconnect()?;
+            let result = op(&mut fresh);
+            // Keep a healthy replacement; discard one that died during the retry so the next
+            // call re-dials instead of retrying on a known-dead handle.
+            if !matches!(&result, Err(error) if retryable(error)) {
+                *slot = Some(fresh);
+            }
+            result
+        }
+        Err(error) => {
+            *slot = Some(client);
+            Err(error)
+        }
+    }
+}
+
+fn is_disconnect_error(error: &Error) -> bool {
+    matches!(error, Error::Postgres(source) if is_disconnect(source))
+}
+
+/// The one connection shared by every store. It can be re-dialed; the single-writer model
+/// (one connection serialized behind one mutex) is unchanged.
+struct SharedClient {
+    url: String,
+    connector: MakeTlsConnector,
+    client: Mutex<Option<Client>>,
+}
+
+impl SharedClient {
+    fn with<T>(&self, op: impl FnMut(&mut Client) -> Result<T>) -> Result<T> {
+        self.with_retry(op, is_disconnect_error)
+    }
+
+    fn with_retry<T>(
+        &self,
+        op: impl FnMut(&mut Client) -> Result<T>,
+        retryable: impl Fn(&Error) -> bool,
+    ) -> Result<T> {
+        // A poisoned lock means an earlier panic, not a dead connection. Recover the guarded
+        // connection rather than turning every later store call into an error.
+        let mut slot = self.client.lock().unwrap_or_else(PoisonError::into_inner);
+        let url = &self.url;
+        let connector = &self.connector;
+        with_reconnect(
+            &mut slot,
+            || Ok(Client::connect(url, connector.clone())?),
+            op,
+            retryable,
+            RECONNECT_PAUSE,
+        )
+    }
+}
+
 impl CompanyStoreRegistry for PostgresCompanyStores {
     fn health_check(&self) -> Result<()> {
-        let mut client = self
-            .client
-            .lock()
-            .map_err(|_| Error::Bad("PostgreSQL client lock poisoned".into()))?;
-        client.query("SELECT 1 FROM marbles_project LIMIT 1", &[])?;
-        Ok(())
+        // A real round-trip, not a cached flag: a dead connection is replaced and retried once
+        // inside `SharedClient::with`, so /healthz recovers when PostgreSQL comes back.
+        self.client.with(|client| {
+            client.query("SELECT 1 FROM marbles_project LIMIT 1", &[])?;
+            Ok(())
+        })
     }
 
     fn for_company(&self, company_id: &str) -> Result<Arc<dyn Store>> {
         validate_company_id(company_id)?;
-        let mut open = self
-            .open
-            .lock()
-            .map_err(|_| Error::Bad("PostgreSQL company store lock poisoned".into()))?;
+        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(store) = open.get(company_id) {
             return Ok(Arc::clone(store));
         }
@@ -69,10 +198,7 @@ impl CompanyStoreRegistry for PostgresCompanyStores {
     }
 
     fn open_stores(&self) -> Result<Vec<(String, Arc<dyn Store>)>> {
-        let open = self
-            .open
-            .lock()
-            .map_err(|_| Error::Bad("PostgreSQL company store lock poisoned".into()))?;
+        let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
         Ok(open
             .iter()
             .map(|(company, store)| (company.clone(), Arc::clone(store)))
@@ -81,32 +207,40 @@ impl CompanyStoreRegistry for PostgresCompanyStores {
 }
 
 struct PostgresStore {
-    client: Arc<Mutex<Client>>,
+    client: Arc<SharedClient>,
     company_id: String,
     policy: Policy,
     week: WorkWeek,
 }
 
 impl PostgresStore {
-    fn client(&self) -> Result<std::sync::MutexGuard<'_, Client>> {
-        self.client
-            .lock()
-            .map_err(|_| Error::Bad("PostgreSQL client lock poisoned".into()))
+    fn with_client<T>(&self, op: impl FnMut(&mut Client) -> Result<T>) -> Result<T> {
+        self.client.with(op)
     }
 
-    fn transaction<T>(&self, f: impl FnOnce(&mut Transaction<'_>) -> Result<T>) -> Result<T> {
-        let mut client = self.client()?;
-        let mut tx = client.transaction()?;
-        // Serialize one tenant's state machine across blue/green server processes. This also
-        // makes the migrated, per-company history sequence safe without introducing a second
-        // sequence namespace that could collide with preserved SQLite ids.
-        tx.execute(
-            "SELECT pg_advisory_xact_lock(hashtext($1))",
-            &[&self.company_id],
-        )?;
-        let value = f(&mut tx)?;
-        tx.commit()?;
-        Ok(value)
+    fn transaction<T>(&self, mut f: impl FnMut(&mut Transaction<'_>) -> Result<T>) -> Result<T> {
+        // A COMMIT that loses the connection is ambiguous: the server may already have applied
+        // it. Replaying the transaction could duplicate a state transition or its outbound
+        // event, so only failures raised before COMMIT is attempted are retried.
+        let commit_attempted = std::cell::Cell::new(false);
+        self.client.with_retry(
+            |client| {
+                commit_attempted.set(false);
+                let mut tx = client.transaction()?;
+                // Serialize one tenant's state machine across blue/green server processes. This
+                // also makes the migrated, per-company history sequence safe without introducing
+                // a second sequence namespace that could collide with preserved SQLite ids.
+                tx.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1))",
+                    &[&self.company_id],
+                )?;
+                let value = f(&mut tx)?;
+                commit_attempted.set(true);
+                tx.commit()?;
+                Ok(value)
+            },
+            |error| !commit_attempted.get() && is_disconnect_error(error),
+        )
     }
 }
 
@@ -123,21 +257,23 @@ impl Store for PostgresStore {
     }
 
     fn projects(&self) -> Result<Vec<(String, String, String)>> {
-        let mut client = self.client()?;
-        Ok(client
-            .query(
-                "SELECT slug,root,prefix FROM marbles_project WHERE company_id=$1 ORDER BY slug",
-                &[&self.company_id],
-            )?
-            .into_iter()
-            .map(|row| (row.get(0), row.get(1), row.get(2)))
-            .collect())
+        self.with_client(|client| {
+            Ok(client
+                .query(
+                    "SELECT slug,root,prefix FROM marbles_project WHERE company_id=$1 ORDER BY slug",
+                    &[&self.company_id],
+                )?
+                .into_iter()
+                .map(|row| (row.get(0), row.get(1), row.get(2)))
+                .collect())
+        })
     }
 
     fn pending_events(&self, at: i64, limit: usize) -> Result<Vec<OutboundEvent>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut client = self.client()?;
-        Ok(client.query("SELECT seq,issue_id,project,occurred_at,event,attempts FROM marbles_outbound_event WHERE company_id=$1 AND delivered_at IS NULL AND next_attempt_at <= $2 ORDER BY seq LIMIT $3", &[&self.company_id,&at,&limit])?.into_iter().map(|r| OutboundEvent { seq:r.get(0), issue_id:r.get(1), project:r.get(2), occurred_at:r.get(3), event:r.get(4), attempts:r.get(5) }).collect())
+        self.with_client(|client| {
+            Ok(client.query("SELECT seq,issue_id,project,occurred_at,event,attempts FROM marbles_outbound_event WHERE company_id=$1 AND delivered_at IS NULL AND next_attempt_at <= $2 ORDER BY seq LIMIT $3", &[&self.company_id,&at,&limit])?.into_iter().map(|r| OutboundEvent { seq:r.get(0), issue_id:r.get(1), project:r.get(2), occurred_at:r.get(3), event:r.get(4), attempts:r.get(5) }).collect())
+        })
     }
 
     fn mark_event_delivered(&self, seq: i64, at: i64) -> Result<()> {
@@ -184,43 +320,49 @@ impl Store for PostgresStore {
     }
 
     fn get(&self, id: &str) -> Result<Issue> {
-        let mut client = self.client()?;
-        row_to_issue(&mut *client, &self.company_id, id)?.ok_or_else(|| Error::NotFound(id.into()))
+        self.with_client(|client| {
+            row_to_issue(&mut *client, &self.company_id, id)?
+                .ok_or_else(|| Error::NotFound(id.into()))
+        })
     }
 
     fn list(&self, project: Option<&str>, all: bool, only_id: Option<&str>) -> Result<Vec<Issue>> {
-        let mut client = self.client()?;
-        let rows = client.query("SELECT id FROM marbles_issue WHERE company_id=$1 AND ($2::boolean OR status != 'closed') AND ($3::text IS NULL OR project=$3) AND ($4::text IS NULL OR id=$4) ORDER BY priority,created_at,id", &[&self.company_id,&all,&project,&only_id])?;
-        rows.into_iter()
-            .map(|r| {
-                let id: String = r.get(0);
-                row_to_issue(&mut *client, &self.company_id, &id)?.ok_or(Error::NotFound(id))
-            })
-            .collect()
+        self.with_client(|client| {
+            let rows = client.query("SELECT id FROM marbles_issue WHERE company_id=$1 AND ($2::boolean OR status != 'closed') AND ($3::text IS NULL OR project=$3) AND ($4::text IS NULL OR id=$4) ORDER BY priority,created_at,id", &[&self.company_id,&all,&project,&only_id])?;
+            rows.into_iter()
+                .map(|r| {
+                    let id: String = r.get(0);
+                    row_to_issue(&mut *client, &self.company_id, &id)?.ok_or(Error::NotFound(id))
+                })
+                .collect()
+        })
     }
 
     fn ready(&self, project: Option<&str>, at: i64) -> Result<Vec<Issue>> {
-        let mut client = self.client()?;
-        let rows=client.query("SELECT i.id FROM marbles_issue i WHERE i.company_id=$1 AND i.status='open' AND (i.available_at IS NULL OR i.available_at <= $2) AND ($3::text IS NULL OR i.project=$3) AND NOT EXISTS(SELECT 1 FROM marbles_dep d JOIN marbles_issue p ON p.company_id=d.company_id AND p.id=d.depends_on WHERE d.company_id=i.company_id AND d.issue_id=i.id AND p.status!='closed') AND (i.assignee IS NULL OR (i.expires_at IS NOT NULL AND i.expires_at <= $2)) ORDER BY i.priority,i.created_at,i.id", &[&self.company_id,&at,&project])?;
-        rows.into_iter()
-            .map(|r| {
-                let id: String = r.get(0);
-                row_to_issue(&mut *client, &self.company_id, &id)?.ok_or(Error::NotFound(id))
-            })
-            .collect()
+        self.with_client(|client| {
+            let rows=client.query("SELECT i.id FROM marbles_issue i WHERE i.company_id=$1 AND i.status='open' AND (i.available_at IS NULL OR i.available_at <= $2) AND ($3::text IS NULL OR i.project=$3) AND NOT EXISTS(SELECT 1 FROM marbles_dep d JOIN marbles_issue p ON p.company_id=d.company_id AND p.id=d.depends_on WHERE d.company_id=i.company_id AND d.issue_id=i.id AND p.status!='closed') AND (i.assignee IS NULL OR (i.expires_at IS NOT NULL AND i.expires_at <= $2)) ORDER BY i.priority,i.created_at,i.id", &[&self.company_id,&at,&project])?;
+            rows.into_iter()
+                .map(|r| {
+                    let id: String = r.get(0);
+                    row_to_issue(&mut *client, &self.company_id, &id)?.ok_or(Error::NotFound(id))
+                })
+                .collect()
+        })
     }
 
     fn update(&self, id: &str, patch: &IssuePatch, actor: &str, at: i64) -> Result<Issue> {
-        if let Some(status) = &patch.status {
-            if !STATUSES.contains(&status.as_str()) {
-                return Err(Error::BadStatus(status.clone()));
-            }
+        if let Some(status) = &patch.status
+            && !STATUSES.contains(&status.as_str())
+        {
+            return Err(Error::BadStatus(status.clone()));
         }
         self.transaction(|tx| {
             let mut issue=row_to_issue(tx,&self.company_id,id)?.ok_or_else(|| Error::NotFound(id.into()))?;
-            if let Some(v)=&patch.title { issue.title=v.clone(); } if let Some(v)=&patch.description { issue.description=v.clone(); }
+            if let Some(v)=&patch.title { issue.title=v.clone(); }
+            if let Some(v)=&patch.description { issue.description=v.clone(); }
             if let Some(v)=&patch.append_notes { if !issue.description.is_empty(){issue.description.push('\n');} issue.description.push_str(v); }
-            if let Some(v)=patch.priority { issue.priority=v; } if let Some(v)=&patch.evidence { issue.evidence=v.clone(); }
+            if let Some(v)=patch.priority { issue.priority=v; }
+            if let Some(v)=&patch.evidence { issue.evidence=v.clone(); }
             if let Some(v)=&patch.metadata { let serde_json::Value::Object(incoming)=v else{return Err(Error::Bad("metadata patch must be a JSON object".into()))}; let mut map=issue.metadata.as_object().cloned().unwrap_or_default(); for (k,v) in incoming { if v.is_null(){map.remove(k);}else{map.insert(k.clone(),v.clone());}} issue.metadata=serde_json::Value::Object(map); issue.external_ref=issue.metadata.get("external_ref").and_then(|v|v.as_str()).map(str::to_owned); }
             let status_changed=patch.status.as_deref().is_some_and(|s|s!=issue.status); if let Some(v)=&patch.status {issue.status=v.clone();issue.closed_at=(v=="closed").then_some(at);}
             let available=patch.available_at.unwrap_or_else(|| (at+self.policy.edit_deferral_seconds).max(issue.available_at.unwrap_or(0)));
@@ -282,7 +424,7 @@ impl Store for PostgresStore {
                 .unwrap_or(self.week.human_expiry(&utc(at), &self.policy) - at)
                 .min(self.policy.max_ttl_seconds),
         };
-        self.transaction(|tx| { let row=tx.query_opt("SELECT assignee,expires_at FROM marbles_issue WHERE company_id=$1 AND id=$2 FOR UPDATE", &[&self.company_id,&req.id])?.ok_or_else(||Error::NotFound(req.id.clone()))?;let assignee:Option<String>=row.get(0);let expires:Option<i64>=row.get(1);if assignee.is_some()&&expires.is_some_and(|v|v>at)&&assignee.as_deref()!=Some(&req.assignee){return Err(Error::AlreadyClaimed(req.id.clone(),assignee.unwrap()));}let expiry=at+ttl;tx.execute("UPDATE marbles_issue SET assignee=$3,actor_kind=$4,claimed_at=$5,expires_at=$6,updated_at=$5 WHERE company_id=$1 AND id=$2", &[&self.company_id,&req.id,&req.assignee,&req.actor_kind.as_str(),&at,&expiry])?;log_event(tx,&self.company_id,&req.id,at,&req.assignee,"claimed",req.actor_kind.as_str())?;Ok(ClaimReceipt{id:req.id.clone(),assignee:req.assignee.clone(),actor_kind:req.actor_kind,expires_at:expiry}) })
+        self.transaction(|tx| { let row=tx.query_opt("SELECT assignee,expires_at FROM marbles_issue WHERE company_id=$1 AND id=$2 FOR UPDATE", &[&self.company_id,&req.id])?.ok_or_else(||Error::NotFound(req.id.clone()))?;let assignee:Option<String>=row.get(0);let expires:Option<i64>=row.get(1);if let Some(holder)=&assignee && expires.is_some_and(|v|v>at) && holder!=&req.assignee {return Err(Error::AlreadyClaimed(req.id.clone(),holder.clone()));}let expiry=at+ttl;tx.execute("UPDATE marbles_issue SET assignee=$3,actor_kind=$4,claimed_at=$5,expires_at=$6,updated_at=$5 WHERE company_id=$1 AND id=$2", &[&self.company_id,&req.id,&req.assignee,&req.actor_kind.as_str(),&at,&expiry])?;log_event(tx,&self.company_id,&req.id,at,&req.assignee,"claimed",req.actor_kind.as_str())?;Ok(ClaimReceipt{id:req.id.clone(),assignee:req.assignee.clone(),actor_kind:req.actor_kind,expires_at:expiry}) })
     }
     fn touch(&self, id: &str, assignee: &str, at: i64) -> Result<i64> {
         self.transaction(|tx| { let row=tx.query_opt("SELECT assignee,actor_kind FROM marbles_issue WHERE company_id=$1 AND id=$2 FOR UPDATE", &[&self.company_id,&id])?.ok_or_else(||Error::NotFound(id.into()))?;let current:Option<String>=row.get(0);if current.as_deref()!=Some(assignee){return Err(Error::Bad(format!("{id} is not claimed by {assignee}")));}let kind:Option<String>=row.get(1);let ttl=if kind.as_deref()==Some("human"){self.week.human_expiry(&utc(at),&self.policy)-at}else{self.policy.agent_ttl_seconds};let expiry=at+ttl;tx.execute("UPDATE marbles_issue SET expires_at=$3,updated_at=$4 WHERE company_id=$1 AND id=$2", &[&self.company_id,&id,&expiry,&at])?;log_event(tx,&self.company_id,id,at,assignee,"heartbeat","")?;Ok(expiry) })
@@ -313,28 +455,30 @@ impl Store for PostgresStore {
         self.transaction(|tx|{require_issue(tx,&self.company_id,replacement)?;let reason=format!("superseded by {replacement}");close_tx(tx,&self.company_id,id,Some(&reason),&[Evidence::ack(reason.clone())],actor,at)?;let row=tx.query_one("SELECT labels_json FROM marbles_issue WHERE company_id=$1 AND id=$2 FOR UPDATE", &[&self.company_id,&id])?;let mut labels:Vec<String>=serde_json::from_str(row.get(0))?;let label=format!("supersedes:{replacement}");if !labels.contains(&label){labels.push(label);labels.sort();let encoded=serde_json::to_string(&labels)?;tx.execute("UPDATE marbles_issue SET labels_json=$3,updated_at=$4 WHERE company_id=$1 AND id=$2", &[&self.company_id,&id,&encoded,&at])?;log_event(tx,&self.company_id,id,at,actor,"labels",&labels.join(","))?;}Ok(())})
     }
     fn history(&self, id: &str) -> Result<Vec<HistoryEvent>> {
-        let mut client = self.client()?;
-        Ok(client.query("SELECT issue_id,ts,actor,event,detail FROM marbles_history WHERE company_id=$1 AND issue_id=$2 ORDER BY seq", &[&self.company_id,&id])?.into_iter().map(|r|HistoryEvent{issue_id:r.get(0),ts:r.get(1),actor:r.get(2),event:r.get(3),detail:r.get(4)}).collect())
+        self.with_client(|client| {
+            Ok(client.query("SELECT issue_id,ts,actor,event,detail FROM marbles_history WHERE company_id=$1 AND issue_id=$2 ORDER BY seq", &[&self.company_id,&id])?.into_iter().map(|r|HistoryEvent{issue_id:r.get(0),ts:r.get(1),actor:r.get(2),event:r.get(3),detail:r.get(4)}).collect())
+        })
     }
     fn stats(&self) -> Result<serde_json::Value> {
-        let mut client = self.client()?;
-        let mut counts: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
-        for r in client.query("SELECT project,status,COUNT(*) FROM marbles_issue WHERE company_id=$1 GROUP BY project,status", &[&self.company_id])?{counts.entry(r.get(0)).or_default().insert(r.get(1),r.get(2));}
-        Ok(serde_json::json!(
-            counts
-                .into_iter()
-                .map(|(project, statuses)| {
-                    let total: i64 = statuses.values().sum();
-                    (
-                        project,
-                        serde_json::json!({"by_status":statuses,"total":total}),
-                    )
-                })
-                .collect::<serde_json::Map<_, _>>()
-        ))
+        self.with_client(|client| {
+            let mut counts: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
+            for r in client.query("SELECT project,status,COUNT(*) FROM marbles_issue WHERE company_id=$1 GROUP BY project,status", &[&self.company_id])?{counts.entry(r.get(0)).or_default().insert(r.get(1),r.get(2));}
+            Ok(serde_json::json!(
+                counts
+                    .into_iter()
+                    .map(|(project, statuses)| {
+                        let total: i64 = statuses.values().sum();
+                        (
+                            project,
+                            serde_json::json!({"by_status":statuses,"total":total}),
+                        )
+                    })
+                    .collect::<serde_json::Map<_, _>>()
+            ))
+        })
     }
     fn prometheus_metrics(&self, at: i64) -> Result<String> {
-        let mut client = self.client()?;
+        self.with_client(|client| {
         let mut out = String::from(
             "# HELP marbles_issues Current issues by project and status.\n# TYPE marbles_issues gauge\n# HELP marbles_queue_oldest_age_seconds Age of the oldest currently ready issue.\n# TYPE marbles_queue_oldest_age_seconds gauge\n# HELP marbles_claims_active Current unexpired claims by project and actor kind.\n# TYPE marbles_claims_active gauge\n# HELP marbles_events_total Durable tracker transitions by project and event.\n# TYPE marbles_events_total counter\n# HELP marbles_claim_latency_seconds Time from issue creation to first claim.\n# TYPE marbles_claim_latency_seconds summary\n# HELP marbles_cycle_time_seconds Time from issue creation to evidence-backed close.\n# TYPE marbles_cycle_time_seconds summary\n# HELP marbles_review_time_seconds Time from first review state to close.\n# TYPE marbles_review_time_seconds summary\n",
         );
@@ -364,6 +508,7 @@ impl Store for PostgresStore {
             "SELECT i.project,SUM(i.closed_at-h.first_review)::bigint,COUNT(*) FROM marbles_issue i JOIN (SELECT company_id,issue_id,MIN(ts) first_review FROM marbles_history WHERE company_id=$1 AND event='status' AND detail='→ review' GROUP BY company_id,issue_id) h ON h.company_id=i.company_id AND h.issue_id=i.id WHERE i.company_id=$1 AND i.closed_at IS NOT NULL AND i.closed_at>=h.first_review GROUP BY i.project",
         )?;
         Ok(out)
+        })
     }
 }
 
@@ -509,4 +654,241 @@ fn append_duration(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! The reconnect decision logic is exercised without a database: `with_reconnect` is
+    //! generic over the client and error types, so a fake client is enough to pin down
+    //! "retry exactly once on a dropped connection, never on anything else".
+
+    use super::*;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum FakeError {
+        Dropped,
+        Fatal,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct FakeClient(u8);
+
+    fn dropped(error: &FakeError) -> bool {
+        *error == FakeError::Dropped
+    }
+
+    #[test]
+    fn sqlstate_classification_covers_only_connection_loss() {
+        for code in [
+            "08000", "08001", "08003", "08004", "08006", "57P01", "57P02", "57P03", "53300",
+        ] {
+            assert!(
+                is_disconnect_sqlstate(Some(code)),
+                "{code} should be a disconnect"
+            );
+        }
+        for code in ["23505", "42601", "57014", "40001"] {
+            assert!(
+                !is_disconnect_sqlstate(Some(code)),
+                "{code} is a statement error, not a disconnect"
+            );
+        }
+        assert!(!is_disconnect_sqlstate(None));
+    }
+
+    #[test]
+    fn socket_errors_are_connection_loss_but_other_io_is_not() {
+        use std::io::ErrorKind;
+        for kind in [
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+            ErrorKind::NotConnected,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert!(is_disconnect_io_kind(kind), "{kind:?} is a dead socket");
+        }
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidData,
+            ErrorKind::WouldBlock,
+        ] {
+            assert!(
+                !is_disconnect_io_kind(kind),
+                "{kind:?} must not trigger a reconnect"
+            );
+        }
+    }
+
+    #[test]
+    fn dropped_connection_is_replaced_and_retried_exactly_once() {
+        let mut slot = Some(FakeClient(1));
+        let mut connects = 0;
+        let mut attempts = Vec::new();
+        let value = with_reconnect(
+            &mut slot,
+            || {
+                connects += 1;
+                Ok(FakeClient(2))
+            },
+            |client| {
+                attempts.push(client.0);
+                if client.0 == 1 {
+                    Err(FakeError::Dropped)
+                } else {
+                    Ok(client.0)
+                }
+            },
+            dropped,
+            Duration::ZERO,
+        );
+        assert_eq!(value, Ok(2));
+        assert_eq!(attempts, [1, 2], "the operation runs once per connection");
+        assert_eq!(connects, 1);
+        assert_eq!(slot.as_ref().map(|client| client.0), Some(2));
+    }
+
+    #[test]
+    fn statement_errors_are_not_retried() {
+        let mut slot = Some(FakeClient(1));
+        let mut connects = 0;
+        let error = with_reconnect(
+            &mut slot,
+            || {
+                connects += 1;
+                Ok(FakeClient(2))
+            },
+            |_| Err::<(), FakeError>(FakeError::Fatal),
+            dropped,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(error, FakeError::Fatal);
+        assert_eq!(connects, 0);
+        assert_eq!(slot.as_ref().map(|client| client.0), Some(1));
+    }
+
+    #[test]
+    fn failed_reconnect_surfaces_the_new_error_and_stays_retryable() {
+        let mut slot = Some(FakeClient(1));
+        let mut connects = 0;
+        let error = with_reconnect(
+            &mut slot,
+            || {
+                connects += 1;
+                Err(FakeError::Fatal)
+            },
+            |_| Err::<(), FakeError>(FakeError::Dropped),
+            dropped,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            FakeError::Fatal,
+            "never the stale dropped-connection error"
+        );
+        assert_eq!(connects, 1);
+        assert!(
+            slot.is_none(),
+            "a failed reconnect must not pin a dead client"
+        );
+
+        // The next operation dials again instead of staying dead forever.
+        let value = with_reconnect(
+            &mut slot,
+            || Ok(FakeClient(3)),
+            |client| Ok(client.0),
+            dropped,
+            Duration::ZERO,
+        );
+        assert_eq!(value, Ok(3));
+    }
+
+    #[test]
+    fn an_empty_slot_connects_before_the_first_operation() {
+        let mut slot = None;
+        let value = with_reconnect(
+            &mut slot,
+            || Ok(FakeClient(7)),
+            |client| Ok(client.0),
+            dropped,
+            Duration::ZERO,
+        );
+        assert_eq!(value, Ok(7));
+    }
+
+    #[test]
+    fn a_retry_that_drops_again_leaves_the_slot_empty_for_the_next_call() {
+        let mut slot = Some(FakeClient(1));
+        let error = with_reconnect(
+            &mut slot,
+            || Ok(FakeClient(2)),
+            |_| Err::<(), FakeError>(FakeError::Dropped),
+            dropped,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(error, FakeError::Dropped);
+        assert!(
+            slot.is_none(),
+            "a replacement that also died must not be cached"
+        );
+    }
+
+    #[test]
+    fn a_retry_that_fails_for_another_reason_keeps_the_replacement() {
+        let mut slot = Some(FakeClient(1));
+        let mut attempts = 0;
+        let error = with_reconnect(
+            &mut slot,
+            || Ok(FakeClient(2)),
+            |client| {
+                attempts += 1;
+                if client.0 == 1 {
+                    Err::<(), FakeError>(FakeError::Dropped)
+                } else {
+                    Err::<(), FakeError>(FakeError::Fatal)
+                }
+            },
+            dropped,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(error, FakeError::Fatal);
+        assert_eq!(attempts, 2);
+        assert_eq!(
+            slot.as_ref().map(|client| client.0),
+            Some(2),
+            "the healthy replacement stays cached for the next call"
+        );
+    }
+
+    #[test]
+    fn a_disconnect_after_commit_is_not_replayed() {
+        // Mirrors `PostgresStore::transaction`: `commit_attempted` is set before COMMIT, and the
+        // retry predicate refuses the ambiguous error so committed work cannot be duplicated.
+        let mut slot = Some(FakeClient(1));
+        let commit_attempted = std::cell::Cell::new(false);
+        let mut attempts = 0;
+        let mut connects = 0;
+        let error = with_reconnect(
+            &mut slot,
+            || {
+                connects += 1;
+                Ok(FakeClient(2))
+            },
+            |_| {
+                attempts += 1;
+                commit_attempted.set(true);
+                Err::<(), FakeError>(FakeError::Dropped)
+            },
+            |error| !commit_attempted.get() && dropped(error),
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(error, FakeError::Dropped);
+        assert_eq!(attempts, 1, "an ambiguous COMMIT must not be replayed");
+        assert_eq!(connects, 0);
+    }
 }
