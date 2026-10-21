@@ -230,6 +230,7 @@ fn sqlite_migration_preserves_binary_copy_values_and_refuses_populated_tenants()
 #[test]
 fn failed_binary_copy_rolls_back_the_entire_tenant_import() {
     let Some(url) = test_url() else {
+        eprintln!("skipping binary copy integration: MARBLES_TEST_DATABASE_URL unset");
         return;
     };
     let company = format!("rollback-{}-{}", std::process::id(), marbles::db::now());
@@ -257,5 +258,91 @@ fn failed_binary_copy_rolls_back_the_entire_tenant_import() {
         .unwrap()
         .get(0);
     assert_eq!(count, 0, "failed COPY must not partially import the tenant");
+    cleanup(&url, &[company]);
+}
+
+/// Tag the connection string so the test can terminate exactly its own backend without
+/// disturbing other tests or tenants sharing the database.
+fn with_application_name(url: &str, name: &str) -> String {
+    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        let separator = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{separator}application_name={name}")
+    } else {
+        format!("{url} application_name={name}")
+    }
+}
+
+/// Terminate the store's backend server-side and wait until PostgreSQL drops it, so the next
+/// statement really has to notice a dead socket instead of racing an asynchronous shutdown.
+fn terminate_store_backend(admin: &mut postgres::Client, application_name: &str) {
+    let rows = admin
+        .query(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE application_name=$1 AND pid <> pg_backend_pid()",
+            &[&application_name],
+        )
+        .expect("terminate the store backend");
+    let terminated = rows.iter().filter(|row| row.get::<_, bool>(0)).count();
+    assert_eq!(
+        terminated, 1,
+        "expected exactly one live store backend to terminate"
+    );
+    for _ in 0..100 {
+        let alive: i64 = admin
+            .query_one(
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name=$1",
+                &[&application_name],
+            )
+            .unwrap()
+            .get(0);
+        if alive == 0 {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("backend {application_name} was terminated but is still listed");
+}
+
+#[test]
+fn store_reconnects_after_the_server_terminates_its_backend() {
+    let Some(base_url) = test_url() else {
+        eprintln!("skipping reconnect integration: MARBLES_TEST_DATABASE_URL unset");
+        return;
+    };
+    let nonce = format!("{}-{}", std::process::id(), marbles::db::now());
+    let company = format!("pg-reconnect-{nonce}");
+    let application_name = format!("marbles-reconnect-{nonce}");
+    let url = with_application_name(&base_url, &application_name);
+
+    let stores = PostgresCompanyStores::connect(&url).expect("open PostgreSQL stores");
+    // Put the process-long connection into use before killing it.
+    stores.health_check().expect("initial health check");
+    let store = stores.for_company(&company).unwrap();
+    store
+        .ensure_project("reconnect", "/reconnect", "rec")
+        .unwrap();
+
+    let mut admin = postgres_migration::connect(&base_url).expect("admin connection");
+
+    // No 500, no restart: the next store operation reconnects and retries once.
+    terminate_store_backend(&mut admin, &application_name);
+    let projects = store
+        .projects()
+        .expect("store operation after backend termination must reconnect");
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0].0, "reconnect");
+
+    // /healthz probes the same connection, so it must recover on its own too.
+    terminate_store_backend(&mut admin, &application_name);
+    stores
+        .health_check()
+        .expect("health_check must recover after backend termination");
+
+    // A write on the replacement connection proves the new backend is fully usable.
+    store
+        .ensure_project("reconnect-b", "/reconnect-b", "recb")
+        .unwrap();
+    assert_eq!(store.projects().unwrap().len(), 2);
+
     cleanup(&url, &[company]);
 }
