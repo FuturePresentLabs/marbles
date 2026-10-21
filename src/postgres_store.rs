@@ -25,13 +25,15 @@ impl PostgresCompanyStores {
     pub fn connect(database_url: &str) -> Result<Self> {
         let connector = crate::postgres_migration::tls_connector()
             .map_err(|e| Error::Bad(format!("building PostgreSQL TLS connector: {e}")))?;
-        let mut client = Client::connect(database_url, connector.clone())?;
-        crate::postgres_migration::install_schema(&mut client)?;
+        let client = connect_bounded(database_url, &connector)?;
         Ok(Self {
             client: Arc::new(SharedClient {
                 url: database_url.to_owned(),
                 connector,
-                client: Mutex::new(Some(client)),
+                state: Mutex::new(SlotState {
+                    client: Some(client),
+                    reconnecting: false,
+                }),
             }),
             open: Mutex::new(BTreeMap::new()),
         })
@@ -42,6 +44,73 @@ impl PostgresCompanyStores {
 /// this repairs a transient blip; it is not an unbounded retry loop and never runs while a
 /// statement is in flight.
 const RECONNECT_PAUSE: Duration = Duration::from_millis(200);
+
+/// Bound the TCP connect. A half-open socket or an idle pooler drop can leave `connect` waiting
+/// on a peer that will never answer; without this the shared client wedges forever.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Even a successful TCP handshake can stall in TLS/startup against a black-holed peer. The
+/// sync client's `connect_timeout` only covers the TCP connect itself, so dial on a worker and
+/// abandon it after this deadline rather than blocking the caller indefinitely.
+const DIAL_DEADLINE: Duration = Duration::from_secs(6);
+
+/// Notice a peer that vanished without sending a FIN during a long idle period. PostgreSQL's
+/// own TCP keepalives are not guaranteed to be enabled server-side.
+const KEEPALIVES_IDLE: Duration = Duration::from_secs(30);
+
+/// Bound a statement the server never answers (e.g. a half-open socket after the query was
+/// written). This is per statement, so a legitimately long transaction is not capped.
+const STATEMENT_TIMEOUT_MS: u64 = 15_000;
+
+/// Build the reconnect configuration: the caller's `DATABASE_URL` (including `sslmode=require`)
+/// plus a bounded connect, keepalives, and a server-side statement timeout.
+fn bounded_config(url: &str) -> Result<postgres::Config> {
+    let mut config: postgres::Config = url
+        .parse()
+        .map_err(|e| Error::Bad(format!("parsing DATABASE_URL: {e}")))?;
+    if config
+        .get_connect_timeout()
+        .is_none_or(|timeout| *timeout > CONNECT_TIMEOUT)
+    {
+        config.connect_timeout(CONNECT_TIMEOUT);
+    }
+    config.keepalives_idle(KEEPALIVES_IDLE);
+    let statement_timeout = format!("-c statement_timeout={STATEMENT_TIMEOUT_MS}");
+    let options = match config.get_options() {
+        Some(existing) if !existing.trim().is_empty() => {
+            format!("{existing} {statement_timeout}")
+        }
+        _ => statement_timeout,
+    };
+    config.options(&options);
+    Ok(config)
+}
+
+/// Connect with the bounded configuration and ensure the schema exists on the fresh handle.
+/// The dial runs on a worker thread so the caller can abandon a stalled TLS/startup handshake
+/// after [`DIAL_DEADLINE`]; a late connection is simply dropped when its sender is gone.
+fn connect_bounded(url: &str, connector: &MakeTlsConnector) -> Result<Client> {
+    let config = bounded_config(url)?;
+    let connector = connector.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut client = match config.connect(connector) {
+            Ok(client) => client,
+            Err(error) => {
+                let _ = sender.send(Err(error));
+                return;
+            }
+        };
+        let installed = crate::postgres_migration::install_schema(&mut client);
+        let _ = sender.send(installed.map(|()| client));
+    });
+    match receiver.recv_timeout(DIAL_DEADLINE) {
+        Ok(result) => Ok(result?),
+        Err(_) => Err(Error::Bad(format!(
+            "connecting to PostgreSQL timed out after {DIAL_DEADLINE:?}"
+        ))),
+    }
+}
 
 /// SQLSTATEs that mean "this connection is gone", not "your statement is wrong". 08xxx is the
 /// connection-exception class, 57P0x is administrative shutdown/crash recovery, and 53300 is
@@ -84,44 +153,76 @@ fn is_disconnect(error: &postgres::Error) -> bool {
     false
 }
 
-/// Run `op` against a live connection in `slot`, replacing the connection exactly once if the
-/// server dropped it. On a failed reconnect the slot stays empty, so the next call tries again
-/// instead of pinning a dead handle forever.
+/// The state behind the shared-client mutex. `reconnecting` is set (and the lock released)
+/// while a replacement connection is being dialed, so concurrent callers fail fast instead of
+/// queueing behind a connect that may never finish.
+struct SlotState<C> {
+    client: Option<C>,
+    reconnecting: bool,
+}
+
+/// Run `op` against a live connection, replacing the connection exactly once if the server
+/// dropped it. The slot mutex serializes statements (the single-writer model) but is **never**
+/// held across a dial: while `reconnecting` is set other callers get `reconnecting()` instead
+/// of blocking, which is what keeps a stalled reconnect from wedging `/healthz`. On a failed
+/// reconnect the slot stays empty, so the next call tries again instead of pinning a dead
+/// handle forever.
 ///
 /// `op` must be repeatable for the error classes `retryable` accepts: a single statement is
 /// rolled back by the dropped connection, and a transaction only retries failures raised
 /// before `COMMIT` was attempted (see `PostgresStore::transaction`).
 fn with_reconnect<C, T, E>(
-    slot: &mut Option<C>,
+    slot: &Mutex<SlotState<C>>,
     mut reconnect: impl FnMut() -> std::result::Result<C, E>,
     mut op: impl FnMut(&mut C) -> std::result::Result<T, E>,
     retryable: impl Fn(&E) -> bool,
     pause: Duration,
+    reconnecting: impl Fn() -> E,
 ) -> std::result::Result<T, E> {
-    let mut client = match slot.take() {
+    // A poisoned lock means an earlier panic, not a dead connection. Recover the guarded
+    // connection rather than turning every later store call into an error.
+    let mut state = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if state.reconnecting {
+        return Err(reconnecting());
+    }
+    let mut client = match state.client.take() {
         Some(client) => client,
-        None => reconnect()?,
+        None => {
+            // Release the lock before dialing so a stalled connect cannot block every other
+            // caller (and every health probe) behind this mutex.
+            state.reconnecting = true;
+            drop(state);
+            let dialed = reconnect();
+            state = slot.lock().unwrap_or_else(PoisonError::into_inner);
+            state.reconnecting = false;
+            dialed?
+        }
     };
     match op(&mut client) {
         Ok(value) => {
-            *slot = Some(client);
+            state.client = Some(client);
             Ok(value)
         }
         Err(error) if retryable(&error) => {
             // Drop the known-dead handle before pausing so nothing can reuse it.
             drop(client);
+            state.reconnecting = true;
+            drop(state);
             std::thread::sleep(pause);
-            let mut fresh = reconnect()?;
+            let dialed = reconnect();
+            state = slot.lock().unwrap_or_else(PoisonError::into_inner);
+            state.reconnecting = false;
+            let mut fresh = dialed?;
             let result = op(&mut fresh);
             // Keep a healthy replacement; discard one that died during the retry so the next
             // call re-dials instead of retrying on a known-dead handle.
             if !matches!(&result, Err(error) if retryable(error)) {
-                *slot = Some(fresh);
+                state.client = Some(fresh);
             }
             result
         }
         Err(error) => {
-            *slot = Some(client);
+            state.client = Some(client);
             Err(error)
         }
     }
@@ -136,7 +237,7 @@ fn is_disconnect_error(error: &Error) -> bool {
 struct SharedClient {
     url: String,
     connector: MakeTlsConnector,
-    client: Mutex<Option<Client>>,
+    state: Mutex<SlotState<Client>>,
 }
 
 impl SharedClient {
@@ -149,17 +250,17 @@ impl SharedClient {
         op: impl FnMut(&mut Client) -> Result<T>,
         retryable: impl Fn(&Error) -> bool,
     ) -> Result<T> {
-        // A poisoned lock means an earlier panic, not a dead connection. Recover the guarded
-        // connection rather than turning every later store call into an error.
-        let mut slot = self.client.lock().unwrap_or_else(PoisonError::into_inner);
-        let url = &self.url;
-        let connector = &self.connector;
         with_reconnect(
-            &mut slot,
-            || Ok(Client::connect(url, connector.clone())?),
+            &self.state,
+            || connect_bounded(&self.url, &self.connector),
             op,
             retryable,
             RECONNECT_PAUSE,
+            || {
+                Error::Bad(
+                    "PostgreSQL connection is being re-established; retry the request".into(),
+                )
+            },
         )
     }
 }
@@ -660,14 +761,18 @@ fn append_duration(
 mod tests {
     //! The reconnect decision logic is exercised without a database: `with_reconnect` is
     //! generic over the client and error types, so a fake client is enough to pin down
-    //! "retry exactly once on a dropped connection, never on anything else".
+    //! "retry exactly once on a dropped connection, never on anything else" — and that a slow
+    //! or stalled reconnect never blocks another caller on the slot mutex.
 
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
 
     #[derive(Debug, PartialEq, Eq)]
     enum FakeError {
         Dropped,
         Fatal,
+        Reconnecting,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -675,6 +780,21 @@ mod tests {
 
     fn dropped(error: &FakeError) -> bool {
         *error == FakeError::Dropped
+    }
+
+    fn busy() -> FakeError {
+        FakeError::Reconnecting
+    }
+
+    fn slot(client: Option<FakeClient>) -> Mutex<SlotState<FakeClient>> {
+        Mutex::new(SlotState {
+            client,
+            reconnecting: false,
+        })
+    }
+
+    fn stored(slot: &Mutex<SlotState<FakeClient>>) -> Option<u8> {
+        slot.lock().unwrap().client.as_ref().map(|client| client.0)
     }
 
     #[test]
@@ -722,11 +842,11 @@ mod tests {
 
     #[test]
     fn dropped_connection_is_replaced_and_retried_exactly_once() {
-        let mut slot = Some(FakeClient(1));
+        let slot = slot(Some(FakeClient(1)));
         let mut connects = 0;
         let mut attempts = Vec::new();
         let value = with_reconnect(
-            &mut slot,
+            &slot,
             || {
                 connects += 1;
                 Ok(FakeClient(2))
@@ -741,19 +861,20 @@ mod tests {
             },
             dropped,
             Duration::ZERO,
+            busy,
         );
         assert_eq!(value, Ok(2));
         assert_eq!(attempts, [1, 2], "the operation runs once per connection");
         assert_eq!(connects, 1);
-        assert_eq!(slot.as_ref().map(|client| client.0), Some(2));
+        assert_eq!(stored(&slot), Some(2));
     }
 
     #[test]
     fn statement_errors_are_not_retried() {
-        let mut slot = Some(FakeClient(1));
+        let slot = slot(Some(FakeClient(1)));
         let mut connects = 0;
         let error = with_reconnect(
-            &mut slot,
+            &slot,
             || {
                 connects += 1;
                 Ok(FakeClient(2))
@@ -761,19 +882,20 @@ mod tests {
             |_| Err::<(), FakeError>(FakeError::Fatal),
             dropped,
             Duration::ZERO,
+            busy,
         )
         .unwrap_err();
         assert_eq!(error, FakeError::Fatal);
         assert_eq!(connects, 0);
-        assert_eq!(slot.as_ref().map(|client| client.0), Some(1));
+        assert_eq!(stored(&slot), Some(1));
     }
 
     #[test]
     fn failed_reconnect_surfaces_the_new_error_and_stays_retryable() {
-        let mut slot = Some(FakeClient(1));
+        let slot = slot(Some(FakeClient(1)));
         let mut connects = 0;
         let error = with_reconnect(
-            &mut slot,
+            &slot,
             || {
                 connects += 1;
                 Err(FakeError::Fatal)
@@ -781,6 +903,7 @@ mod tests {
             |_| Err::<(), FakeError>(FakeError::Dropped),
             dropped,
             Duration::ZERO,
+            busy,
         )
         .unwrap_err();
         assert_eq!(
@@ -790,58 +913,61 @@ mod tests {
         );
         assert_eq!(connects, 1);
         assert!(
-            slot.is_none(),
+            stored(&slot).is_none(),
             "a failed reconnect must not pin a dead client"
         );
 
         // The next operation dials again instead of staying dead forever.
         let value = with_reconnect(
-            &mut slot,
+            &slot,
             || Ok(FakeClient(3)),
             |client| Ok(client.0),
             dropped,
             Duration::ZERO,
+            busy,
         );
         assert_eq!(value, Ok(3));
     }
 
     #[test]
     fn an_empty_slot_connects_before_the_first_operation() {
-        let mut slot = None;
+        let slot = slot(None);
         let value = with_reconnect(
-            &mut slot,
+            &slot,
             || Ok(FakeClient(7)),
             |client| Ok(client.0),
             dropped,
             Duration::ZERO,
+            busy,
         );
         assert_eq!(value, Ok(7));
     }
 
     #[test]
     fn a_retry_that_drops_again_leaves_the_slot_empty_for_the_next_call() {
-        let mut slot = Some(FakeClient(1));
+        let slot = slot(Some(FakeClient(1)));
         let error = with_reconnect(
-            &mut slot,
+            &slot,
             || Ok(FakeClient(2)),
             |_| Err::<(), FakeError>(FakeError::Dropped),
             dropped,
             Duration::ZERO,
+            busy,
         )
         .unwrap_err();
         assert_eq!(error, FakeError::Dropped);
         assert!(
-            slot.is_none(),
+            stored(&slot).is_none(),
             "a replacement that also died must not be cached"
         );
     }
 
     #[test]
     fn a_retry_that_fails_for_another_reason_keeps_the_replacement() {
-        let mut slot = Some(FakeClient(1));
+        let slot = slot(Some(FakeClient(1)));
         let mut attempts = 0;
         let error = with_reconnect(
-            &mut slot,
+            &slot,
             || Ok(FakeClient(2)),
             |client| {
                 attempts += 1;
@@ -853,12 +979,13 @@ mod tests {
             },
             dropped,
             Duration::ZERO,
+            busy,
         )
         .unwrap_err();
         assert_eq!(error, FakeError::Fatal);
         assert_eq!(attempts, 2);
         assert_eq!(
-            slot.as_ref().map(|client| client.0),
+            stored(&slot),
             Some(2),
             "the healthy replacement stays cached for the next call"
         );
@@ -868,12 +995,12 @@ mod tests {
     fn a_disconnect_after_commit_is_not_replayed() {
         // Mirrors `PostgresStore::transaction`: `commit_attempted` is set before COMMIT, and the
         // retry predicate refuses the ambiguous error so committed work cannot be duplicated.
-        let mut slot = Some(FakeClient(1));
+        let slot = slot(Some(FakeClient(1)));
         let commit_attempted = std::cell::Cell::new(false);
         let mut attempts = 0;
         let mut connects = 0;
         let error = with_reconnect(
-            &mut slot,
+            &slot,
             || {
                 connects += 1;
                 Ok(FakeClient(2))
@@ -885,10 +1012,116 @@ mod tests {
             },
             |error| !commit_attempted.get() && dropped(error),
             Duration::ZERO,
+            busy,
         )
         .unwrap_err();
         assert_eq!(error, FakeError::Dropped);
         assert_eq!(attempts, 1, "an ambiguous COMMIT must not be replayed");
         assert_eq!(connects, 0);
+    }
+
+    #[test]
+    fn a_slow_reconnect_does_not_block_concurrent_callers() {
+        let slot = slot(Some(FakeClient(1)));
+        let dials = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let reconnecting = scope.spawn(|| {
+                with_reconnect(
+                    &slot,
+                    || {
+                        dials.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(400));
+                        Ok(FakeClient(2))
+                    },
+                    |client| {
+                        if client.0 == 1 {
+                            Err(FakeError::Dropped)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    dropped,
+                    Duration::from_millis(1),
+                    busy,
+                )
+            });
+
+            // Wait until the first caller has released the lock to dial, then assert a second
+            // caller gets a bounded error immediately instead of waiting for the dial.
+            let wait = Instant::now();
+            while !slot.lock().unwrap().reconnecting {
+                assert!(
+                    wait.elapsed() < Duration::from_secs(5),
+                    "the reconnecting flag was never set"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let caller_started = Instant::now();
+            let got = with_reconnect(
+                &slot,
+                || -> std::result::Result<FakeClient, FakeError> {
+                    panic!("a concurrent caller must not dial while a reconnect is in progress")
+                },
+                |_| Ok(()),
+                dropped,
+                Duration::ZERO,
+                busy,
+            );
+            assert_eq!(
+                got,
+                Err(FakeError::Reconnecting),
+                "the concurrent caller gets a bounded error, not a hang"
+            );
+            assert!(
+                caller_started.elapsed() < Duration::from_millis(200),
+                "the concurrent caller must not wait on the in-flight dial"
+            );
+            assert_eq!(dials.load(Ordering::SeqCst), 1);
+            assert_eq!(reconnecting.join().unwrap(), Ok(()));
+        });
+        assert_eq!(stored(&slot), Some(2));
+    }
+
+    #[test]
+    fn a_failed_reconnect_does_not_block_concurrent_callers() {
+        let slot = slot(Some(FakeClient(1)));
+        std::thread::scope(|scope| {
+            let reconnecting = scope.spawn(|| {
+                with_reconnect(
+                    &slot,
+                    || {
+                        std::thread::sleep(Duration::from_millis(300));
+                        Err::<FakeClient, _>(FakeError::Fatal)
+                    },
+                    |_| Err::<(), FakeError>(FakeError::Dropped),
+                    dropped,
+                    Duration::ZERO,
+                    busy,
+                )
+            });
+            let wait = Instant::now();
+            while !slot.lock().unwrap().reconnecting {
+                assert!(wait.elapsed() < Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let started = Instant::now();
+            let got = with_reconnect(
+                &slot,
+                || -> std::result::Result<FakeClient, FakeError> {
+                    panic!("a concurrent caller must not dial while a reconnect is in progress")
+                },
+                |_| Ok(()),
+                dropped,
+                Duration::ZERO,
+                busy,
+            );
+            assert_eq!(got, Err(FakeError::Reconnecting));
+            assert!(started.elapsed() < Duration::from_millis(200));
+            assert_eq!(reconnecting.join().unwrap(), Err(FakeError::Fatal));
+        });
+        assert!(
+            stored(&slot).is_none(),
+            "a failed reconnect must leave the slot empty for the next caller"
+        );
     }
 }
