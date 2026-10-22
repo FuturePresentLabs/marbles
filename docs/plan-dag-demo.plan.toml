@@ -1,0 +1,67 @@
+name = "checkout-v2"
+project = "marbles"
+
+[[nodes]]
+key = "schema"
+title = "Add plan schema and metadata keys"
+repo = "marbles"
+conflict_group = "db"
+risk = "high"
+estimate = 30
+done_means = "cargo test -p marbles plan_schema"
+acceptance = "create/show/gantt/ready pass on an empty store"
+
+[[nodes]]
+key = "scaffold"
+title = "Scaffold the checkout client"
+project = "checkout"
+repo = "checkout"
+conflict_group = "api"
+risk = "low"
+estimate = 20
+done_means = "cargo test -p checkout scaffold"
+acceptance = "client builds with the generated types"
+
+[[nodes]]
+key = "api"
+title = "Expose plan endpoints"
+repo = "marbles"
+conflict_group = "api"
+risk = "medium"
+estimate = 45
+done_means = "cargo test --test server plans"
+acceptance = "/v1/plans.* round-trips the same DAG"
+deps = ["schema"]
+
+[[nodes]]
+key = "wiring"
+title = "Wire the client to plan ready"
+project = "checkout"
+repo = "checkout"
+conflict_group = "db"
+risk = "medium"
+estimate = 40
+done_means = "cargo test -p checkout wiring"
+acceptance = "client consumes the frontier without same-group races"
+deps = ["scaffold"]
+
+[[nodes]]
+key = "docs"
+title = "Document plans as DAGs"
+repo = "marbles"
+conflict_group = "docs"
+risk = "low"
+estimate = 15
+done_means = "grep -q 'Plans are DAGs' README.md"
+acceptance = "README section renders and commands match the CLI"
+deps = ["api"]
+
+[[nodes]]
+key = "migration"
+title = "Backfill metadata on existing issues"
+repo = "marbles"
+conflict_group = "db"
+risk = "high"
+estimate = 25
+done_means = "cargo test -p marbles backfill"
+acceptance = "legacy issues gain plan metadata without loss"

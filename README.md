@@ -231,7 +231,8 @@ are also served as `/v1/plans.*`, so local mode and the hosted API return identi
 
 A full local-mode run — draft, create, show, gantt with critical path, and the conflict-group
 frontier before/after a claim — is captured in [`docs/plan-dag-demo.md`](docs/plan-dag-demo.md)
-with the reproducer at [`docs/plan-dag-demo.sh`](docs/plan-dag-demo.sh).
+with the reproducer at [`docs/plan-dag-demo.sh`](docs/plan-dag-demo.sh) and the raw verbatim
+run in [`docs/plan-dag-demo.transcript.txt`](docs/plan-dag-demo.transcript.txt).
 
 ## Identity
 

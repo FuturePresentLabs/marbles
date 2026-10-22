@@ -4,7 +4,8 @@ Executed against a scratch store (`MARBLES_HOME=/tmp/plan-dag-demo-final/home`, 
 hosted instance was 503 during this work). Plan: **6 nodes, 2 projects (repos), 3 conflict
 groups**. Issue ids carry a random suffix, so they differ per run; the shape does not.
 
-Reproduce from the repo root:
+Raw artifacts: [`plan-dag-demo.transcript.txt`](plan-dag-demo.transcript.txt) (verbatim run) and
+[`plan-dag-demo.plan.toml`](plan-dag-demo.plan.toml) (exact spec). Reproduce from the repo root:
 
 ```bash
 cargo build
