@@ -44,6 +44,15 @@ struct Cli {
     /// Machine-readable output.
     #[arg(long, global = true)]
     json: bool,
+    /// Per-request HTTP deadline in milliseconds (connect is capped at 3s).
+    #[arg(
+        long,
+        env = "MARBLES_TIMEOUT_MS",
+        global = true,
+        default_value_t = marbles::client::DEFAULT_TIMEOUT_MS,
+        value_name = "MS"
+    )]
+    timeout_ms: u64,
     /// Override the acting identity in local mode.
     #[arg(long, global = true)]
     actor: Option<String>,
@@ -476,7 +485,16 @@ async fn main() -> ExitCode {
                 "remote Marbles has no credential; run `mb --url <url> login --client-secret <secret>`",
             );
         }
-        Mode::Http(Client::new(url, &token))
+        Mode::Http(Client::with_options(
+            url,
+            &token,
+            marbles::client::Options {
+                timeout: Some(std::time::Duration::from_millis(cli.timeout_ms)),
+                // Remote reads keep a local copy so an outage degrades to the last known graph.
+                // Local mode never reaches this branch and never writes a cache.
+                cache: Some(marbles::cache::Cache::at(marbles::cache::default_root())),
+            },
+        ))
     } else {
         let db = match Db::open(config::db_path()) {
             Ok(db) => Arc::new(db),

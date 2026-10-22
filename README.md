@@ -222,6 +222,23 @@ receiver secrets during a deployment, changing the mounted sender secret, then
 removing the old receiver secret. Polling remains the consumer's reconciliation
 path; webhook delivery is a latency optimization, not a second source of truth.
 
+### When the server is down
+
+A hung or unreachable tracker must not hang the fleet, and it must never look like a successful
+write. Every CLI request is bounded — `--timeout-ms` (or `MARBLES_TIMEOUT_MS`, default 8000) caps
+both the whole request and the connect attempt — and the client splits failures in two:
+
+- **Reads** (`list`, `ready`, `show`, `history`, `stats`, `projects`) replay the newest response
+  that server already returned, loudly: `marbles: offline (cached <time>, <age> old, from <url>)`.
+  The exit code stays 0 because the data is real, just old; the banner is the staleness contract.
+- **Writes** are never cached and never queued. An unavailable server exits non-zero with
+  `offline: <op> not applied (no server)` — an outage cannot produce a phantom claim.
+
+Cached bodies live in `$MARBLES_HOME/cache` (default `~/.marbles/cache`), one 0600 file per
+`(server, op, request body)` keyed by SHA-256 so neither endpoints nor tokens appear in names, and
+pruned to the newest 128 entries / 8 MiB. Local mode never writes this cache. This is a cache, not
+replication: one server still owns the truth, clients only remember what it last told them.
+
 ## CLI cheat sheet
 
 ```bash
