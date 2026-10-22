@@ -19,6 +19,7 @@ pub mod db;
 pub mod import;
 pub mod jsonl;
 pub mod oidc;
+pub mod plan;
 pub mod postgres_migration;
 pub mod postgres_store;
 pub mod setup;

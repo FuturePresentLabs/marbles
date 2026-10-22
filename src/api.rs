@@ -55,6 +55,10 @@ impl Api {
             .route("/v1/issues.get", post(issues_get))
             .route("/v1/issues.list", post(issues_list))
             .route("/v1/issues.ready", post(issues_ready))
+            .route("/v1/plans.show", post(plans_show))
+            .route("/v1/plans.gantt", post(plans_gantt))
+            .route("/v1/plans.ready", post(plans_ready))
+            .route("/v1/plans.create", post(plans_create))
             .route("/v1/issues.update", post(issues_update))
             .route("/v1/issues.close", post(issues_close))
             .route("/v1/issues.supersede", post(issues_supersede))
@@ -204,6 +208,77 @@ storage_handler!(
 storage_handler!(claims_sweep, claims_sweep_blocking, Empty, SweepReport);
 storage_handler!(history_get, history_get_blocking, IdBody, Vec<HistoryEvent>);
 storage_handler!(stats, stats_blocking, Empty, serde_json::Value);
+storage_handler!(
+    plans_show,
+    plans_show_blocking,
+    PlanNameBody,
+    crate::plan::PlanView
+);
+storage_handler!(
+    plans_gantt,
+    plans_gantt_blocking,
+    PlanNameBody,
+    crate::plan::Gantt
+);
+storage_handler!(
+    plans_ready,
+    plans_ready_blocking,
+    PlanNameBody,
+    crate::plan::ReadyView
+);
+storage_handler!(
+    plans_create,
+    plans_create_blocking,
+    crate::plan::ResolvedPlan,
+    crate::plan::CreateReport
+);
+
+/// Plans are views over ordinary issues, so every endpoint resolves the caller's company store
+/// exactly like the issue endpoints do. Local and hosted Marbles therefore compute the same DAG.
+#[derive(Deserialize)]
+struct PlanNameBody {
+    plan: String,
+}
+
+fn plans_show_blocking(
+    State(api): State<Arc<Api>>,
+    Extension(principal): Extension<Principal>,
+    Json(body): Json<PlanNameBody>,
+) -> Res<crate::plan::PlanView> {
+    let store = api.db_for(&principal)?;
+    Ok(Json(crate::plan::load(&*store, &body.plan)?.view()?))
+}
+
+fn plans_gantt_blocking(
+    State(api): State<Arc<Api>>,
+    Extension(principal): Extension<Principal>,
+    Json(body): Json<PlanNameBody>,
+) -> Res<crate::plan::Gantt> {
+    let store = api.db_for(&principal)?;
+    let graph = crate::plan::load(&*store, &body.plan)?;
+    Ok(Json(crate::plan::gantt(&graph, crate::db::now())?))
+}
+
+fn plans_ready_blocking(
+    State(api): State<Arc<Api>>,
+    Extension(principal): Extension<Principal>,
+    Json(body): Json<PlanNameBody>,
+) -> Res<crate::plan::ReadyView> {
+    let store = api.db_for(&principal)?;
+    let graph = crate::plan::load(&*store, &body.plan)?;
+    Ok(Json(crate::plan::ready(&graph, crate::db::now())?))
+}
+
+fn plans_create_blocking(
+    State(api): State<Arc<Api>>,
+    Extension(principal): Extension<Principal>,
+    Json(body): Json<crate::plan::ResolvedPlan>,
+) -> Res<crate::plan::CreateReport> {
+    let store = api.db_for(&principal)?;
+    let report = crate::plan::create(&*store, &body, crate::db::now(), &principal.name)
+        .map_err(DbError::Bad)?;
+    Ok(Json(report))
+}
 
 fn metrics_blocking(
     State(api): State<Arc<Api>>,
