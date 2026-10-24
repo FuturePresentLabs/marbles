@@ -10,33 +10,48 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=bob /usr/local/bin/sccache /usr/local/bin/sccache
 WORKDIR /src
-ARG SCCACHE_BUCKET=fpl-sccache-cache
-ARG SCCACHE_ENDPOINT=https://919a14daf9d20924903a85f2da1df951.r2.cloudflarestorage.com
+# Remote caching is opt-in. The defaults deliberately point at no cache so a plain
+# `docker build .` needs no AWS-shaped secrets and never talks to R2. Supply all of
+# SCCACHE_BUCKET, SCCACHE_ENDPOINT and the two cache-key secrets to use the
+# DigitalOcean/mycelium cache; see docs/build-cache.md.
+ARG SCCACHE_BUCKET=
+ARG SCCACHE_ENDPOINT=
 ARG SCCACHE_REGION=auto
 ARG SCCACHE_S3_KEY_PREFIX=rust/
 ENV CARGO_BUILD_JOBS=1 \
     CARGO_INCREMENTAL=0 \
-    CARGO_PROFILE_RELEASE_DEBUG=0 \
-    RUSTC_WRAPPER=/usr/local/bin/sccache \
-    SCCACHE_BUCKET=${SCCACHE_BUCKET} \
-    SCCACHE_ENDPOINT=${SCCACHE_ENDPOINT} \
-    SCCACHE_REGION=${SCCACHE_REGION} \
-    SCCACHE_S3_KEY_PREFIX=${SCCACHE_S3_KEY_PREFIX} \
-    SCCACHE_S3_USE_SSL=true \
-    SCCACHE_BASEDIRS=/src
+    CARGO_PROFILE_RELEASE_DEBUG=0
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY tests ./tests
 # Integration tests reference both production binaries through CARGO_BIN_EXE_*,
 # so this single Cargo invocation tests and emits the exact release artifacts
 # copied into the runtime image. Do not add a second `cargo build` graph here.
-RUN --mount=type=secret,id=AWS_ACCESS_KEY_ID \
-    --mount=type=secret,id=AWS_SECRET_ACCESS_KEY \
-    export AWS_ACCESS_KEY_ID="$(cat /run/secrets/AWS_ACCESS_KEY_ID)" \
-           AWS_SECRET_ACCESS_KEY="$(cat /run/secrets/AWS_SECRET_ACCESS_KEY)" \
- && sccache --zero-stats \
- && cargo test --locked --release --all-targets --all-features \
- && sccache --show-stats
+RUN --mount=type=secret,id=sccache_access_key_id,required=false \
+    --mount=type=secret,id=sccache_secret_access_key,required=false \
+    set -eu; \
+    cache_enabled=0; \
+    if [ -n "${SCCACHE_ENDPOINT}" ] && [ -n "${SCCACHE_BUCKET}" ] \
+       && [ -s /run/secrets/sccache_access_key_id ] \
+       && [ -s /run/secrets/sccache_secret_access_key ]; then \
+        export RUSTC_WRAPPER=/usr/local/bin/sccache \
+               SCCACHE_BUCKET="${SCCACHE_BUCKET}" \
+               SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT}" \
+               SCCACHE_REGION="${SCCACHE_REGION}" \
+               SCCACHE_S3_KEY_PREFIX="${SCCACHE_S3_KEY_PREFIX}" \
+               SCCACHE_S3_USE_SSL=true \
+               SCCACHE_BASEDIRS=/src \
+               AWS_ACCESS_KEY_ID="$(cat /run/secrets/sccache_access_key_id)" \
+               AWS_SECRET_ACCESS_KEY="$(cat /run/secrets/sccache_secret_access_key)"; \
+        sccache --zero-stats; \
+        cache_enabled=1; \
+    else \
+        echo "sccache: no remote cache configured (SCCACHE_ENDPOINT, SCCACHE_BUCKET and cache-key secrets); building without it"; \
+        unset RUSTC_WRAPPER; \
+        export SCCACHE_DISABLE=1; \
+    fi; \
+    cargo test --locked --release --all-targets --all-features; \
+    if [ "${cache_enabled}" = 1 ]; then sccache --show-stats; fi
 
 FROM debian:12-slim
 RUN apt-get update \

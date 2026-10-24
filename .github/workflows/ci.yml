@@ -3,9 +3,21 @@ on:
   pull_request:
   push:
     branches: [main]
+
+env:
+  # Pull-side registry host. `registry.fpl.dev` is the Cloudflare-proxied name and answers
+  # `401 Basic realm="Restricted"` to anything outside the mesh, so builds pull from the
+  # mTLS host that the FPL_REGISTRY_* certs are issued for.
+  FPL_REGISTRY_DIRECT_HOST: ${{ vars.FPL_REGISTRY_DIRECT_HOST || 'registry-direct.fpl.dev' }}
+
 jobs:
   rust:
     runs-on: ubuntu-latest
+    env:
+      # Fork PRs never receive secrets, so the image build is credential-gated and says so
+      # instead of failing on an unrelated 401. Same-repo PRs and main get the real build.
+      # No cache credentials are required: sccache is optional in the Dockerfile.
+      HAS_REGISTRY_CREDS: ${{ secrets.FPL_REGISTRY_CA_CERT != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
@@ -14,4 +26,51 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features
       - run: cargo test --all-targets --all-features
-      - run: docker build -t marbles:test .
+      - name: Install FPL registry client certs
+        if: env.HAS_REGISTRY_CREDS == 'true'
+        env:
+          FPL_REGISTRY_CA_CERT: ${{ secrets.FPL_REGISTRY_CA_CERT }}
+          FPL_REGISTRY_CLIENT_CERT: ${{ secrets.FPL_REGISTRY_CLIENT_CERT }}
+          FPL_REGISTRY_CLIENT_KEY: ${{ secrets.FPL_REGISTRY_CLIENT_KEY }}
+        run: .github/scripts/install-fpl-registry-certs.sh
+      - name: Resolve the Bob image onto the mTLS registry host
+        if: env.HAS_REGISTRY_CREDS == 'true'
+        run: |
+          # Keep the digest as the single source of truth in the Dockerfile and rewrite only
+          # the host: cert trust under /etc/docker/certs.d is per host, so the client cert is
+          # never presented for the proxied name.
+          bob="$(sed -n 's/^ARG BOB_IMAGE=//p' Dockerfile)"
+          test -n "${bob}" || { echo "::error::Dockerfile has no BOB_IMAGE ARG"; exit 1; }
+          echo "BOB_IMAGE=${bob/registry.fpl.dev/${FPL_REGISTRY_DIRECT_HOST}}" >>"${GITHUB_ENV}"
+      - name: docker build
+        if: env.HAS_REGISTRY_CREDS == 'true'
+        env:
+          # Optional remote-cache opt-in. All four must be configured; otherwise the
+          # Dockerfile builds with sccache disabled and no credentials are passed.
+          SCCACHE_ENDPOINT: ${{ vars.SCCACHE_ENDPOINT }}
+          SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET }}
+          SCCACHE_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
+          SCCACHE_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+        run: |
+          cache_args=()
+          if [ -n "${SCCACHE_ENDPOINT}" ] && [ -n "${SCCACHE_BUCKET}" ] \
+             && [ -n "${SCCACHE_ACCESS_KEY_ID}" ] && [ -n "${SCCACHE_SECRET_ACCESS_KEY}" ]; then
+            (umask 077
+             printf '%s' "${SCCACHE_ACCESS_KEY_ID}" >"${RUNNER_TEMP}/sccache-key-id"
+             printf '%s' "${SCCACHE_SECRET_ACCESS_KEY}" >"${RUNNER_TEMP}/sccache-secret")
+            cache_args=(
+              --build-arg "SCCACHE_BUCKET=${SCCACHE_BUCKET}"
+              --build-arg "SCCACHE_ENDPOINT=${SCCACHE_ENDPOINT}"
+              --secret "id=sccache_access_key_id,src=${RUNNER_TEMP}/sccache-key-id"
+              --secret "id=sccache_secret_access_key,src=${RUNNER_TEMP}/sccache-secret"
+            )
+          else
+            echo "::notice title=sccache disabled::no SCCACHE_ENDPOINT/SCCACHE_BUCKET and cache key pair configured; building without a remote cache"
+          fi
+          docker build --build-arg "BOB_IMAGE=${BOB_IMAGE}" "${cache_args[@]}" -t marbles:test .
+      - name: docker build skipped
+        if: env.HAS_REGISTRY_CREDS != 'true'
+        run: |
+          # The Bob image is private, so a fork PR cannot perform the image build. No cache
+          # credential is involved in this decision.
+          echo "::notice title=docker build skipped::FPL registry credentials are not available to this run (fork PR or unconfigured repo secrets); rust fmt/clippy/test still ran"

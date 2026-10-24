@@ -1056,6 +1056,15 @@ mod tests {
                 );
                 std::thread::sleep(Duration::from_millis(5));
             }
+            // `with_reconnect` sets the flag, releases the lock, then sleeps the retry pause
+            // before it dials. Wait for the dial itself, or `dials == 1` below races that pause.
+            while dials.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    wait.elapsed() < Duration::from_secs(5),
+                    "the reconnect never started dialing"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
             let caller_started = Instant::now();
             let got = with_reconnect(
                 &slot,

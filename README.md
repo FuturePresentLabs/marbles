@@ -102,6 +102,9 @@ Tagged releases publish checksum-addressed archives for Linux and macOS on both 
 ARM64. On an FPL workstation, `fpl install marbles` selects and verifies the correct archive,
 then exposes both `marbles` and `mb` in `~/.local/bin`.
 
+Container builds work without a remote cache or AWS credentials. If you want the
+optional DigitalOcean/mycelium sccache, see [`docs/build-cache.md`](docs/build-cache.md).
+
 ### Local, single operator
 
 ```bash
