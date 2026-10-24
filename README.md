@@ -164,6 +164,76 @@ projected days-to-zero when there are closes in the window.
 See [`docs/organizing-work.md`](docs/organizing-work.md) for the data model and
 worked examples.
 
+## Plans are DAGs
+
+A plan is not a second database. It is a **view over issues**: nodes are marbles carrying a
+small metadata block, edges are ordinary `dep` rows. One claim race, one company scope, and an
+executor consumes exactly the same `ready` semantics it already understands. Because membership
+is `metadata.plan`, a plan can span projects (repos) inside one store.
+
+Node metadata is flat and machine-readable, so it is queryable with JSON extraction on every
+backend (`metadata_json` in SQLite, `metadata` in PostgreSQL):
+
+| key | meaning |
+| --- | --- |
+| `plan` / `plan_key` | plan membership and the spec's stable node key |
+| `done_means` | the **command** that proves the node done |
+| `repo` | which checkout this node edits |
+| `conflict_group` | nodes sharing a group must never run concurrently |
+| `acceptance` | the test a reviewer runs to accept the outcome |
+| `risk`, `estimate` | `low\|medium\|high\|critical` and minutes (feeds the Gantt) |
+
+```bash
+mb plan create plan.toml --dry-run     # review the draft; nothing written
+mb plan create plan.toml               # write nodes + dependency edges
+mb plan show checkout-v2               # DAG in topological order, with metadata and edges
+mb plan gantt checkout-v2              # estimates, critical path, current/peak concurrency
+mb plan ready checkout-v2              # the parallel frontier the executor consumes
+```
+
+`plan ready` is deliberately stricter than plain `ready`: a node is offered only when every
+dependency is `closed`, no live claim holds it, and **no node in its conflict group is already
+running** (or earlier in the same frontier). At most one node per group is offered, so a naive
+dispatcher that claims the whole list cannot race two same-group edits. A group is freed when its
+running node leaves `in_progress` — `review` does not block it, because the code work is done.
+
+Specs are TOML (the repo's config language) or JSON; `deps` refer to node keys, never to issue ids
+(which do not exist until the plan is written):
+
+```toml
+name = "checkout-v2"
+project = "marbles"
+
+[[nodes]]
+key = "schema"
+title = "Add the plan schema"
+repo = "marbles"
+conflict_group = "db"
+risk = "high"
+estimate = 30
+done_means = "cargo test -p marbles plan_schema"
+acceptance = "migrations apply on an empty database"
+
+[[nodes]]
+key = "api"
+title = "Expose plan endpoints"
+repo = "marbles"
+conflict_group = "api"
+estimate = 45
+done_means = "cargo test --test server plans"
+deps = ["schema"]
+```
+
+A node may set `project = "checkout"` when the plan spans repos. `mb create` also accepts the
+metadata directly (`--plan`, `--done-means`, `--repo`, `--conflict-group`, `--risk`,
+`--acceptance`, `--estimate`) for hand-authored nodes. `plan show|gantt|ready` and `plan create`
+are also served as `/v1/plans.*`, so local mode and the hosted API return identical views.
+
+A full local-mode run — draft, create, show, gantt with critical path, and the conflict-group
+frontier before/after a claim — is captured in [`docs/plan-dag-demo.md`](docs/plan-dag-demo.md)
+with the reproducer at [`docs/plan-dag-demo.sh`](docs/plan-dag-demo.sh) and the raw verbatim
+run in [`docs/plan-dag-demo.transcript.txt`](docs/plan-dag-demo.transcript.txt).
+
 ## Identity
 
 `marbles serve` resolves every request to a `Principal` before it reaches the

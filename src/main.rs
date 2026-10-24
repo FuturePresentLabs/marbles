@@ -232,6 +232,12 @@ enum Command {
     },
     /// Check integrity, settings, row counts, and WAL size (local mode only).
     Doctor,
+    /// Plans are DAGs over issues: inspect the graph, schedule it, take the frontier, or
+    /// draft one from a spec before dispatching any worker.
+    Plan {
+        #[command(subcommand)]
+        action: PlanAction,
+    },
     /// Import a Beads export. JSONL (from `bd export`) or the `bd list --json` array shape.
     ///
     /// `--rewrite-prefix old:new` renames a whole store's ids — for the mistake where two
@@ -299,6 +305,27 @@ struct CreateArgs {
     /// Stable pointer to the external system this issue mirrors (gap findings, imports).
     #[arg(long)]
     external_ref: Option<String>,
+    /// Plan membership: makes this issue a node of the named plan DAG.
+    #[arg(long)]
+    plan: Option<String>,
+    /// The command that proves this node done (plan metadata `done_means`).
+    #[arg(long = "done-means")]
+    done_means: Option<String>,
+    /// Checkout this node edits (plan metadata `repo`).
+    #[arg(long)]
+    repo: Option<String>,
+    /// Nodes sharing a conflict group never run concurrently.
+    #[arg(long = "conflict-group")]
+    conflict_group: Option<String>,
+    /// low | medium | high | critical (plan metadata `risk`).
+    #[arg(long)]
+    risk: Option<String>,
+    /// The test that accepts the outcome (plan metadata `acceptance`).
+    #[arg(long)]
+    acceptance: Option<String>,
+    /// Minutes of expected work, feeding `plan gantt`.
+    #[arg(long)]
+    estimate: Option<i64>,
 }
 
 #[derive(clap::Args)]
@@ -402,6 +429,30 @@ enum TaskAction {
         epic: String,
         #[command(flatten)]
         args: WorkCreateArgs,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlanAction {
+    /// Print the plan DAG: nodes in topological order, metadata, and edges.
+    Show { plan: String },
+    /// Estimated start/finish per node, the critical path, and current vs peak concurrency.
+    Gantt { plan: String },
+    /// The parallel frontier the executor consumes: deps closed and conflict group free.
+    Ready { plan: String },
+    /// Draft a plan from a TOML/JSON spec; writes nodes+deps unless --dry-run.
+    Create {
+        /// Spec path, or `-` for stdin. TOML (`name`, `project`, `[[nodes]]`) or JSON.
+        spec: String,
+        /// Plan name override (defaults to the spec's `name`).
+        #[arg(long)]
+        plan: Option<String>,
+        /// Project override (defaults to the spec's `project`, then project discovery).
+        #[arg(long)]
+        project: Option<String>,
+        /// Print the reviewable draft without writing any issue.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -933,7 +984,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                 project: Some(project),
                 available_at: args.available_at,
                 created_by: Some(actor.clone()),
-                metadata: json_arg(args.metadata.as_deref())?,
+                metadata: Some(plan_node_metadata(args)?),
                 external_ref: args.external_ref.clone(),
             };
             let id: String = match mode {
@@ -1730,6 +1781,109 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             }
             Ok(())
         }
+        Command::Plan { action } => match action {
+            PlanAction::Show { plan } => {
+                let view: marbles::plan::PlanView = mode
+                    .call("plans.show", &serde_json::json!({"plan": plan}), |db| {
+                        marbles::plan::load(db, plan)
+                            .and_then(|graph| graph.view())
+                            .map_err(|e| e.to_string())
+                    })
+                    .await?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&view).map_err(|e| e.to_string())?
+                    );
+                } else {
+                    print!("{}", marbles::plan::render_plan(&view));
+                }
+                Ok(())
+            }
+            PlanAction::Gantt { plan } => {
+                let gantt: marbles::plan::Gantt = mode
+                    .call("plans.gantt", &serde_json::json!({"plan": plan}), |db| {
+                        let graph = marbles::plan::load(db, plan).map_err(|e| e.to_string())?;
+                        marbles::plan::gantt(&graph, now()).map_err(|e| e.to_string())
+                    })
+                    .await?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&gantt).map_err(|e| e.to_string())?
+                    );
+                } else {
+                    print!("{}", marbles::plan::render_gantt(&gantt));
+                }
+                Ok(())
+            }
+            PlanAction::Ready { plan } => {
+                let frontier: marbles::plan::ReadyView = mode
+                    .call("plans.ready", &serde_json::json!({"plan": plan}), |db| {
+                        let graph = marbles::plan::load(db, plan).map_err(|e| e.to_string())?;
+                        marbles::plan::ready(&graph, now()).map_err(|e| e.to_string())
+                    })
+                    .await?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&frontier).map_err(|e| e.to_string())?
+                    );
+                } else {
+                    print!("{}", marbles::plan::render_ready(&frontier));
+                }
+                Ok(())
+            }
+            PlanAction::Create {
+                spec,
+                plan,
+                project,
+                dry_run,
+            } => {
+                let text = read_spec_arg(spec)?;
+                let spec = marbles::plan::parse_spec(&text).map_err(|e| e.to_string())?;
+                let project = project
+                    .clone()
+                    .or(spec.project.clone())
+                    .or_else(|| project_for(cli).ok())
+                    .unwrap_or_default();
+                let plan_name = plan
+                    .clone()
+                    .or(spec.name.clone())
+                    .unwrap_or_else(|| "plan".to_string());
+                let resolved = marbles::plan::ResolvedPlan {
+                    plan: plan_name,
+                    project,
+                    nodes: spec.nodes,
+                };
+                if *dry_run {
+                    let report = marbles::plan::draft(&resolved).map_err(|p| p.join("; "))?;
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+                        );
+                    } else {
+                        print!("{}", marbles::plan::render_draft(&report));
+                    }
+                    return Ok(());
+                }
+                let report: marbles::plan::CreateReport = mode
+                    .call("plans.create", &resolved, |db| {
+                        marbles::plan::create(db, &resolved, now(), &actor)
+                    })
+                    .await?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+                    );
+                } else {
+                    print!("{}", marbles::plan::render_create(&report));
+                }
+                Ok(())
+            }
+        },
         Command::ImportBd {
             file,
             project,
@@ -1835,16 +1989,51 @@ fn reported_url(effective_url: Option<&str>) -> String {
         .unwrap_or_else(|| config::server_config().listen)
 }
 
-#[cfg(test)]
-mod cli_tests {
-    use super::reported_url;
+/// Merge `mb create`'s plan-metadata sugar into one JSON object. Explicit `--metadata` keys win
+/// only when the sugar is absent, so neither form silently shadows the other.
+fn plan_node_metadata(args: &CreateArgs) -> Result<serde_json::Value, String> {
+    let mut metadata = json_arg(args.metadata.as_deref())?.unwrap_or_else(|| serde_json::json!({}));
+    if !metadata.is_object() {
+        return Err("--metadata must be a JSON object".into());
+    }
+    let map = metadata
+        .as_object_mut()
+        .expect("checked metadata is an object");
+    let sugar = [
+        ("plan", args.plan.as_ref().map(|v| serde_json::json!(v))),
+        (
+            "done_means",
+            args.done_means.as_ref().map(|v| serde_json::json!(v)),
+        ),
+        ("repo", args.repo.as_ref().map(|v| serde_json::json!(v))),
+        (
+            "conflict_group",
+            args.conflict_group.as_ref().map(|v| serde_json::json!(v)),
+        ),
+        ("risk", args.risk.as_ref().map(|v| serde_json::json!(v))),
+        (
+            "acceptance",
+            args.acceptance.as_ref().map(|v| serde_json::json!(v)),
+        ),
+        ("estimate", args.estimate.map(|v| serde_json::json!(v))),
+    ];
+    for (key, value) in sugar {
+        if let Some(value) = value {
+            map.insert(key.to_string(), value);
+        }
+    }
+    Ok(metadata)
+}
 
-    #[test]
-    fn url_reports_the_selected_remote_instead_of_the_local_listen_default() {
-        assert_eq!(
-            reported_url(Some("https://marbles.fpl.dev")),
-            "https://marbles.fpl.dev"
-        );
+/// Plan specs come from a path, `-` (stdin), `@path`, or inline text — the same surfaces as
+/// other text arguments, plus the file-path case a spec usually is.
+fn read_spec_arg(value: &str) -> Result<String, String> {
+    if value == "-" || value.starts_with('@') {
+        return read_text_arg(Some(value));
+    }
+    match std::fs::read_to_string(value) {
+        Ok(text) => Ok(text),
+        Err(_) => Ok(value.to_string()),
     }
 }
 
@@ -1947,6 +2136,19 @@ fn print_issues(cli: &Cli, rows: &[Issue]) {
         println!(
             "{}{}{} — {} — {} blocker(s)",
             row.id, claim, row.status, row.title, row.dependency_count
+        );
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::reported_url;
+
+    #[test]
+    fn url_reports_the_selected_remote_instead_of_the_local_listen_default() {
+        assert_eq!(
+            reported_url(Some("https://marbles.fpl.dev")),
+            "https://marbles.fpl.dev"
         );
     }
 }
