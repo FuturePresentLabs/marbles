@@ -37,7 +37,7 @@ replicated, so there is nothing to merge.
 - **`review` is not `done`.** An agent that finished writing code has produced
   something to look at, not a delivery. Closing requires merge evidence or an
   explicit acknowledgement that no delivery is expected.
-- **The queue is queryable.** Ready work, blockers, claims, plans, and history
+- **The queue is queryable.** Ready work, blockers, claims, and history
   all live in one store, so a portfolio view is a query rather than a sync job.
 
 ## Install
@@ -123,74 +123,6 @@ portfolio queries are cheap.
 Dependencies are ordinary rows and may cross projects. A blocker in `infra`
 can gate work in `app` without either tracker owning the other.
 
-### Plans are DAGs
-
-A plan is not a second database. It is a **view over issues**: nodes are
-marbles carrying a small metadata block, edges are ordinary `dep` rows. One
-claim race, one company scope, and an executor consumes the same `ready`
-semantics it already understands.
-
-| metadata | meaning |
-| --- | --- |
-| `plan` / `plan_key` | plan membership and the spec's stable node key |
-| `done_means` | the **command** that proves the node done |
-| `repo` | which checkout this node edits |
-| `conflict_group` | nodes sharing a group never run concurrently |
-| `acceptance` | the test a reviewer runs to accept the outcome |
-| `risk`, `estimate` | `low\|medium\|high\|critical` and minutes (feeds the Gantt) |
-
-```bash
-mb plan create plan.toml --dry-run   # review the draft; nothing written
-mb plan create plan.toml             # write nodes + dependency edges
-mb plan show checkout-v2             # DAG in topological order
-mb plan gantt checkout-v2            # estimates, critical path, concurrency
-mb plan ready checkout-v2            # the parallel frontier an executor consumes
-```
-
-`plan ready` is deliberately stricter than plain `ready`: a node is offered
-only when every dependency is `closed`, no live claim holds it, and no node in
-its conflict group is already running (or earlier in the same frontier). At
-most one node per group is offered, so a dispatcher that claims the whole list
-cannot race two same-group edits. `review` frees the group — the code work is
-done.
-
-Specs are TOML or JSON; `deps` refer to node keys, never issue IDs (which do not
-exist until the plan is written):
-
-```toml
-name = "checkout-v2"
-project = "marbles"
-
-[[nodes]]
-key = "schema"
-title = "Add the plan schema"
-repo = "marbles"
-conflict_group = "db"
-risk = "high"
-estimate = 30
-done_means = "cargo test -p marbles plan_schema"
-acceptance = "migrations apply on an empty database"
-
-[[nodes]]
-key = "api"
-title = "Expose plan endpoints"
-repo = "marbles"
-conflict_group = "api"
-estimate = 45
-done_means = "cargo test --test server plans"
-deps = ["schema"]
-```
-
-`mb create` accepts the same metadata directly (`--plan`, `--done-means`,
-`--repo`, `--conflict-group`, `--risk`, `--acceptance`, `--estimate`) for
-hand-authored nodes. `plan show|gantt|ready` and `plan create` are also served
-as `/v1/plans.*`, so local mode and the hosted API return identical views.
-
-A full local run — draft, create, show, gantt with critical path, and the
-conflict-group frontier before/after a claim — is captured in
-[`docs/plan-dag-demo.md`](docs/plan-dag-demo.md), with the reproducer and raw
-transcript beside it.
-
 ## Identity
 
 `marbles serve` resolves every request to a `Principal` before it reaches the
@@ -259,9 +191,6 @@ mb close  <id> --ack "no delivery expected: …"
 mb dep add <child> <parent> ; mb dep rm <child> <parent>
 mb label add <id> bug ; mb label remove <id> bug
 
-# Plans
-mb plan create plan.toml [--dry-run]
-mb plan show|gantt|ready <plan>
 
 # Projects and operations
 mb init [--slug S] [--prefix P]
