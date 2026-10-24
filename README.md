@@ -317,6 +317,12 @@ Cached bodies live in `$MARBLES_HOME/cache` (default `~/.marbles/cache`), one 06
 pruned to the newest 128 entries / 8 MiB. Local mode never writes this cache. This is a cache, not
 replication: one server still owns the truth, clients only remember what it last told them.
 
+OIDC refresh is bounded by the same timeout. A revoked or expired refresh token prints
+`re-login required: … run marbles login` instead of hanging or surfacing a raw `invalid_grant`;
+if the IdP omits a rotated refresh token, the existing one is kept. See
+[`docs/distributed.md`](docs/distributed.md) for the distributed-client contract and why Marbles
+still has one writer.
+
 ## CLI cheat sheet
 
 ```bash
