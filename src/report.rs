@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Issue, STATUSES};
+use crate::types::{Folder, Issue, STATUSES};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Progress {
@@ -257,11 +257,261 @@ pub fn progress_bar(progress: &Progress, width: usize) -> String {
     )
 }
 
+/// The wire shape of `projects.list`, including its optional folder assignment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectInfo {
+    pub slug: String,
+    #[serde(default)]
+    pub root: String,
+    #[serde(default)]
+    pub prefix: String,
+    #[serde(default)]
+    pub folder: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectRollup {
+    pub slug: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+    pub prefix: String,
+    pub progress: Progress,
+    pub ready: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_ready_age_secs: Option<i64>,
+    pub stale: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_review_age_secs: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub burn_per_day: Option<f64>,
+    pub goals: Vec<GoalSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderRollup {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    pub projects: Vec<ProjectRollup>,
+    pub progress: Progress,
+    pub ready: i64,
+    pub stale: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub burn_per_day: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortfolioTotals {
+    pub projects: i64,
+    pub progress: Progress,
+    pub ready: i64,
+    pub stale: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub burn_per_day: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Portfolio {
+    pub generated_at: i64,
+    pub days: i64,
+    pub stale_days: i64,
+    pub folders: Vec<FolderRollup>,
+    pub unfiled: Vec<ProjectRollup>,
+    pub totals: PortfolioTotals,
+}
+
+fn is_ready(issue: &Issue, statuses: &BTreeMap<&str, &str>, now: i64) -> bool {
+    if issue.issue_type == "goal" || issue.status != "open" {
+        return false;
+    }
+    if issue.available_at.is_some_and(|available| available > now) {
+        return false;
+    }
+    if issue.assignee.is_some() && issue.expires_at.is_none_or(|expires| expires > now) {
+        return false;
+    }
+    issue.dependencies.iter().all(|dep| {
+        dep.depends_on_id
+            .as_deref()
+            .and_then(|id| statuses.get(id).copied())
+            .is_none_or(|status| status == "closed")
+    })
+}
+
+fn project_rollup(
+    project: &ProjectInfo,
+    issues: &[&Issue],
+    statuses: &BTreeMap<&str, &str>,
+    now: i64,
+    days: i64,
+    stale_days: i64,
+) -> ProjectRollup {
+    // Goals are containers, not executable work; they are shown separately below.
+    let work: Vec<&Issue> = issues
+        .iter()
+        .copied()
+        .filter(|issue| issue.issue_type != "goal")
+        .collect();
+    let ready: Vec<&Issue> = work
+        .iter()
+        .copied()
+        .filter(|issue| is_ready(issue, statuses, now))
+        .collect();
+    let oldest_ready_age_secs = ready
+        .iter()
+        .map(|issue| (now - issue.created_at).max(0))
+        .max();
+    let stale_cutoff = now.saturating_sub(stale_days.saturating_mul(86_400));
+    let stale = work
+        .iter()
+        .filter(|issue| matches!(issue.status.as_str(), "open" | "in_progress"))
+        .filter(|issue| issue.updated_at < stale_cutoff)
+        .count() as i64;
+    let oldest_review_age_secs = work
+        .iter()
+        .filter(|issue| issue.status == "review")
+        .map(|issue| (now - issue.updated_at).max(0))
+        .max();
+    let burn_per_day = burndown(
+        &work.iter().copied().cloned().collect::<Vec<_>>(),
+        days,
+        now,
+    )
+    .burn_per_day;
+    let mut goals = goal_summaries(
+        &issues.iter().copied().cloned().collect::<Vec<_>>(),
+        Some(&project.slug),
+    );
+    goals.retain(|goal| goal.status != "closed");
+    ProjectRollup {
+        slug: project.slug.clone(),
+        folder: project.folder.clone(),
+        prefix: project.prefix.clone(),
+        progress: Progress::from_issues(&work),
+        ready: ready.len() as i64,
+        oldest_ready_age_secs,
+        stale,
+        oldest_review_age_secs,
+        burn_per_day,
+        goals,
+    }
+}
+
+/// Build a folder/project/goal portfolio from one issue page. Ready work follows the same
+/// rules as `mb ready`: open, past grace, not under a live claim, and every existing
+/// dependency closed. Missing dependency rows are ignored, matching the SQL ready query.
+pub fn portfolio(
+    projects: &[ProjectInfo],
+    folders: &[Folder],
+    issues: &[Issue],
+    now: i64,
+    days: i64,
+    stale_days: i64,
+) -> Portfolio {
+    let statuses: BTreeMap<&str, &str> = issues
+        .iter()
+        .map(|issue| (issue.id.as_str(), issue.status.as_str()))
+        .collect();
+    let mut by_project: BTreeMap<&str, Vec<&Issue>> = BTreeMap::new();
+    for issue in issues {
+        by_project
+            .entry(issue.project.as_str())
+            .or_default()
+            .push(issue);
+    }
+    let mut rollups: Vec<ProjectRollup> = projects
+        .iter()
+        .map(|project| {
+            let project_issues = by_project
+                .get(project.slug.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            project_rollup(project, project_issues, &statuses, now, days, stale_days)
+        })
+        .collect();
+    rollups.sort_by(|a, b| a.slug.cmp(&b.slug));
+
+    let mut folder_rollups = Vec::new();
+    for folder in folders {
+        let in_folder: Vec<ProjectRollup> = rollups
+            .iter()
+            .filter(|project| project.folder.as_deref() == Some(folder.slug.as_str()))
+            .cloned()
+            .collect();
+        if in_folder.is_empty() {
+            continue;
+        }
+        let folder_issues: Vec<&Issue> = in_folder
+            .iter()
+            .flat_map(|project| by_project.get(project.slug.as_str()).into_iter().flatten())
+            .copied()
+            .filter(|issue| issue.issue_type != "goal")
+            .collect();
+        folder_rollups.push(FolderRollup {
+            slug: Some(folder.slug.clone()),
+            name: folder.name.clone(),
+            parent: folder.parent.clone(),
+            ready: in_folder.iter().map(|project| project.ready).sum(),
+            stale: in_folder.iter().map(|project| project.stale).sum(),
+            progress: Progress::from_issues(&folder_issues),
+            burn_per_day: burndown(
+                &folder_issues.iter().copied().cloned().collect::<Vec<_>>(),
+                days,
+                now,
+            )
+            .burn_per_day,
+            projects: in_folder,
+        });
+    }
+    folder_rollups.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let unfiled: Vec<ProjectRollup> = rollups
+        .iter()
+        .filter(|project| {
+            project.folder.is_none()
+                || !folders
+                    .iter()
+                    .any(|folder| Some(folder.slug.as_str()) == project.folder.as_deref())
+        })
+        .cloned()
+        .collect();
+    let all_issues: Vec<&Issue> = issues
+        .iter()
+        .filter(|issue| issue.issue_type != "goal")
+        .collect();
+    let totals = PortfolioTotals {
+        projects: projects.len() as i64,
+        progress: Progress::from_issues(&all_issues),
+        ready: rollups.iter().map(|project| project.ready).sum(),
+        stale: rollups.iter().map(|project| project.stale).sum(),
+        burn_per_day: burndown(
+            &issues
+                .iter()
+                .filter(|issue| issue.issue_type != "goal")
+                .cloned()
+                .collect::<Vec<_>>(),
+            days,
+            now,
+        )
+        .burn_per_day,
+    };
+    Portfolio {
+        generated_at: now,
+        days,
+        stale_days,
+        folders: folder_rollups,
+        unfiled,
+        totals,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::{Db, now};
-    use crate::types::{Issue, NewIssue};
+    use crate::types::{Dependency, Folder, Issue, NewIssue};
 
     fn issue(
         id: &str,
@@ -337,6 +587,54 @@ mod tests {
         assert_eq!(b.points.last().unwrap().remaining, 1);
         assert_eq!(b.points.last().unwrap().scope, 2);
         assert!(b.burn_per_day.is_some());
+    }
+
+    #[test]
+    fn portfolio_counts_ready_work_and_excludes_goal_containers() {
+        let now = 10 * 86_400;
+        let mut ready = issue("t1", None, "task", "open", 0, None);
+        ready.available_at = Some(0);
+        let mut blocked = issue("t2", None, "task", "open", 0, None);
+        blocked.available_at = Some(0);
+        blocked.dependencies = vec![Dependency {
+            depends_on_id: Some("t1".into()),
+        }];
+        let mut claimed = issue("t3", None, "task", "open", 0, None);
+        claimed.available_at = Some(0);
+        claimed.assignee = Some("agent".into());
+        claimed.expires_at = Some(now + 1_000);
+        let mut review = issue("r", None, "task", "review", 0, None);
+        review.updated_at = 0;
+        let closed = issue("c", None, "task", "closed", 0, Some(2 * 86_400));
+        let goal = issue("g", None, "goal", "open", 0, None);
+        let issues = vec![goal, ready, blocked, claimed, review, closed];
+        let projects = vec![ProjectInfo {
+            slug: "p".into(),
+            root: "/p".into(),
+            prefix: "p".into(),
+            folder: Some("business".into()),
+        }];
+        let folders = vec![Folder {
+            slug: "business".into(),
+            name: "Business".into(),
+            parent: None,
+            created_at: 0,
+        }];
+        let report = portfolio(&projects, &folders, &issues, now, 10, 7);
+        assert_eq!(report.folders.len(), 1);
+        let project = &report.folders[0].projects[0];
+        assert_eq!(project.progress.total, 5, "goal container is not work");
+        assert_eq!(project.progress.open, 3);
+        assert_eq!(project.progress.review, 1);
+        assert_eq!(project.progress.closed, 1);
+        assert_eq!(project.ready, 1);
+        assert_eq!(project.stale, 3);
+        assert_eq!(project.oldest_ready_age_secs, Some(10 * 86_400));
+        assert_eq!(project.oldest_review_age_secs, Some(10 * 86_400));
+        assert_eq!(project.goals.len(), 1);
+        let burn = project.burn_per_day.unwrap();
+        assert!((burn - 0.1).abs() < 0.001, "burn={burn}");
+        assert_eq!(report.totals.ready, 1);
     }
 
     #[test]

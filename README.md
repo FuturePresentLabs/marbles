@@ -161,8 +161,20 @@ mb burndown --epic <epic-id> --days 7 --json
 The series reports daily `scope`, `done`, and `remaining`, plus burn rate and a
 projected days-to-zero when there are closes in the window.
 
-See [`docs/organizing-work.md`](docs/organizing-work.md) for the data model and
-worked examples.
+### Portfolio
+
+`mb portfolio` rolls folders → projects → goals into one read-only view: ready
+work, WIP, review/blocked counts, stale work, oldest-ready age, and per-project
+burn rate.
+
+```bash
+mb portfolio
+mb portfolio --folder business --days 30 --stale-days 14
+mb portfolio --json
+```
+
+See [`docs/organizing-work.md`](docs/organizing-work.md) and
+[`docs/portfolio.md`](docs/portfolio.md) for the data model and field meanings.
 
 ## Plans are DAGs
 
@@ -338,6 +350,7 @@ mb epic create "Storage" --goal <goal-id>
 mb task create "Write the WAL test" --epic <epic-id>
 mb goal list ; mb goal show <goal-id>
 mb burndown --project <project> --days 30 [--json]
+mb portfolio [--folder <slug>] [--days N] [--stale-days N] [--json]
 
 # Projects and operations
 mb init [--folder NAME] [--slug S] [--prefix P]

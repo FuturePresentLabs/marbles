@@ -234,6 +234,18 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         days: i64,
     },
+    /// Folder → project → goal rollup: ready work, WIP, review/blocked, staleness, burn rate.
+    Portfolio {
+        /// Only show projects in this folder slug.
+        #[arg(long)]
+        folder: Option<String>,
+        /// Burn-rate window in days.
+        #[arg(long, default_value_t = 14)]
+        days: i64,
+        /// Treat open/in-progress work untouched for this many days as stale.
+        #[arg(long, default_value_t = 7)]
+        stale_days: i64,
+    },
     /// Write an atomic SQLite snapshot with `VACUUM INTO` (local mode only).
     Backup {
         /// Destination path; must not already exist.
@@ -626,6 +638,112 @@ fn project_folder_map(view: &FolderView) -> BTreeMap<&str, &str> {
         .iter()
         .map(|p| (p.project.as_str(), p.folder.as_str()))
         .collect()
+}
+
+fn project_infos(db: &Db) -> Result<Vec<report::ProjectInfo>, String> {
+    let view = db.folder_view().map_err(|e| e.to_string())?;
+    let rows = db.projects().map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|(slug, root, prefix)| report::ProjectInfo {
+            folder: view
+                .projects
+                .iter()
+                .find(|p| p.project == slug)
+                .map(|p| p.folder.clone()),
+            slug,
+            root,
+            prefix,
+        })
+        .collect())
+}
+
+fn print_portfolio(report: &report::Portfolio) {
+    println!(
+        "portfolio — {} projects, {} issues, {} ready, {} in progress, {} stale",
+        report.totals.projects,
+        report.totals.progress.total,
+        report.totals.ready,
+        report.totals.progress.in_progress,
+        report.totals.stale
+    );
+    match report.totals.burn_per_day {
+        Some(rate) => println!("burn {rate:.2}/day across all projects"),
+        None => println!("burn unknown (no closes in the window)"),
+    }
+    for folder in &report.folders {
+        let mut parts = Vec::new();
+        let mut cursor = folder.parent.as_deref();
+        let mut guard = 0;
+        while let Some(slug) = cursor {
+            guard += 1;
+            if guard > 16 {
+                break;
+            }
+            match report
+                .folders
+                .iter()
+                .find(|candidate| candidate.slug.as_deref() == Some(slug))
+            {
+                Some(parent) => {
+                    parts.push(parent.name.clone());
+                    cursor = parent.parent.as_deref();
+                }
+                None => break,
+            }
+        }
+        parts.reverse();
+        parts.push(folder.name.clone());
+        println!(
+            "\n{}  total {}  ready {}  stale {}  burn {}",
+            parts.join("/"),
+            folder.progress.total,
+            folder.ready,
+            folder.stale,
+            folder
+                .burn_per_day
+                .map(|rate| format!("{rate:.2}/day"))
+                .unwrap_or_else(|| "unknown".into())
+        );
+        for project in &folder.projects {
+            print_project_rollup(project);
+        }
+    }
+    if !report.unfiled.is_empty() {
+        println!("\n(unfiled)");
+        for project in &report.unfiled {
+            print_project_rollup(project);
+        }
+    }
+}
+
+fn print_project_rollup(project: &report::ProjectRollup) {
+    let oldest = project
+        .oldest_ready_age_secs
+        .map(|age| format!(" oldest-ready {}d", age / 86_400))
+        .unwrap_or_default();
+    println!(
+        "  {:<22} total {:>3}  open {:>3}  wip {:>3}  review {:>3}  blocked {:>3}  ready {:>3}  stale {:>3}{}",
+        project.slug,
+        project.progress.total,
+        project.progress.open,
+        project.progress.in_progress,
+        project.progress.review,
+        project.progress.blocked,
+        project.ready,
+        project.stale,
+        oldest
+    );
+    for goal in &project.goals {
+        println!(
+            "      goal {} [{}] {:.1}% ({}/{})",
+            goal.id,
+            goal.status,
+            goal.progress.percent_done,
+            goal.progress.closed,
+            goal.progress.total
+        );
+    }
 }
 
 fn print_folder_view(view: &FolderView, tree: bool) {
@@ -1736,6 +1854,41 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                         point.date, point.scope, point.done, point.remaining, point.ideal_remaining
                     );
                 }
+            }
+            Ok(())
+        }
+        Command::Portfolio {
+            folder,
+            days,
+            stale_days,
+        } => {
+            let view: FolderView = mode
+                .call("folders.list", &serde_json::json!({}), |db| {
+                    db.folder_view().map_err(|e| e.to_string())
+                })
+                .await?;
+            let mut projects: Vec<report::ProjectInfo> = mode
+                .call("projects.list", &serde_json::json!({}), |db| {
+                    project_infos(db)
+                })
+                .await?;
+            if let Some(folder) = folder {
+                projects.retain(|project| project.folder.as_deref() == Some(folder.as_str()));
+            }
+            let issues: Vec<Issue> = mode
+                .call("issues.list", &serde_json::json!({"all": true}), |db| {
+                    db.list(None, true, None).map_err(|e| e.to_string())
+                })
+                .await?;
+            let report =
+                report::portfolio(&projects, &view.folders, &issues, now(), *days, *stale_days);
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+                );
+            } else {
+                print_portfolio(&report);
             }
             Ok(())
         }
