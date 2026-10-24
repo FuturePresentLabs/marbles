@@ -1628,7 +1628,9 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                     })
                     .await?;
                 let ids = report::descendant_ids(&all, root_id);
-                all.into_iter().filter(|i| ids.contains(&i.id)).collect()
+                all.into_iter()
+                    .filter(|i| i.id != *root_id && ids.contains(&i.id))
+                    .collect()
             } else {
                 let body = serde_json::json!({"project": project, "all": true});
                 mode.call("issues.list", &body, |db| {
