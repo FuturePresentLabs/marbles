@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/img/marbles-logo.png" alt="Marbles — a small issue tracker for fleets of coding agents" width="900">
+  <img src="docs/img/marbles-logo.svg" alt="Marbles — a small issue tracker for fleets of coding agents" width="900">
 </p>
 
 <p align="center">
@@ -24,10 +24,6 @@ per-checkout replicated database that made fleet-scale bookkeeping the work.
 The core idea is deliberately boring: **the work graph has exactly one writer
 per lineage.** Humans and agents are HTTP clients of that writer. Nothing is
 replicated, so there is nothing to merge.
-
-<p align="center">
-  <img src="docs/img/marbles-hero.jpg" alt="A ring of colorful marbles, with one silver marble striking the ring and starting a chain reaction" width="820">
-</p>
 
 ## Why Marbles
 
