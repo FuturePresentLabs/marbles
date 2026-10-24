@@ -225,6 +225,13 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         days: i64,
     },
+    /// Write an atomic SQLite snapshot with `VACUUM INTO` (local mode only).
+    Backup {
+        /// Destination path; must not already exist.
+        to: PathBuf,
+    },
+    /// Check integrity, settings, row counts, and WAL size (local mode only).
+    Doctor,
     /// Import a Beads export. JSONL (from `bd export`) or the `bd list --json` array shape.
     ///
     /// `--rewrite-prefix old:new` renames a whole store's ids — for the mistake where two
@@ -1657,6 +1664,66 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                         "{}  scope {:>4}  done {:>4}  left {:>4}  ideal {:>4}",
                         point.date, point.scope, point.done, point.remaining, point.ideal_remaining
                     );
+                }
+            }
+            Ok(())
+        }
+        Command::Backup { to } => {
+            let db = require_local(
+                mode,
+                "backup reads the server's database file; run it on the host that owns --url",
+            )?;
+            let report = db.backup(to).map_err(|e| e.to_string())?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!(
+                    "backup {} ({} bytes): {} projects, {} issues, {} deps, {} history entries",
+                    report.path,
+                    report.bytes,
+                    report.projects,
+                    report.issues,
+                    report.deps,
+                    report.history
+                );
+            }
+            Ok(())
+        }
+        Command::Doctor => {
+            let db = require_local(
+                mode,
+                "doctor reads the server's database file; run it on the host that owns --url",
+            )?;
+            let report = db.doctor().map_err(|e| e.to_string())?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!("integrity:    {}", report.integrity);
+                println!("quick check:  {}", report.quick_check);
+                println!(
+                    "journal:      {} / synchronous {}",
+                    report.journal_mode, report.synchronous
+                );
+                println!(
+                    "storage:      {} bytes DB + {} bytes WAL",
+                    report.db_bytes, report.wal_bytes
+                );
+                println!(
+                    "rows:         {} projects, {} issues, {} deps, {} history, {} outbox pending",
+                    report.projects,
+                    report.issues,
+                    report.deps,
+                    report.history,
+                    report.outbox_pending
+                );
+                if !report.foreign_key_violations.is_empty() {
+                    println!("foreign keys: {}", report.foreign_key_violations.join("; "));
                 }
             }
             Ok(())

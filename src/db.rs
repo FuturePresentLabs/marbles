@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 
 use crate::time::WorkWeek;
 use crate::types::*;
@@ -178,6 +179,36 @@ pub struct Db {
     conn: Mutex<Connection>,
     policy: Policy,
     week: WorkWeek,
+    /// The on-disk path, when there is one. `None` for in-memory test stores.
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupReport {
+    pub path: String,
+    pub bytes: u64,
+    pub created_at: i64,
+    pub projects: i64,
+    pub issues: i64,
+    pub deps: i64,
+    pub history: i64,
+    pub integrity: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoctorReport {
+    pub integrity: String,
+    pub quick_check: String,
+    pub foreign_key_violations: Vec<String>,
+    pub journal_mode: String,
+    pub synchronous: String,
+    pub db_bytes: u64,
+    pub wal_bytes: u64,
+    pub projects: i64,
+    pub issues: i64,
+    pub deps: i64,
+    pub history: i64,
+    pub outbox_pending: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -323,6 +354,18 @@ fn short_suffix() -> String {
         .collect()
 }
 
+fn count(conn: &Connection, table: &str) -> Result<i64> {
+    Ok(conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?)
+}
+
+fn count_where(conn: &Connection, table: &str, predicate: &str) -> Result<i64> {
+    Ok(conn.query_row(
+        &format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"),
+        [],
+        |r| r.get(0),
+    )?)
+}
+
 impl Db {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -332,7 +375,9 @@ impl Db {
         }
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // The tracker acknowledges mutations to agents; a power loss must not lose the
+        // last claim/close after the client has a receipt. FULL is the durable WAL setting.
+        conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // WAL serializes writers correctly but returns SQLITE_BUSY immediately; give contended
         // writes (sweeper vs daemon tick vs CLI on one machine) a few seconds to queue.
@@ -342,6 +387,7 @@ impl Db {
             conn: Mutex::new(conn),
             policy: Policy::default(),
             week: WorkWeek::default(),
+            path: Some(path.to_path_buf()),
         })
     }
 
@@ -352,6 +398,7 @@ impl Db {
             conn: Mutex::new(conn),
             policy: Policy::default(),
             week: WorkWeek::default(),
+            path: None,
         })
     }
 
@@ -651,6 +698,101 @@ impl Db {
         )
         .optional()?
         .ok_or_else(|| Error::NotFound(id.to_string()))
+    }
+
+    // ---- durability ----
+
+    /// Create an atomic, compact snapshot with `VACUUM INTO`. The target must not exist; a
+    /// backup never overwrites a previous one by accident. The source is checked first so a
+    /// corrupted database is not laundered into a second file.
+    pub fn backup(&self, target: &Path) -> Result<BackupReport> {
+        if target.exists() {
+            return Err(Error::Bad(format!(
+                "backup target {} already exists; choose a new path",
+                target.display()
+            )));
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::Bad(format!("creating {}: {e}", parent.display())))?;
+        }
+        let created_at = now();
+        let target_sql = target.to_string_lossy().replace('\'', "''");
+        let conn = self.conn.lock().expect("store lock poisoned");
+        let integrity: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        if integrity != "ok" {
+            return Err(Error::Bad(format!(
+                "refusing to back up a database whose integrity_check is {integrity:?}"
+            )));
+        }
+        let projects = count(&conn, "project")?;
+        let issues = count(&conn, "issue")?;
+        let deps = count(&conn, "dep")?;
+        let history = count(&conn, "history")?;
+        conn.execute_batch(&format!("VACUUM INTO '{target_sql}'"))?;
+        drop(conn);
+        let bytes = std::fs::metadata(target).map(|m| m.len()).unwrap_or(0);
+        Ok(BackupReport {
+            path: target.display().to_string(),
+            bytes,
+            created_at,
+            projects,
+            issues,
+            deps,
+            history,
+            integrity,
+        })
+    }
+
+    /// Report integrity, settings, row counts, and on-disk/WAL size without mutating anything.
+    pub fn doctor(&self) -> Result<DoctorReport> {
+        let conn = self.conn.lock().expect("store lock poisoned");
+        let integrity: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        let quick_check: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+        let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+        let sync: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
+        let synchronous = match sync {
+            0 => "OFF",
+            1 => "NORMAL",
+            2 => "FULL",
+            3 => "EXTRA",
+            _ => "UNKNOWN",
+        }
+        .to_string();
+        let mut foreign_key_violations = Vec::new();
+        let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let table: String = row.get(0)?;
+            let rowid: Option<i64> = row.get(1)?;
+            let parent: String = row.get(2)?;
+            foreign_key_violations.push(format!("{table} row {rowid:?} -> {parent}"));
+        }
+        let outbox_pending = count_where(&conn, "outbound_event", "delivered_at IS NULL")?;
+        let (db_bytes, wal_bytes) = match &self.path {
+            Some(path) => {
+                let db = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                let wal = std::fs::metadata(format!("{}-wal", path.display()))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                (db, wal)
+            }
+            None => (0, 0),
+        };
+        Ok(DoctorReport {
+            integrity,
+            quick_check,
+            foreign_key_violations,
+            journal_mode,
+            synchronous,
+            db_bytes,
+            wal_bytes,
+            projects: count(&conn, "project")?,
+            issues: count(&conn, "issue")?,
+            deps: count(&conn, "dep")?,
+            history: count(&conn, "history")?,
+            outbox_pending,
+        })
     }
 
     // ---- issues ----
