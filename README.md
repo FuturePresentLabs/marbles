@@ -120,8 +120,49 @@ A **project** is one tracker: a repo or a coherent body of work. Every project
 has its own prefix (`marbles-…`), and all projects share one database, so
 portfolio queries are cheap.
 
-Dependencies are ordinary rows and may cross projects. A blocker in `infra`
-can gate work in `app` without either tracker owning the other.
+### Folders
+
+Projects can be grouped into folders (`personal`, `business`, `business/acme`).
+Folders nest; a project belongs to at most one folder, and unfiled is explicit.
+
+```bash
+mb folder create "Business" --slug business
+mb folder move acme business
+mb folder tree
+mb projects                       # includes each project's folder
+```
+
+### Goals → epics → tasks
+
+A **goal** is a project-local root. An **epic** is a body of work under a goal;
+a **task** is an executable unit under an epic. All three are ordinary issues,
+so they inherit claims, history, labels, dependencies, review, and evidence.
+
+```bash
+mb goal create "Ship v1" -p 1
+mb epic create "Storage" --goal <goal-id>
+mb task create "Write the WAL test" --epic <epic-id>
+
+mb goal list                      # descendant rollups
+mb goal show <goal-id>            # tree + progress bar
+```
+
+Hierarchy is project-local; use an ordinary dependency edge for a blocker in
+another project. Dependencies remain cross-project and cross-folder.
+
+### Burndown
+
+```bash
+mb burndown --project acme --days 30
+mb burndown --goal <goal-id> --days 14
+mb burndown --epic <epic-id> --days 7 --json
+```
+
+The series reports daily `scope`, `done`, and `remaining`, plus burn rate and a
+projected days-to-zero when there are closes in the window.
+
+See [`docs/organizing-work.md`](docs/organizing-work.md) for the data model and
+worked examples.
 
 ## Identity
 
@@ -146,11 +187,22 @@ checked-in `deploy/server.toml` is the FPL Auth production shape.
 
 ## Durability
 
-The local store is SQLite in WAL mode with a single writer and a five-second
-busy timeout. Every mutation runs inside `BEGIN IMMEDIATE`, so a claim is
-serialized even when several projects and a sweeper write at once. The append-
-only `history` table is the audit trail; `outbound_event` is a transactional
-outbox, written in the same transaction as the mutation it describes.
+The local store is SQLite in WAL mode with a single writer, `synchronous=FULL`,
+and a five-second busy timeout. Every mutation runs inside `BEGIN IMMEDIATE`, so
+a claim is serialized even when several projects and a sweeper write at once,
+and an acknowledged claim or close survives a crash. The append-only `history`
+table is the audit trail; `outbound_event` is a transactional outbox, written in
+the same transaction as the mutation it describes.
+
+```bash
+mb doctor                          # integrity, WAL size, settings, row counts
+mb backup ~/backups/marbles.db     # atomic VACUUM INTO snapshot
+```
+
+`backup` refuses to overwrite an existing file and checks source integrity
+first. `doctor` runs `integrity_check` and `foreign_key_check`. Both are local
+commands: run them on the host that owns the store. See
+[`docs/durability.md`](docs/durability.md).
 
 An optional signed webhook wakes an event-driven consumer without making it
 part of the mutation transaction:
@@ -191,10 +243,19 @@ mb close  <id> --ack "no delivery expected: …"
 mb dep add <child> <parent> ; mb dep rm <child> <parent>
 mb label add <id> bug ; mb label remove <id> bug
 
+# Organizing
+mb folder create "Business" --slug business
+mb folder tree ; mb folder move <project> <folder|none>
+mb goal create "Ship v1" -p 1
+mb epic create "Storage" --goal <goal-id>
+mb task create "Write the WAL test" --epic <epic-id>
+mb goal list ; mb goal show <goal-id>
+mb burndown --project <project> --days 30 [--json]
 
 # Projects and operations
-mb init [--slug S] [--prefix P]
+mb init [--folder NAME] [--slug S] [--prefix P]
 mb projects ; mb stats ; mb sweep
+mb doctor ; mb backup <new-path>
 ```
 
 ## Migrating from Beads
