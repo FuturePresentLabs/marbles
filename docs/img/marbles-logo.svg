@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 600" width="1400" height="600" role="img" aria-labelledby="title desc">
+  <title id="title">Marbles</title>
+  <desc id="desc">Marbles wordmark beside a ring of colorful marbles, with one silver marble striking the ring and starting a chain reaction.</desc>
+
+  <rect width="1400" height="600" fill="#000000"/>
+
+  <text x="70" y="360" fill="#E7D3C8"
+        font-family="Georgia, 'Times New Roman', serif"
+        font-size="210" font-weight="400" letter-spacing="4">Marbles</text>
+
+  <g id="ring" stroke="#050505" stroke-width="3">
+    <!-- 12 marbles on a 170px radius around (1030,300) -->
+    <circle cx="1200" cy="300" r="28" fill="#F4D35E"/>
+    <circle cx="1177" cy="385" r="28" fill="#F77F00"/>
+    <circle cx="1115" cy="447" r="28" fill="#E63946"/>
+    <circle cx="1030" cy="470" r="28" fill="#C77DFF"/>
+    <circle cx="945"  cy="447" r="28" fill="#7B2CBF"/>
+    <circle cx="883"  cy="385" r="28" fill="#5A67D8"/>
+    <circle cx="860"  cy="300" r="28" fill="#277DA1"/>
+    <circle cx="883"  cy="215" r="28" fill="#00B4D8"/>
+    <circle cx="945"  cy="153" r="28" fill="#2A9D8F"/>
+    <circle cx="1030" cy="130" r="28" fill="#43AA8B"/>
+    <circle cx="1115" cy="153" r="28" fill="#90BE6D"/>
+    <circle cx="1177" cy="215" r="28" fill="#FCBF49"/>
+  </g>
+
+  <g fill="#FFFFFF" opacity="0.34">
+    <circle cx="1191" cy="291" r="7"/>
+    <circle cx="1168" cy="376" r="7"/>
+    <circle cx="1106" cy="438" r="7"/>
+    <circle cx="1021" cy="461" r="7"/>
+    <circle cx="936"  cy="438" r="7"/>
+    <circle cx="874"  cy="376" r="7"/>
+    <circle cx="851"  cy="291" r="7"/>
+    <circle cx="874"  cy="206" r="7"/>
+    <circle cx="936"  cy="144" r="7"/>
+    <circle cx="1021" cy="121" r="7"/>
+    <circle cx="1106" cy="144" r="7"/>
+    <circle cx="1168" cy="206" r="7"/>
+  </g>
+
+  <!-- chain-reaction arcs at the impact -->
+  <g fill="none" stroke-linecap="round" opacity="0.85">
+    <path d="M 1218 262 A 44 44 0 0 1 1246 286" stroke="#FFD166" stroke-width="4"/>
+    <path d="M 1246 314 A 44 44 0 0 1 1218 338" stroke="#FFD166" stroke-width="4"/>
+  </g>
+
+  <!-- the shooter and its motion trail -->
+  <g stroke-linecap="round">
+    <line x1="1310" y1="282" x2="1392" y2="282" stroke="#F8F9FA" stroke-width="4" opacity="0.38"/>
+    <line x1="1310" y1="300" x2="1396" y2="300" stroke="#F8F9FA" stroke-width="4" opacity="0.6"/>
+    <line x1="1310" y1="318" x2="1392" y2="318" stroke="#F8F9FA" stroke-width="4" opacity="0.38"/>
+  </g>
+  <circle cx="1276" cy="300" r="30" fill="#F8F9FA" stroke="#FFFFFF" stroke-width="2"/>
+  <circle cx="1266" cy="290" r="7" fill="#FFFFFF" opacity="0.55"/>
+
+  <g fill="#FFD166">
+    <circle cx="1240" cy="272" r="4"/>
+    <circle cx="1247" cy="300" r="5"/>
+    <circle cx="1240" cy="328" r="4"/>
+  </g>
+</svg>
