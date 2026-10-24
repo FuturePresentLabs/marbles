@@ -536,7 +536,7 @@ async fn main() -> ExitCode {
         let token = if let Some(token) = cli.token.clone() {
             token
         } else if let Some(saved) = saved {
-            match marbles::oidc::valid_token(saved).await {
+            match marbles::oidc::valid_token_with_timeout(saved, cli.timeout_ms).await {
                 Ok((_, token)) => token,
                 Err(err) => return fail(err),
             }

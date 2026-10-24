@@ -16,6 +16,9 @@ use crate::config;
 const DEFAULT_ISSUER: &str = "https://sso.fpl.dev";
 const DEFAULT_CLIENT_ID: &str = "marbles";
 const DEFAULT_REDIRECT_URI: &str = "http://localhost:17878/callback";
+/// OIDC token calls are bounded like tracker calls; a hung IdP must not hang the CLI.
+pub const DEFAULT_OIDC_TIMEOUT_MS: u64 = 8_000;
+const CONNECT_TIMEOUT_MS: u64 = 3_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClientConfig {
@@ -36,9 +39,25 @@ pub struct ClientConfig {
 
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
-    refresh_token: String,
-    id_token: String,
+    /// Some providers only return a rotated refresh token on rotation, not every refresh.
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default = "default_expires_in")]
     expires_in: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthError {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
+fn default_expires_in() -> i64 {
+    300
 }
 
 fn default_issuer() -> String {
@@ -53,6 +72,15 @@ fn default_redirect_uri() -> String {
 
 fn persist_by_default() -> bool {
     true
+}
+
+fn http_client(timeout_ms: u64) -> Result<reqwest::Client, String> {
+    let timeout = std::time::Duration::from_millis(timeout_ms.max(1));
+    reqwest::Client::builder()
+        .connect_timeout(timeout.min(std::time::Duration::from_millis(CONNECT_TIMEOUT_MS)))
+        .timeout(timeout)
+        .build()
+        .map_err(|e| format!("building OIDC HTTP client: {e}"))
 }
 
 fn env_config() -> Result<Option<ClientConfig>, String> {
@@ -176,7 +204,7 @@ pub async fn login(
             .error
             .unwrap_or_else(|| "OIDC callback omitted code".to_owned())
     })?;
-    let response = reqwest::Client::new()
+    let response = http_client(DEFAULT_OIDC_TIMEOUT_MS)?
         .post(format!("{issuer}/token"))
         .form(&[
             ("grant_type", "authorization_code"),
@@ -200,14 +228,20 @@ pub async fn login(
     }
     let tokens: TokenResponse =
         serde_json::from_str(&body).map_err(|e| format!("parsing OIDC token response: {e}"))?;
+    let refresh_token = tokens.refresh_token.ok_or_else(|| {
+        "OIDC login response omitted refresh_token; ensure the client requests the `offline_access` scope".to_string()
+    })?;
+    let id_token = tokens
+        .id_token
+        .ok_or_else(|| "OIDC login response omitted id_token".to_string())?;
     let cfg = ClientConfig {
         url: url.trim_end_matches('/').to_owned(),
         issuer: issuer.to_owned(),
         client_id: client_id.to_owned(),
         client_secret: client_secret.to_owned(),
         redirect_uri: redirect_uri.to_owned(),
-        refresh_token: tokens.refresh_token,
-        id_token: tokens.id_token,
+        refresh_token,
+        id_token,
         expires_at: chrono::Utc::now().timestamp() + tokens.expires_in,
         persist: true,
     };
@@ -217,11 +251,18 @@ pub async fn login(
     Ok(cfg)
 }
 
-pub async fn valid_token(mut cfg: ClientConfig) -> Result<(ClientConfig, String), String> {
+pub async fn valid_token(cfg: ClientConfig) -> Result<(ClientConfig, String), String> {
+    valid_token_with_timeout(cfg, DEFAULT_OIDC_TIMEOUT_MS).await
+}
+
+pub async fn valid_token_with_timeout(
+    mut cfg: ClientConfig,
+    timeout_ms: u64,
+) -> Result<(ClientConfig, String), String> {
     if cfg.expires_at > chrono::Utc::now().timestamp() + 60 {
         return Ok((cfg.clone(), cfg.id_token.clone()));
     }
-    let response = reqwest::Client::new()
+    let response = http_client(timeout_ms)?
         .post(format!("{}/token", cfg.issuer.trim_end_matches('/')))
         .form(&[
             ("grant_type", "refresh_token"),
@@ -231,23 +272,66 @@ pub async fn valid_token(mut cfg: ClientConfig) -> Result<(ClientConfig, String)
         ])
         .send()
         .await
-        .map_err(|e| format!("refreshing OIDC token: {e}"))?;
+        .map_err(|e| {
+            if e.is_timeout() {
+                format!(
+                    "OIDC refresh timed out after {timeout_ms}ms; the tracker is not usable until the IdP answers or you re-login"
+                )
+            } else {
+                format!("refreshing OIDC token: {e}")
+            }
+        })?;
     let status = response.status();
     let body = response.text().await.map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(format!(
-            "OIDC refresh HTTP {}: {}",
-            status.as_u16(),
-            body.trim()
-        ));
+        return Err(refresh_error(status.as_u16(), &body));
     }
     let tokens: TokenResponse =
         serde_json::from_str(&body).map_err(|e| format!("parsing OIDC refresh: {e}"))?;
-    cfg.refresh_token = tokens.refresh_token;
-    cfg.id_token = tokens.id_token;
-    cfg.expires_at = chrono::Utc::now().timestamp() + tokens.expires_in;
+    apply_refresh(&mut cfg, tokens)?;
     save(&cfg)?;
     Ok((cfg.clone(), cfg.id_token))
+}
+
+/// Classify a failed refresh. `invalid_grant` is the one case that is definitively terminal:
+/// the refresh token is expired/revoked and only an interactive login can fix it.
+fn refresh_error(status: u16, body: &str) -> String {
+    let parsed = serde_json::from_str::<OAuthError>(body).ok();
+    let oauth_error = parsed.as_ref().and_then(|e| e.error.as_deref());
+    let description = parsed
+        .as_ref()
+        .and_then(|e| e.error_description.as_deref())
+        .unwrap_or("");
+    if status == 400 && oauth_error == Some("invalid_grant") {
+        let detail = if description.is_empty() {
+            String::new()
+        } else {
+            format!(": {description}")
+        };
+        return format!(
+            "re-login required: OIDC refresh was rejected (invalid_grant{detail}); run `marbles login --client-secret <secret>` to mint new tokens"
+        );
+    }
+    let kind = oauth_error.unwrap_or("unknown");
+    format!(
+        "OIDC refresh rejected (HTTP {status}, {kind}): {}",
+        body.trim()
+    )
+}
+
+/// Apply a refresh response. A missing rotated refresh token keeps the current one; a missing
+/// id_token is terminal because Marbles authenticates with the id_token, not an access token.
+fn apply_refresh(cfg: &mut ClientConfig, tokens: TokenResponse) -> Result<(), String> {
+    let id_token = tokens.id_token.ok_or_else(|| {
+        "re-login required: OIDC refresh response omitted id_token; run `marbles login --client-secret <secret>`"
+            .to_string()
+    })?;
+    if let Some(refresh_token) = tokens.refresh_token {
+        cfg.refresh_token = refresh_token;
+    }
+    cfg.id_token = id_token;
+    cfg.expires_at = chrono::Utc::now().timestamp() + tokens.expires_in;
+    Ok(())
 }
 
 struct Callback {
@@ -314,9 +398,88 @@ fn open_browser(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config() -> ClientConfig {
+        ClientConfig {
+            url: "http://127.0.0.1:1".into(),
+            issuer: "https://sso.example".into(),
+            client_id: "marbles".into(),
+            client_secret: "secret".into(),
+            redirect_uri: default_redirect_uri(),
+            refresh_token: "old-refresh".into(),
+            id_token: "old-id".into(),
+            expires_at: 0,
+            persist: false,
+        }
+    }
+
     #[test]
     fn defaults_are_stable() {
         assert_eq!(default_client_id(), "marbles");
         assert_eq!(default_redirect_uri(), "http://localhost:17878/callback");
+        assert_eq!(DEFAULT_OIDC_TIMEOUT_MS, 8_000);
+    }
+
+    #[test]
+    fn invalid_grant_is_a_terminal_relogin_error() {
+        let message = refresh_error(
+            400,
+            r#"{"error":"invalid_grant","error_description":"Token is not active"}"#,
+        );
+        assert!(message.contains("re-login required"), "{message}");
+        assert!(message.contains("marbles login"), "{message}");
+        assert!(message.contains("Token is not active"), "{message}");
+    }
+
+    #[test]
+    fn a_server_or_network_failure_is_not_misreported_as_relogin() {
+        let message = refresh_error(503, "upstream unavailable");
+        assert!(!message.contains("re-login required"), "{message}");
+        assert!(message.contains("503"), "{message}");
+    }
+
+    #[test]
+    fn refresh_keeps_the_old_token_when_provider_omits_rotation() {
+        let mut cfg = config();
+        apply_refresh(
+            &mut cfg,
+            TokenResponse {
+                refresh_token: None,
+                id_token: Some("new-id".into()),
+                expires_in: 60,
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.refresh_token, "old-refresh");
+        assert_eq!(cfg.id_token, "new-id");
+    }
+
+    #[test]
+    fn refresh_without_an_id_token_requires_login() {
+        let mut cfg = config();
+        let err = apply_refresh(
+            &mut cfg,
+            TokenResponse {
+                refresh_token: Some("rotated".into()),
+                id_token: None,
+                expires_in: 60,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("re-login required"), "{err}");
+        assert_eq!(
+            cfg.id_token, "old-id",
+            "nothing is mutated before the check"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_token_is_returned_without_an_idp_round_trip() {
+        let mut cfg = config();
+        cfg.expires_at = chrono::Utc::now().timestamp() + 3_600;
+        cfg.id_token = "still-fresh".into();
+        let (out, token) = valid_token_with_timeout(cfg, 1).await.unwrap();
+        assert_eq!(token, "still-fresh");
+        assert_eq!(out.id_token, "still-fresh");
     }
 }
