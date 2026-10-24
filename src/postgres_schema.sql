@@ -8,6 +8,25 @@ CREATE TABLE IF NOT EXISTS marbles_project (
   PRIMARY KEY (company_id, slug),
   UNIQUE (company_id, root)
 );
+CREATE TABLE IF NOT EXISTS marbles_folder (
+  company_id TEXT NOT NULL,
+  slug TEXT NOT NULL,
+  name TEXT NOT NULL,
+  parent TEXT,
+  created_at BIGINT NOT NULL,
+  PRIMARY KEY (company_id, slug)
+);
+CREATE TABLE IF NOT EXISTS marbles_project_folder (
+  company_id TEXT NOT NULL,
+  project TEXT NOT NULL,
+  folder TEXT NOT NULL,
+  assigned_at BIGINT NOT NULL,
+  PRIMARY KEY (company_id, project),
+  FOREIGN KEY (company_id, project) REFERENCES marbles_project(company_id, slug) ON DELETE CASCADE,
+  FOREIGN KEY (company_id, folder) REFERENCES marbles_folder(company_id, slug)
+);
+CREATE INDEX IF NOT EXISTS marbles_project_folder_folder
+  ON marbles_project_folder(company_id, folder);
 CREATE TABLE IF NOT EXISTS marbles_issue (
   company_id TEXT NOT NULL,
   id TEXT NOT NULL,

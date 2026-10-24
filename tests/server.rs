@@ -178,6 +178,37 @@ async fn an_unauthenticated_request_is_refused_before_it_reaches_the_store() {
 }
 
 #[tokio::test]
+async fn folders_and_project_assignment_are_served_over_http() {
+    let (app, dir) = app();
+    let token = token_file(dir.path(), "human-avery");
+    let (status, body) = call(
+        &app,
+        "folders.create",
+        serde_json::json!({"slug":"business","name":"Business","parent":null}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = call(&app, "folders.list", serde_json::json!({}), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("\"slug\":\"business\""), "{body}");
+
+    let (status, body) = call(
+        &app,
+        "projects.move",
+        serde_json::json!({"project":"demo","folder":"business"}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = call(&app, "projects.list", serde_json::json!({}), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("\"folder\":\"business\""), "{body}");
+}
+
+#[tokio::test]
 async fn hosted_company_stores_reject_credentials_without_a_verified_company() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(Db::in_memory().unwrap());

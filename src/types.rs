@@ -83,7 +83,7 @@ pub struct Dependency {
     pub depends_on_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Issue {
     pub id: String,
     pub title: String,
@@ -279,4 +279,30 @@ where
 {
     let v = serde_json::Value::deserialize(d)?;
     Ok(ts_from(&v))
+}
+
+/// A user-defined grouping for projects (for example `personal`, `business-acme`).
+/// Folders may nest through `parent`; a project belongs to at most one folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Folder {
+    pub slug: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub created_at: i64,
+}
+
+/// The project-to-folder assignment. Projects with no row are unfiled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectFolder {
+    pub project: String,
+    pub folder: String,
+}
+
+/// One read of the folder tree: the folders themselves and the current assignments.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FolderView {
+    pub folders: Vec<Folder>,
+    pub projects: Vec<ProjectFolder>,
 }

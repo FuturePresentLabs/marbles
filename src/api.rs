@@ -48,6 +48,9 @@ impl Api {
             .route("/metrics", axum::routing::get(metrics))
             .route("/v1/projects.ensure", post(projects_ensure))
             .route("/v1/projects.list", post(projects_list))
+            .route("/v1/projects.move", post(projects_move))
+            .route("/v1/folders.list", post(folders_list))
+            .route("/v1/folders.create", post(folders_create))
             .route("/v1/issues.create", post(issues_create))
             .route("/v1/issues.get", post(issues_get))
             .route("/v1/issues.list", post(issues_list))
@@ -133,6 +136,19 @@ storage_handler!(
     projects_list,
     projects_list_blocking,
     Empty,
+    serde_json::Value
+);
+storage_handler!(
+    projects_move,
+    projects_move_blocking,
+    MoveProject,
+    serde_json::Value
+);
+storage_handler!(folders_list, folders_list_blocking, Empty, FolderView);
+storage_handler!(
+    folders_create,
+    folders_create_blocking,
+    Folder,
     serde_json::Value
 );
 storage_handler!(issues_create, issues_create_blocking, NewIssue, OkId);
@@ -290,14 +306,67 @@ fn projects_list_blocking(
     Extension(principal): Extension<Principal>,
     Json(_body): Json<Empty>,
 ) -> Res<serde_json::Value> {
-    let rows = api.db_for(&principal)?.projects()?;
+    let store = api.db_for(&principal)?;
+    let rows = store.projects()?;
+    let view = store.folder_view()?;
     Ok(Json(serde_json::json!(
         rows.into_iter()
             .map(|(slug, root, prefix)| {
-                serde_json::json!({"slug": slug, "root": root, "prefix": prefix})
+                let folder = view
+                    .projects
+                    .iter()
+                    .find(|p| p.project == slug)
+                    .map(|p| p.folder.clone());
+                serde_json::json!({
+                    "slug": slug,
+                    "root": root,
+                    "prefix": prefix,
+                    "folder": folder,
+                })
             })
             .collect::<Vec<_>>()
     )))
+}
+
+#[derive(Deserialize)]
+struct MoveProject {
+    project: String,
+    #[serde(default)]
+    folder: Option<String>,
+}
+
+fn projects_move_blocking(
+    State(api): State<Arc<Api>>,
+    Extension(principal): Extension<Principal>,
+    Json(body): Json<MoveProject>,
+) -> Res<serde_json::Value> {
+    api.db_for(&principal)?.set_project_folder(
+        &body.project,
+        body.folder.as_deref(),
+        crate::db::now(),
+    )?;
+    Ok(Json(serde_json::json!({
+        "project": body.project,
+        "folder": body.folder,
+    })))
+}
+
+fn folders_list_blocking(
+    State(api): State<Arc<Api>>,
+    Extension(principal): Extension<Principal>,
+    Json(_body): Json<Empty>,
+) -> Res<FolderView> {
+    Ok(Json(api.db_for(&principal)?.folder_view()?))
+}
+
+fn folders_create_blocking(
+    State(api): State<Arc<Api>>,
+    Extension(principal): Extension<Principal>,
+    Json(body): Json<Folder>,
+) -> Res<serde_json::Value> {
+    api.db_for(&principal)?
+        .ensure_folder(&body, crate::db::now())?;
+    Ok(Json(serde_json::json!({"slug": body.slug})))
 }
 
 // ---- issues ----

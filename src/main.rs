@@ -10,6 +10,7 @@
 //! `list`/`ready` → arrays of beads, `show` → a one-element array) so migration is a binary swap,
 //! not a rewrite.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -20,6 +21,7 @@ use marbles::client::Client;
 use marbles::config;
 use marbles::db::{CompanyStoreRegistry, CompanyStores, Db, now};
 use marbles::postgres_store::PostgresCompanyStores;
+use marbles::report;
 use marbles::setup::Profile;
 use marbles::types::*;
 
@@ -71,6 +73,9 @@ enum Command {
         /// Persist the Marbles service endpoint in project.toml.
         #[arg(long)]
         server_url: Option<String>,
+        /// Put the project in this folder (created if it does not exist).
+        #[arg(long)]
+        folder: Option<String>,
     },
     /// Start the server (fleet mode).
     Serve {
@@ -186,6 +191,40 @@ enum Command {
         #[command(subcommand)]
         action: ProjectAction,
     },
+    /// Group projects into folders (personal, business-acme, …).
+    Folder {
+        #[command(subcommand)]
+        action: FolderAction,
+    },
+    /// Goals are project-local roots for epics and tasks.
+    Goal {
+        #[command(subcommand)]
+        action: GoalAction,
+    },
+    /// Epics belong to a goal.
+    Epic {
+        #[command(subcommand)]
+        action: EpicAction,
+    },
+    /// Tasks belong to an epic (or any parent issue).
+    Task {
+        #[command(subcommand)]
+        action: TaskAction,
+    },
+    /// Daily remaining-work series and burn rate for a project, goal, or epic.
+    Burndown {
+        #[arg(long)]
+        project: Option<String>,
+        /// Scope the report to this goal (and its descendants).
+        #[arg(long)]
+        goal: Option<String>,
+        /// Scope the report to this epic (and its descendants).
+        #[arg(long)]
+        epic: Option<String>,
+        /// Window in days.
+        #[arg(long, default_value_t = 30)]
+        days: i64,
+    },
     /// Import a Beads export. JSONL (from `bd export`) or the `bd list --json` array shape.
     ///
     /// `--rewrite-prefix old:new` renames a whole store's ids — for the mistake where two
@@ -280,6 +319,83 @@ struct UpdateArgs {
 enum ProjectAction {
     /// Delete a store and every issue/edge/history row that touched it.
     Rm { slug: String },
+}
+
+#[derive(Subcommand)]
+enum FolderAction {
+    /// Create or rename a folder.
+    Create {
+        name: String,
+        /// Stable slug (defaults to a slugified name).
+        #[arg(long)]
+        slug: Option<String>,
+        /// Parent folder slug for nesting.
+        #[arg(long)]
+        parent: Option<String>,
+    },
+    /// List folders and their projects.
+    List,
+    /// Render the folder tree.
+    Tree,
+    /// Put a project in a folder; use `none` to unfile it.
+    Move { project: String, folder: String },
+}
+
+#[derive(clap::Args)]
+struct WorkCreateArgs {
+    title: String,
+    #[arg(short = 'p', long, default_value_t = 2)]
+    priority: i64,
+    #[arg(short = 'd', long)]
+    description: Option<String>,
+    #[arg(short = 'l', long, default_value = "")]
+    labels: String,
+    #[arg(long)]
+    project: Option<String>,
+    /// Epoch seconds to override the creation grace (0 = visible immediately).
+    #[arg(long)]
+    available_at: Option<i64>,
+}
+
+#[derive(Subcommand)]
+enum GoalAction {
+    /// Set a goal, optionally with a description.
+    Create {
+        #[command(flatten)]
+        args: WorkCreateArgs,
+    },
+    /// List goals with descendant rollups.
+    List {
+        #[arg(long)]
+        project: Option<String>,
+        /// Include closed goals.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show one goal and its epic/task tree.
+    Show { id: String },
+}
+
+#[derive(Subcommand)]
+enum EpicAction {
+    /// Register an epic under a goal.
+    Create {
+        #[arg(long)]
+        goal: String,
+        #[command(flatten)]
+        args: WorkCreateArgs,
+    },
+}
+
+#[derive(Subcommand)]
+enum TaskAction {
+    /// Register a task under an epic.
+    Create {
+        #[arg(long)]
+        epic: String,
+        #[command(flatten)]
+        args: WorkCreateArgs,
+    },
 }
 
 #[derive(Subcommand)]
@@ -408,6 +524,131 @@ fn project_for(cli: &Cli) -> Result<String, String> {
     ))
 }
 
+fn resolve_project(cli: &Cli, explicit: Option<&str>) -> Result<String, String> {
+    explicit
+        .map(str::to_string)
+        .or_else(|| project_for(cli).ok())
+        .filter(|project| !project.is_empty())
+        .ok_or_else(|| "no project: run `marbles init` or pass --project".to_string())
+}
+
+async fn create_issue(mode: &Mode, spec: &NewIssue) -> Result<String, String> {
+    match mode {
+        Mode::Local(db) => db.create(spec, now()).map_err(|e| e.to_string()),
+        Mode::Http(client) => {
+            let response: serde_json::Value = client.call("issues.create", spec).await?;
+            response["id"]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("issues.create returned no id: {response}"))
+        }
+    }
+}
+
+fn project_folder_map(view: &FolderView) -> BTreeMap<&str, &str> {
+    view.projects
+        .iter()
+        .map(|p| (p.project.as_str(), p.folder.as_str()))
+        .collect()
+}
+
+fn print_folder_view(view: &FolderView, tree: bool) {
+    let assignments = project_folder_map(view);
+    if tree {
+        let mut children: BTreeMap<Option<&str>, Vec<&Folder>> = BTreeMap::new();
+        for folder in &view.folders {
+            children
+                .entry(folder.parent.as_deref())
+                .or_default()
+                .push(folder);
+        }
+        for folders in children.values_mut() {
+            folders.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        fn walk(
+            parent: Option<&str>,
+            depth: usize,
+            children: &BTreeMap<Option<&str>, Vec<&Folder>>,
+            assignments: &BTreeMap<&str, &str>,
+            view: &FolderView,
+            out: &mut Vec<String>,
+        ) {
+            let Some(folders) = children.get(&parent) else {
+                return;
+            };
+            for folder in folders {
+                let indent = "  ".repeat(depth);
+                let projects: Vec<&str> = view
+                    .projects
+                    .iter()
+                    .filter(|p| p.folder == folder.slug)
+                    .map(|p| p.project.as_str())
+                    .collect();
+                let suffix = if projects.is_empty() {
+                    String::new()
+                } else {
+                    format!("  [{}]", projects.join(", "))
+                };
+                out.push(format!("{indent}{} ({}){suffix}", folder.name, folder.slug));
+                walk(
+                    Some(&folder.slug),
+                    depth + 1,
+                    children,
+                    assignments,
+                    view,
+                    out,
+                );
+            }
+        }
+        let mut lines = Vec::new();
+        walk(None, 0, &children, &assignments, view, &mut lines);
+        let unfiled: Vec<&str> = assignments
+            .iter()
+            .filter(|(_, folder)| !view.folders.iter().any(|f| f.slug == **folder))
+            .map(|(project, _)| *project)
+            .collect();
+        if !lines.is_empty() {
+            println!("{}", lines.join("\n"));
+        }
+        if !unfiled.is_empty() {
+            println!("(unfiled) [{}]", unfiled.join(", "));
+        }
+        return;
+    }
+    if view.folders.is_empty() {
+        println!("no folders");
+    }
+    for folder in &view.folders {
+        let mut projects: Vec<&str> = view
+            .projects
+            .iter()
+            .filter(|p| p.folder == folder.slug)
+            .map(|p| p.project.as_str())
+            .collect();
+        projects.sort();
+        println!(
+            "{:<24} {:<28} {}",
+            folder.slug,
+            folder.name,
+            if projects.is_empty() {
+                "-".to_string()
+            } else {
+                projects.join(", ")
+            }
+        );
+    }
+    let mut unfiled: Vec<&str> = view
+        .projects
+        .iter()
+        .filter(|p| !view.folders.iter().any(|f| f.slug == p.folder))
+        .map(|p| p.project.as_str())
+        .collect();
+    unfiled.sort();
+    if !unfiled.is_empty() {
+        println!("{:<24} {:<28} {}", "(unfiled)", "", unfiled.join(", "));
+    }
+}
+
 async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), String> {
     let actor = cli.actor.clone().unwrap_or_else(actor_default);
     match &cli.command {
@@ -419,6 +660,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             no_migrate_beads,
             profile,
             server_url,
+            folder,
         } => {
             let dir = std::env::current_dir().unwrap_or_default().join(&cli.dir);
             let dir = dir.canonicalize().unwrap_or(dir);
@@ -457,6 +699,32 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                         )
                         .await?;
                 }
+            }
+            if let Some(folder) = folder {
+                let folder = Folder {
+                    slug: config::slugify(folder),
+                    name: folder.clone(),
+                    parent: None,
+                    created_at: now(),
+                };
+                let _: serde_json::Value = mode
+                    .call("folders.create", &folder, |db| {
+                        db.ensure_folder(&folder, now())
+                            .map_err(|e| e.to_string())?;
+                        Ok(serde_json::json!({"slug": folder.slug}))
+                    })
+                    .await?;
+                let _: serde_json::Value = mode
+                    .call(
+                        "projects.move",
+                        &serde_json::json!({"project": slug, "folder": folder.slug}),
+                        |db| {
+                            db.set_project_folder(&slug, Some(&folder.slug), now())
+                                .map_err(|e| e.to_string())?;
+                            Ok(serde_json::json!({"project": slug, "folder": folder.slug}))
+                        },
+                    )
+                    .await?;
             }
             if !*no_migrate_beads && dir.join(".beads").is_dir() {
                 let db = require_local(
@@ -1043,16 +1311,354 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
         Command::Projects => {
             let value: serde_json::Value = mode
                 .call("projects.list", &serde_json::json!({}), |db| {
-                    Ok(serde_json::json!(db.projects().map_err(|e| e.to_string())?
-                        .into_iter()
-                        .map(|(slug, root, prefix)| serde_json::json!({"slug": slug, "root": root, "prefix": prefix}))
-                        .collect::<Vec<_>>()))
+                    let view = db.folder_view().map_err(|e| e.to_string())?;
+                    Ok(serde_json::json!(
+                        db.projects()
+                            .map_err(|e| e.to_string())?
+                            .into_iter()
+                            .map(|(slug, root, prefix)| {
+                                let folder = view
+                                    .projects
+                                    .iter()
+                                    .find(|p| p.project == slug)
+                                    .map(|p| p.folder.clone());
+                                serde_json::json!({
+                                    "slug": slug,
+                                    "root": root,
+                                    "prefix": prefix,
+                                    "folder": folder,
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    ))
                 })
                 .await?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
             );
+            Ok(())
+        }
+        Command::Folder { action } => {
+            match action {
+                FolderAction::Create { name, slug, parent } => {
+                    let slug = slug.clone().unwrap_or_else(|| config::slugify(name));
+                    if slug.is_empty() {
+                        return Err("folder name produced an empty slug".into());
+                    }
+                    let folder = Folder {
+                        slug: slug.clone(),
+                        name: name.clone(),
+                        parent: parent.clone(),
+                        created_at: now(),
+                    };
+                    let _: serde_json::Value = mode
+                        .call("folders.create", &folder, |db| {
+                            db.ensure_folder(&folder, now())
+                                .map_err(|e| e.to_string())?;
+                            Ok(serde_json::json!({"slug": folder.slug}))
+                        })
+                        .await?;
+                    if cli.json {
+                        println!("{}", serde_json::json!({"slug": slug}));
+                    } else {
+                        println!("folder {slug} ready");
+                    }
+                }
+                FolderAction::List | FolderAction::Tree => {
+                    let view: FolderView = mode
+                        .call("folders.list", &serde_json::json!({}), |db| {
+                            db.folder_view().map_err(|e| e.to_string())
+                        })
+                        .await?;
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&view).map_err(|e| e.to_string())?
+                        );
+                    } else {
+                        print_folder_view(&view, matches!(action, FolderAction::Tree));
+                    }
+                }
+                FolderAction::Move { project, folder } => {
+                    let target = if folder == "none" || folder == "-" || folder.is_empty() {
+                        None
+                    } else {
+                        Some(folder.as_str())
+                    };
+                    let body = serde_json::json!({"project": project, "folder": target});
+                    let _: serde_json::Value = mode
+                        .call("projects.move", &body, |db| {
+                            db.set_project_folder(project, target, now())
+                                .map_err(|e| e.to_string())?;
+                            Ok(serde_json::json!({"project": project, "folder": target}))
+                        })
+                        .await?;
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::json!({"project": project, "folder": target})
+                        );
+                    } else {
+                        match target {
+                            Some(folder) => println!("{project} -> {folder}"),
+                            None => println!("{project} unfiled"),
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        Command::Goal { action } => {
+            match action {
+                GoalAction::Create { args } => {
+                    let project = resolve_project(cli, args.project.as_deref())?;
+                    let spec = NewIssue {
+                        title: args.title.clone(),
+                        description: read_text_arg(args.description.as_deref())?,
+                        issue_type: "goal".into(),
+                        priority: args.priority,
+                        labels: split_csv(&args.labels),
+                        parent: None,
+                        id: None,
+                        project: Some(project),
+                        available_at: args.available_at,
+                        created_by: Some(actor.clone()),
+                        metadata: None,
+                        external_ref: None,
+                    };
+                    let id = create_issue(mode, &spec).await?;
+                    if cli.json {
+                        println!("{}", serde_json::json!({"id": id}));
+                    } else {
+                        println!("{id} goal created");
+                    }
+                }
+                GoalAction::List { project, all } => {
+                    let project = project.clone().or(project_for(cli).ok());
+                    let body = serde_json::json!({"project": project, "all": true});
+                    let issues: Vec<Issue> = mode
+                        .call("issues.list", &body, |db| {
+                            db.list(project.as_deref(), true, None)
+                                .map_err(|e| e.to_string())
+                        })
+                        .await?;
+                    let mut goals = report::goal_summaries(&issues, project.as_deref());
+                    if !*all {
+                        goals.retain(|goal| goal.status != "closed");
+                    }
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&goals).map_err(|e| e.to_string())?
+                        );
+                    } else if goals.is_empty() {
+                        println!("no goals; create one with `mb goal create \"…\"`");
+                    } else {
+                        for goal in goals {
+                            println!(
+                                "{} [{}] p{} {} — {}/{} closed ({}%)",
+                                goal.id,
+                                goal.status,
+                                goal.priority,
+                                goal.title,
+                                goal.progress.closed,
+                                goal.progress.total,
+                                goal.progress.percent_done
+                            );
+                            println!("  {}", report::progress_bar(&goal.progress, 24));
+                        }
+                    }
+                }
+                GoalAction::Show { id } => {
+                    let root: Issue = mode
+                        .call("issues.get", &serde_json::json!({"id": id}), |db| {
+                            db.get(id).map_err(|e| e.to_string())
+                        })
+                        .await?;
+                    let body = serde_json::json!({"project": root.project, "all": true});
+                    let issues: Vec<Issue> = mode
+                        .call("issues.list", &body, |db| {
+                            db.list(Some(&root.project), true, None)
+                                .map_err(|e| e.to_string())
+                        })
+                        .await?;
+                    let progress = report::progress_for(&issues, &root.id);
+                    let lines = report::tree_lines(&issues, &root.id);
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "issue": root,
+                                "progress": progress,
+                                "tree": lines,
+                            }))
+                            .map_err(|e| e.to_string())?
+                        );
+                    } else {
+                        println!(
+                            "{} — {} [{}] p{} ({})",
+                            root.id, root.title, root.status, root.priority, root.issue_type
+                        );
+                        println!("{}", report::progress_bar(&progress, 28));
+                        for line in lines {
+                            println!("{line}");
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        Command::Epic { action } => {
+            match action {
+                EpicAction::Create { goal, args } => {
+                    let goal_issue: Issue = mode
+                        .call("issues.get", &serde_json::json!({"id": goal}), |db| {
+                            db.get(goal).map_err(|e| e.to_string())
+                        })
+                        .await?;
+                    if goal_issue.issue_type != "goal" {
+                        return Err(format!("{goal} is a {}, not a goal", goal_issue.issue_type));
+                    }
+                    if let Some(project) = args.project.as_deref() {
+                        if project != goal_issue.project {
+                            return Err(format!(
+                                "epic project {project} does not match goal project {}",
+                                goal_issue.project
+                            ));
+                        }
+                    }
+                    let spec = NewIssue {
+                        title: args.title.clone(),
+                        description: read_text_arg(args.description.as_deref())?,
+                        issue_type: "epic".into(),
+                        priority: args.priority,
+                        labels: split_csv(&args.labels),
+                        parent: Some(goal_issue.id),
+                        id: None,
+                        project: Some(goal_issue.project),
+                        available_at: args.available_at,
+                        created_by: Some(actor.clone()),
+                        metadata: None,
+                        external_ref: None,
+                    };
+                    let id = create_issue(mode, &spec).await?;
+                    if cli.json {
+                        println!("{}", serde_json::json!({"id": id}));
+                    } else {
+                        println!("{id} epic created");
+                    }
+                }
+            }
+            Ok(())
+        }
+        Command::Task { action } => {
+            match action {
+                TaskAction::Create { epic, args } => {
+                    let epic_issue: Issue = mode
+                        .call("issues.get", &serde_json::json!({"id": epic}), |db| {
+                            db.get(epic).map_err(|e| e.to_string())
+                        })
+                        .await?;
+                    if epic_issue.issue_type != "epic" {
+                        return Err(format!(
+                            "{epic} is a {}, not an epic",
+                            epic_issue.issue_type
+                        ));
+                    }
+                    if let Some(project) = args.project.as_deref() {
+                        if project != epic_issue.project {
+                            return Err(format!(
+                                "task project {project} does not match epic project {}",
+                                epic_issue.project
+                            ));
+                        }
+                    }
+                    let spec = NewIssue {
+                        title: args.title.clone(),
+                        description: read_text_arg(args.description.as_deref())?,
+                        issue_type: "task".into(),
+                        priority: args.priority,
+                        labels: split_csv(&args.labels),
+                        parent: Some(epic_issue.id),
+                        id: None,
+                        project: Some(epic_issue.project),
+                        available_at: args.available_at,
+                        created_by: Some(actor.clone()),
+                        metadata: None,
+                        external_ref: None,
+                    };
+                    let id = create_issue(mode, &spec).await?;
+                    if cli.json {
+                        println!("{}", serde_json::json!({"id": id}));
+                    } else {
+                        println!("{id} task created");
+                    }
+                }
+            }
+            Ok(())
+        }
+        Command::Burndown {
+            project,
+            goal,
+            epic,
+            days,
+        } => {
+            let root = goal.as_ref().or(epic.as_ref());
+            let mut project = project.clone().or(project_for(cli).ok());
+            let issues: Vec<Issue> = if let Some(root_id) = root {
+                let root_issue: Issue = mode
+                    .call("issues.get", &serde_json::json!({"id": root_id}), |db| {
+                        db.get(root_id).map_err(|e| e.to_string())
+                    })
+                    .await?;
+                project = Some(root_issue.project.clone());
+                let body = serde_json::json!({"project": root_issue.project, "all": true});
+                let all: Vec<Issue> = mode
+                    .call("issues.list", &body, |db| {
+                        db.list(Some(&root_issue.project), true, None)
+                            .map_err(|e| e.to_string())
+                    })
+                    .await?;
+                let ids = report::descendant_ids(&all, root_id);
+                all.into_iter().filter(|i| ids.contains(&i.id)).collect()
+            } else {
+                let body = serde_json::json!({"project": project, "all": true});
+                mode.call("issues.list", &body, |db| {
+                    db.list(project.as_deref(), true, None)
+                        .map_err(|e| e.to_string())
+                })
+                .await?
+            };
+            let report = report::burndown(&issues, *days, now());
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!(
+                    "burndown {} — scope {} done {} remaining {}",
+                    project.as_deref().unwrap_or("all"),
+                    report.scope,
+                    report.done,
+                    report.remaining
+                );
+                match report.burn_per_day {
+                    Some(rate) => println!(
+                        "burn {:.2}/day; projected {:.1} days to zero",
+                        rate,
+                        report.projected_days_to_zero.unwrap_or(0.0)
+                    ),
+                    None => println!("burn unknown (no closes in the window)"),
+                }
+                for point in &report.points {
+                    println!(
+                        "{}  scope {:>4}  done {:>4}  left {:>4}  ideal {:>4}",
+                        point.date, point.scope, point.done, point.remaining, point.ideal_remaining
+                    );
+                }
+            }
             Ok(())
         }
         Command::ImportBd {

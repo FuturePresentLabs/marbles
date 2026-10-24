@@ -27,3 +27,5 @@ pub mod types;
 pub mod webhook;
 
 pub use db::{Db, Error};
+
+pub mod report;

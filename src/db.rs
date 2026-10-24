@@ -24,6 +24,18 @@ CREATE TABLE IF NOT EXISTS project(
   policy_json TEXT NOT NULL DEFAULT '{}',
   created_at  INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS folder(
+  slug       TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,
+  parent     TEXT REFERENCES folder(slug),
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS project_folder(
+  project     TEXT PRIMARY KEY REFERENCES project(slug) ON DELETE CASCADE,
+  folder      TEXT NOT NULL REFERENCES folder(slug),
+  assigned_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS project_folder_folder ON project_folder(folder);
 CREATE TABLE IF NOT EXISTS issue(
   id           TEXT PRIMARY KEY,
   project      TEXT NOT NULL REFERENCES project(slug),
@@ -115,6 +127,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub trait Store: Send + Sync {
     fn ensure_project(&self, slug: &str, root: &str, prefix: &str) -> Result<()>;
     fn projects(&self) -> Result<Vec<(String, String, String)>>;
+    fn ensure_folder(&self, folder: &Folder, at: i64) -> Result<()>;
+    fn set_project_folder(&self, project: &str, folder: Option<&str>, at: i64) -> Result<()>;
+    fn folder_view(&self) -> Result<FolderView>;
     fn pending_events(&self, at: i64, limit: usize) -> Result<Vec<OutboundEvent>>;
     fn mark_event_delivered(&self, seq: i64, at: i64) -> Result<()>;
     fn mark_event_failed(&self, seq: i64, next_attempt_at: i64, error: &str) -> Result<()>;
@@ -432,6 +447,144 @@ impl Db {
         Ok(out)
     }
 
+    // ---- folders ----
+
+    /// Create or rename a folder. Folders may nest, but the parent chain is checked
+    /// before the write so a rename cannot make the tree cyclic.
+    pub fn ensure_folder(&self, folder: &Folder, at: i64) -> Result<()> {
+        let slug = folder.slug.trim();
+        if slug.is_empty() {
+            return Err(Error::Bad("folder slug is empty".into()));
+        }
+        let name = folder.name.trim();
+        if name.is_empty() {
+            return Err(Error::Bad("folder name is empty".into()));
+        }
+        let parent = folder
+            .parent
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+        self.tx(|tx| {
+            if let Some(parent) = parent {
+                if parent == slug {
+                    return Err(Error::Bad("a folder cannot be its own parent".into()));
+                }
+                let exists: Option<String> = tx
+                    .query_row(
+                        "SELECT slug FROM folder WHERE slug = ?1",
+                        params![parent],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if exists.is_none() {
+                    return Err(Error::Bad(format!("no folder {parent}")));
+                }
+                // If `slug` is already an ancestor of `parent`, attaching parent under slug
+                // would close a cycle. Walk the parent chain and look for slug.
+                let cycle: Option<String> = tx
+                    .query_row(
+                        "WITH RECURSIVE ancestors(slug) AS (
+                             SELECT ?1
+                             UNION
+                             SELECT f.parent FROM folder f
+                               JOIN ancestors a ON f.slug = a.slug
+                              WHERE f.parent IS NOT NULL
+                         )
+                         SELECT slug FROM ancestors WHERE slug = ?2 LIMIT 1",
+                        params![parent, slug],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if cycle.is_some() {
+                    return Err(Error::Bad(format!(
+                        "folder {slug} would become a descendant of itself"
+                    )));
+                }
+            }
+            tx.execute(
+                "INSERT INTO folder(slug, name, parent, created_at) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(slug) DO UPDATE SET name = excluded.name, parent = excluded.parent",
+                params![slug, name, parent, at],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Put a project in a folder, or unfile it with `None`.
+    pub fn set_project_folder(&self, project: &str, folder: Option<&str>, at: i64) -> Result<()> {
+        self.tx(|tx| {
+            let exists: Option<String> = tx
+                .query_row(
+                    "SELECT slug FROM project WHERE slug = ?1",
+                    params![project],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if exists.is_none() {
+                return Err(Error::NoProject(project.to_string()));
+            }
+            match folder.map(str::trim).filter(|f| !f.is_empty()) {
+                Some(folder) => {
+                    let exists: Option<String> = tx
+                        .query_row(
+                            "SELECT slug FROM folder WHERE slug = ?1",
+                            params![folder],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    if exists.is_none() {
+                        return Err(Error::Bad(format!("no folder {folder}")));
+                    }
+                    tx.execute(
+                        "INSERT INTO project_folder(project, folder, assigned_at)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(project) DO UPDATE SET
+                           folder = excluded.folder, assigned_at = excluded.assigned_at",
+                        params![project, folder, at],
+                    )?;
+                }
+                None => {
+                    tx.execute(
+                        "DELETE FROM project_folder WHERE project = ?1",
+                        params![project],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn folder_view(&self) -> Result<FolderView> {
+        let mut out = FolderView::default();
+        self.query(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT slug, name, parent, created_at FROM folder ORDER BY name, slug")?;
+            out.folders = stmt
+                .query_map([], |r| {
+                    Ok(Folder {
+                        slug: r.get(0)?,
+                        name: r.get(1)?,
+                        parent: r.get(2)?,
+                        created_at: r.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut stmt =
+                conn.prepare("SELECT project, folder FROM project_folder ORDER BY project")?;
+            out.projects = stmt
+                .query_map([], |r| {
+                    Ok(ProjectFolder {
+                        project: r.get(0)?,
+                        folder: r.get(1)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     pub fn pending_events(&self, at: i64, limit: usize) -> Result<Vec<OutboundEvent>> {
         let mut out = Vec::new();
         self.query(|conn| {
@@ -513,6 +666,24 @@ impl Db {
         let mut created_id = String::new();
         self.tx(|tx| {
             let prefix = self.prefix_for(tx, &project)?;
+            if let Some(parent) = spec.parent.as_deref() {
+                let parent_project: Option<String> = tx
+                    .query_row(
+                        "SELECT project FROM issue WHERE id = ?1",
+                        params![parent],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                match parent_project {
+                    None => return Err(Error::NotFound(parent.to_string())),
+                    Some(p) if p != project => {
+                        return Err(Error::Bad(format!(
+                            "parent {parent} belongs to project {p}, not {project}; hierarchy is project-local (use a dependency edge for cross-project blockers)"
+                        )))
+                    }
+                    Some(_) => {}
+                }
+            }
             let id = match &spec.id {
                 Some(id) => {
                     let exists: Option<String> = tx
@@ -1171,6 +1342,15 @@ impl Store for Db {
     }
     fn projects(&self) -> Result<Vec<(String, String, String)>> {
         Db::projects(self)
+    }
+    fn ensure_folder(&self, folder: &Folder, at: i64) -> Result<()> {
+        Db::ensure_folder(self, folder, at)
+    }
+    fn set_project_folder(&self, project: &str, folder: Option<&str>, at: i64) -> Result<()> {
+        Db::set_project_folder(self, project, folder, at)
+    }
+    fn folder_view(&self) -> Result<FolderView> {
+        Db::folder_view(self)
     }
     fn pending_events(&self, at: i64, limit: usize) -> Result<Vec<OutboundEvent>> {
         Db::pending_events(self, at, limit)
