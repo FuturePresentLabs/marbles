@@ -370,6 +370,130 @@ impl Store for PostgresStore {
         })
     }
 
+    fn ensure_folder(&self, folder: &Folder, at: i64) -> Result<()> {
+        let slug = folder.slug.trim();
+        if slug.is_empty() {
+            return Err(Error::Bad("folder slug is empty".into()));
+        }
+        let name = folder.name.trim();
+        if name.is_empty() {
+            return Err(Error::Bad("folder name is empty".into()));
+        }
+        let parent = folder
+            .parent
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+        self.transaction(|tx| {
+            if let Some(parent) = parent {
+                if parent == slug {
+                    return Err(Error::Bad("a folder cannot be its own parent".into()));
+                }
+                let exists = tx.query_opt(
+                    "SELECT slug FROM marbles_folder WHERE company_id=$1 AND slug=$2",
+                    &[&self.company_id, &parent],
+                )?;
+                if exists.is_none() {
+                    return Err(Error::Bad(format!("no folder {parent}")));
+                }
+                let cycle = tx.query_opt(
+                    "WITH RECURSIVE ancestors(slug) AS (
+                         SELECT $2::text
+                         UNION
+                         SELECT f.parent FROM marbles_folder f
+                           JOIN ancestors a ON f.slug = a.slug
+                          WHERE f.company_id = $1 AND f.parent IS NOT NULL
+                     )
+                     SELECT slug FROM ancestors WHERE slug = $3 LIMIT 1",
+                    &[&self.company_id, &parent, &slug],
+                )?;
+                if cycle.is_some() {
+                    return Err(Error::Bad(format!(
+                        "folder {slug} would become a descendant of itself"
+                    )));
+                }
+            }
+            tx.execute(
+                "INSERT INTO marbles_folder(company_id,slug,name,parent,created_at)
+                 VALUES($1,$2,$3,$4,$5)
+                 ON CONFLICT(company_id,slug) DO UPDATE SET
+                   name=excluded.name, parent=excluded.parent",
+                &[&self.company_id, &slug, &name, &parent, &at],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn set_project_folder(&self, project: &str, folder: Option<&str>, at: i64) -> Result<()> {
+        self.transaction(|tx| {
+            let exists = tx.query_opt(
+                "SELECT slug FROM marbles_project WHERE company_id=$1 AND slug=$2",
+                &[&self.company_id, &project],
+            )?;
+            if exists.is_none() {
+                return Err(Error::NoProject(project.to_string()));
+            }
+            match folder.map(str::trim).filter(|f| !f.is_empty()) {
+                Some(folder) => {
+                    let exists = tx.query_opt(
+                        "SELECT slug FROM marbles_folder WHERE company_id=$1 AND slug=$2",
+                        &[&self.company_id, &folder],
+                    )?;
+                    if exists.is_none() {
+                        return Err(Error::Bad(format!("no folder {folder}")));
+                    }
+                    tx.execute(
+                        "INSERT INTO marbles_project_folder(company_id,project,folder,assigned_at)
+                         VALUES($1,$2,$3,$4)
+                         ON CONFLICT(company_id,project) DO UPDATE SET
+                           folder=excluded.folder, assigned_at=excluded.assigned_at",
+                        &[&self.company_id, &project, &folder, &at],
+                    )?;
+                }
+                None => {
+                    tx.execute(
+                        "DELETE FROM marbles_project_folder WHERE company_id=$1 AND project=$2",
+                        &[&self.company_id, &project],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn folder_view(&self) -> Result<FolderView> {
+        self.with_client(|client| {
+            let mut out = FolderView::default();
+            out.folders = client
+                .query(
+                    "SELECT slug,name,parent,created_at FROM marbles_folder
+                     WHERE company_id=$1 ORDER BY name,slug",
+                    &[&self.company_id],
+                )?
+                .into_iter()
+                .map(|r| Folder {
+                    slug: r.get(0),
+                    name: r.get(1),
+                    parent: r.get(2),
+                    created_at: r.get(3),
+                })
+                .collect();
+            out.projects = client
+                .query(
+                    "SELECT project,folder FROM marbles_project_folder
+                     WHERE company_id=$1 ORDER BY project",
+                    &[&self.company_id],
+                )?
+                .into_iter()
+                .map(|r| ProjectFolder {
+                    project: r.get(0),
+                    folder: r.get(1),
+                })
+                .collect();
+            Ok(out)
+        })
+    }
+
     fn pending_events(&self, at: i64, limit: usize) -> Result<Vec<OutboundEvent>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         self.with_client(|client| {
@@ -401,6 +525,23 @@ impl Store for PostgresStore {
             .unwrap_or(at + self.policy.creation_grace_seconds);
         self.transaction(|tx| {
             let prefix: String = tx.query_opt("SELECT prefix FROM marbles_project WHERE company_id=$1 AND slug=$2", &[&self.company_id,&project])?.ok_or_else(|| Error::NoProject(project.clone()))?.get(0);
+            if let Some(parent) = spec.parent.as_deref() {
+                let parent_project: Option<String> = tx
+                    .query_opt(
+                        "SELECT project FROM marbles_issue WHERE company_id=$1 AND id=$2",
+                        &[&self.company_id, &parent],
+                    )?
+                    .map(|r| r.get(0));
+                match parent_project {
+                    None => return Err(Error::NotFound(parent.to_string())),
+                    Some(p) if p != project => {
+                        return Err(Error::Bad(format!(
+                            "parent {parent} belongs to project {p}, not {project}; hierarchy is project-local (use a dependency edge for cross-project blockers)"
+                        )))
+                    }
+                    Some(_) => {}
+                }
+            }
             let id = if let Some(id) = &spec.id {
                 if tx.query_opt("SELECT 1 FROM marbles_issue WHERE company_id=$1 AND id=$2", &[&self.company_id,id])?.is_some() { return Err(Error::Bad(format!("issue id {id} already exists"))); }
                 id.clone()

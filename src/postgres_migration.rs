@@ -138,6 +138,7 @@ fn migrate_company(
     }
 
     copy_projects(&sqlite, &mut tx, company_id)?;
+    copy_folders(&sqlite, &mut tx, company_id)?;
     copy_issues(&sqlite, &mut tx, company_id)?;
     copy_dependencies(&sqlite, &mut tx, company_id)?;
     copy_history(&sqlite, &mut tx, company_id)?;
@@ -207,6 +208,63 @@ fn copy_projects(
             row.get(4).map_err(|e| e.to_string())?,
         );
         tx.execute("INSERT INTO marbles_project(company_id,slug,root,prefix,policy_json,created_at) VALUES($1,$2,$3,$4,$5,$6)", &[&company, &values.0, &values.1, &values.2, &values.3, &values.4]).map_err(|e| format!("copying project {}: {e}", values.0))?;
+    }
+    Ok(())
+}
+
+fn table_exists(sqlite: &Connection, name: &str) -> Result<bool, String> {
+    let count: i64 = sqlite
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            [name],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("checking SQLite table {name}: {e}"))?;
+    Ok(count > 0)
+}
+
+/// Folders are optional in source stores created before the feature. Copy them when present so a
+/// local store promoted to PostgreSQL keeps its project grouping.
+fn copy_folders(
+    sqlite: &Connection,
+    tx: &mut Transaction<'_>,
+    company: &str,
+) -> Result<(), String> {
+    if !table_exists(sqlite, "folder")? {
+        return Ok(());
+    }
+    let mut stmt = sqlite
+        .prepare("SELECT slug, name, parent, created_at FROM folder ORDER BY slug")
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let slug: String = row.get(0).map_err(|e| e.to_string())?;
+        let name: String = row.get(1).map_err(|e| e.to_string())?;
+        let parent: Option<String> = row.get(2).map_err(|e| e.to_string())?;
+        let created_at: i64 = row.get(3).map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO marbles_folder(company_id,slug,name,parent,created_at)
+             VALUES($1,$2,$3,$4,$5)",
+            &[&company, &slug, &name, &parent, &created_at],
+        )
+        .map_err(|e| format!("copying folder {slug}: {e}"))?;
+    }
+    if table_exists(sqlite, "project_folder")? {
+        let mut stmt = sqlite
+            .prepare("SELECT project, folder, assigned_at FROM project_folder ORDER BY project")
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let project: String = row.get(0).map_err(|e| e.to_string())?;
+            let folder: String = row.get(1).map_err(|e| e.to_string())?;
+            let assigned_at: i64 = row.get(2).map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO marbles_project_folder(company_id,project,folder,assigned_at)
+                 VALUES($1,$2,$3,$4)",
+                &[&company, &project, &folder, &assigned_at],
+            )
+            .map_err(|e| format!("copying project folder {project}: {e}"))?;
+        }
     }
     Ok(())
 }

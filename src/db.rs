@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 
 use crate::time::WorkWeek;
 use crate::types::*;
@@ -24,6 +25,18 @@ CREATE TABLE IF NOT EXISTS project(
   policy_json TEXT NOT NULL DEFAULT '{}',
   created_at  INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS folder(
+  slug       TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,
+  parent     TEXT REFERENCES folder(slug),
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS project_folder(
+  project     TEXT PRIMARY KEY REFERENCES project(slug) ON DELETE CASCADE,
+  folder      TEXT NOT NULL REFERENCES folder(slug),
+  assigned_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS project_folder_folder ON project_folder(folder);
 CREATE TABLE IF NOT EXISTS issue(
   id           TEXT PRIMARY KEY,
   project      TEXT NOT NULL REFERENCES project(slug),
@@ -115,6 +128,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub trait Store: Send + Sync {
     fn ensure_project(&self, slug: &str, root: &str, prefix: &str) -> Result<()>;
     fn projects(&self) -> Result<Vec<(String, String, String)>>;
+    fn ensure_folder(&self, folder: &Folder, at: i64) -> Result<()>;
+    fn set_project_folder(&self, project: &str, folder: Option<&str>, at: i64) -> Result<()>;
+    fn folder_view(&self) -> Result<FolderView>;
     fn pending_events(&self, at: i64, limit: usize) -> Result<Vec<OutboundEvent>>;
     fn mark_event_delivered(&self, seq: i64, at: i64) -> Result<()>;
     fn mark_event_failed(&self, seq: i64, next_attempt_at: i64, error: &str) -> Result<()>;
@@ -163,6 +179,36 @@ pub struct Db {
     conn: Mutex<Connection>,
     policy: Policy,
     week: WorkWeek,
+    /// The on-disk path, when there is one. `None` for in-memory test stores.
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupReport {
+    pub path: String,
+    pub bytes: u64,
+    pub created_at: i64,
+    pub projects: i64,
+    pub issues: i64,
+    pub deps: i64,
+    pub history: i64,
+    pub integrity: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoctorReport {
+    pub integrity: String,
+    pub quick_check: String,
+    pub foreign_key_violations: Vec<String>,
+    pub journal_mode: String,
+    pub synchronous: String,
+    pub db_bytes: u64,
+    pub wal_bytes: u64,
+    pub projects: i64,
+    pub issues: i64,
+    pub deps: i64,
+    pub history: i64,
+    pub outbox_pending: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -308,6 +354,18 @@ fn short_suffix() -> String {
         .collect()
 }
 
+fn count(conn: &Connection, table: &str) -> Result<i64> {
+    Ok(conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?)
+}
+
+fn count_where(conn: &Connection, table: &str, predicate: &str) -> Result<i64> {
+    Ok(conn.query_row(
+        &format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"),
+        [],
+        |r| r.get(0),
+    )?)
+}
+
 impl Db {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -317,7 +375,9 @@ impl Db {
         }
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // The tracker acknowledges mutations to agents; a power loss must not lose the
+        // last claim/close after the client has a receipt. FULL is the durable WAL setting.
+        conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // WAL serializes writers correctly but returns SQLITE_BUSY immediately; give contended
         // writes (sweeper vs daemon tick vs CLI on one machine) a few seconds to queue.
@@ -327,6 +387,7 @@ impl Db {
             conn: Mutex::new(conn),
             policy: Policy::default(),
             week: WorkWeek::default(),
+            path: Some(path.to_path_buf()),
         })
     }
 
@@ -337,6 +398,7 @@ impl Db {
             conn: Mutex::new(conn),
             policy: Policy::default(),
             week: WorkWeek::default(),
+            path: None,
         })
     }
 
@@ -432,6 +494,144 @@ impl Db {
         Ok(out)
     }
 
+    // ---- folders ----
+
+    /// Create or rename a folder. Folders may nest, but the parent chain is checked
+    /// before the write so a rename cannot make the tree cyclic.
+    pub fn ensure_folder(&self, folder: &Folder, at: i64) -> Result<()> {
+        let slug = folder.slug.trim();
+        if slug.is_empty() {
+            return Err(Error::Bad("folder slug is empty".into()));
+        }
+        let name = folder.name.trim();
+        if name.is_empty() {
+            return Err(Error::Bad("folder name is empty".into()));
+        }
+        let parent = folder
+            .parent
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+        self.tx(|tx| {
+            if let Some(parent) = parent {
+                if parent == slug {
+                    return Err(Error::Bad("a folder cannot be its own parent".into()));
+                }
+                let exists: Option<String> = tx
+                    .query_row(
+                        "SELECT slug FROM folder WHERE slug = ?1",
+                        params![parent],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if exists.is_none() {
+                    return Err(Error::Bad(format!("no folder {parent}")));
+                }
+                // If `slug` is already an ancestor of `parent`, attaching parent under slug
+                // would close a cycle. Walk the parent chain and look for slug.
+                let cycle: Option<String> = tx
+                    .query_row(
+                        "WITH RECURSIVE ancestors(slug) AS (
+                             SELECT ?1
+                             UNION
+                             SELECT f.parent FROM folder f
+                               JOIN ancestors a ON f.slug = a.slug
+                              WHERE f.parent IS NOT NULL
+                         )
+                         SELECT slug FROM ancestors WHERE slug = ?2 LIMIT 1",
+                        params![parent, slug],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if cycle.is_some() {
+                    return Err(Error::Bad(format!(
+                        "folder {slug} would become a descendant of itself"
+                    )));
+                }
+            }
+            tx.execute(
+                "INSERT INTO folder(slug, name, parent, created_at) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(slug) DO UPDATE SET name = excluded.name, parent = excluded.parent",
+                params![slug, name, parent, at],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Put a project in a folder, or unfile it with `None`.
+    pub fn set_project_folder(&self, project: &str, folder: Option<&str>, at: i64) -> Result<()> {
+        self.tx(|tx| {
+            let exists: Option<String> = tx
+                .query_row(
+                    "SELECT slug FROM project WHERE slug = ?1",
+                    params![project],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if exists.is_none() {
+                return Err(Error::NoProject(project.to_string()));
+            }
+            match folder.map(str::trim).filter(|f| !f.is_empty()) {
+                Some(folder) => {
+                    let exists: Option<String> = tx
+                        .query_row(
+                            "SELECT slug FROM folder WHERE slug = ?1",
+                            params![folder],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    if exists.is_none() {
+                        return Err(Error::Bad(format!("no folder {folder}")));
+                    }
+                    tx.execute(
+                        "INSERT INTO project_folder(project, folder, assigned_at)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(project) DO UPDATE SET
+                           folder = excluded.folder, assigned_at = excluded.assigned_at",
+                        params![project, folder, at],
+                    )?;
+                }
+                None => {
+                    tx.execute(
+                        "DELETE FROM project_folder WHERE project = ?1",
+                        params![project],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn folder_view(&self) -> Result<FolderView> {
+        let mut out = FolderView::default();
+        self.query(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT slug, name, parent, created_at FROM folder ORDER BY name, slug")?;
+            out.folders = stmt
+                .query_map([], |r| {
+                    Ok(Folder {
+                        slug: r.get(0)?,
+                        name: r.get(1)?,
+                        parent: r.get(2)?,
+                        created_at: r.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut stmt =
+                conn.prepare("SELECT project, folder FROM project_folder ORDER BY project")?;
+            out.projects = stmt
+                .query_map([], |r| {
+                    Ok(ProjectFolder {
+                        project: r.get(0)?,
+                        folder: r.get(1)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     pub fn pending_events(&self, at: i64, limit: usize) -> Result<Vec<OutboundEvent>> {
         let mut out = Vec::new();
         self.query(|conn| {
@@ -500,6 +700,101 @@ impl Db {
         .ok_or_else(|| Error::NotFound(id.to_string()))
     }
 
+    // ---- durability ----
+
+    /// Create an atomic, compact snapshot with `VACUUM INTO`. The target must not exist; a
+    /// backup never overwrites a previous one by accident. The source is checked first so a
+    /// corrupted database is not laundered into a second file.
+    pub fn backup(&self, target: &Path) -> Result<BackupReport> {
+        if target.exists() {
+            return Err(Error::Bad(format!(
+                "backup target {} already exists; choose a new path",
+                target.display()
+            )));
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::Bad(format!("creating {}: {e}", parent.display())))?;
+        }
+        let created_at = now();
+        let target_sql = target.to_string_lossy().replace('\'', "''");
+        let conn = self.conn.lock().expect("store lock poisoned");
+        let integrity: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        if integrity != "ok" {
+            return Err(Error::Bad(format!(
+                "refusing to back up a database whose integrity_check is {integrity:?}"
+            )));
+        }
+        let projects = count(&conn, "project")?;
+        let issues = count(&conn, "issue")?;
+        let deps = count(&conn, "dep")?;
+        let history = count(&conn, "history")?;
+        conn.execute_batch(&format!("VACUUM INTO '{target_sql}'"))?;
+        drop(conn);
+        let bytes = std::fs::metadata(target).map(|m| m.len()).unwrap_or(0);
+        Ok(BackupReport {
+            path: target.display().to_string(),
+            bytes,
+            created_at,
+            projects,
+            issues,
+            deps,
+            history,
+            integrity,
+        })
+    }
+
+    /// Report integrity, settings, row counts, and on-disk/WAL size without mutating anything.
+    pub fn doctor(&self) -> Result<DoctorReport> {
+        let conn = self.conn.lock().expect("store lock poisoned");
+        let integrity: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        let quick_check: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+        let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+        let sync: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
+        let synchronous = match sync {
+            0 => "OFF",
+            1 => "NORMAL",
+            2 => "FULL",
+            3 => "EXTRA",
+            _ => "UNKNOWN",
+        }
+        .to_string();
+        let mut foreign_key_violations = Vec::new();
+        let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let table: String = row.get(0)?;
+            let rowid: Option<i64> = row.get(1)?;
+            let parent: String = row.get(2)?;
+            foreign_key_violations.push(format!("{table} row {rowid:?} -> {parent}"));
+        }
+        let outbox_pending = count_where(&conn, "outbound_event", "delivered_at IS NULL")?;
+        let (db_bytes, wal_bytes) = match &self.path {
+            Some(path) => {
+                let db = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                let wal = std::fs::metadata(format!("{}-wal", path.display()))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                (db, wal)
+            }
+            None => (0, 0),
+        };
+        Ok(DoctorReport {
+            integrity,
+            quick_check,
+            foreign_key_violations,
+            journal_mode,
+            synchronous,
+            db_bytes,
+            wal_bytes,
+            projects: count(&conn, "project")?,
+            issues: count(&conn, "issue")?,
+            deps: count(&conn, "dep")?,
+            history: count(&conn, "history")?,
+            outbox_pending,
+        })
+    }
+
     // ---- issues ----
 
     pub fn create(&self, spec: &NewIssue, at: i64) -> Result<String> {
@@ -513,6 +808,24 @@ impl Db {
         let mut created_id = String::new();
         self.tx(|tx| {
             let prefix = self.prefix_for(tx, &project)?;
+            if let Some(parent) = spec.parent.as_deref() {
+                let parent_project: Option<String> = tx
+                    .query_row(
+                        "SELECT project FROM issue WHERE id = ?1",
+                        params![parent],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                match parent_project {
+                    None => return Err(Error::NotFound(parent.to_string())),
+                    Some(p) if p != project => {
+                        return Err(Error::Bad(format!(
+                            "parent {parent} belongs to project {p}, not {project}; hierarchy is project-local (use a dependency edge for cross-project blockers)"
+                        )))
+                    }
+                    Some(_) => {}
+                }
+            }
             let id = match &spec.id {
                 Some(id) => {
                     let exists: Option<String> = tx
@@ -1171,6 +1484,15 @@ impl Store for Db {
     }
     fn projects(&self) -> Result<Vec<(String, String, String)>> {
         Db::projects(self)
+    }
+    fn ensure_folder(&self, folder: &Folder, at: i64) -> Result<()> {
+        Db::ensure_folder(self, folder, at)
+    }
+    fn set_project_folder(&self, project: &str, folder: Option<&str>, at: i64) -> Result<()> {
+        Db::set_project_folder(self, project, folder, at)
+    }
+    fn folder_view(&self) -> Result<FolderView> {
+        Db::folder_view(self)
     }
     fn pending_events(&self, at: i64, limit: usize) -> Result<Vec<OutboundEvent>> {
         Db::pending_events(self, at, limit)
