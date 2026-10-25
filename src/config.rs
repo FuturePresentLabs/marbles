@@ -78,6 +78,12 @@ pub fn identity_path() -> PathBuf {
     state_dir().join("store-identity.toml")
 }
 
+/// Local pins for remote stores (`name`, locator, verified `(store_id, key_id, public_key)`).
+/// Client state only: it never authorizes a write and never travels over the tracker API.
+pub fn remotes_path() -> PathBuf {
+    state_dir().join("remotes.json")
+}
+
 pub fn server_config() -> ServerConfig {
     match std::fs::read_to_string(server_config_path()) {
         Ok(text) => toml::from_str(&text).expect("server.toml must parse if present"),

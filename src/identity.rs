@@ -528,6 +528,500 @@ fn restrict_permissions(_path: &Path) -> Result<(), IdentityError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------------------------
+// Pinned remote registry
+// ---------------------------------------------------------------------------------------------
+//
+// A remote is *not* a URL that is trusted because it answered. It is a local pin of
+// `(store_id, key_id, public_key)` plus the locator we happen to use today. `mb remote add`
+// verifies the `marbles.store/1` descriptor before it writes anything, later aggregation verifies
+// every remote assertion against the pin, and `mb remote rotate` extends the pin with a named
+// overlap window. Nothing here can grant a write: the registry is client-side read-only state.
+
+pub const REMOTE_REGISTRY_VERSION: u32 = 1;
+const DESCRIPTOR_FETCH_TIMEOUT_SECONDS: u64 = 10;
+const DESCRIPTOR_FETCH_CONNECT_SECONDS: u64 = 3;
+
+#[derive(Debug, thiserror::Error)]
+pub enum RemoteRegistryError {
+    #[error(
+        "remote name {0:?} is not valid (must be non-empty, with no whitespace or '/' characters)"
+    )]
+    InvalidName(String),
+    #[error("remote endpoint {0:?} is not valid (must be a non-empty URL or host:port)")]
+    InvalidEndpoint(String),
+    #[error(
+        "remote {0:?} is not registered; run `mb remote add <name> <endpoint> --descriptor <src>`"
+    )]
+    NotFound(String),
+    #[error(
+        "remote {0:?} is already pinned; use `mb remote rotate {0} --descriptor <src>` to change its key"
+    )]
+    Exists(String),
+    #[error("remote registry {path} is unreadable: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("remote registry {path} is unwritable: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("remote registry {path} is not valid JSON: {source}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error(
+        "remote registry version {found} is newer than supported version {supported}; upgrade marbles"
+    )]
+    UnsupportedVersion { found: u32, supported: u32 },
+    #[error("reading descriptor {target}: {source}")]
+    DescriptorRead {
+        target: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("fetching descriptor {url}: {reason}")]
+    DescriptorFetch { url: String, reason: String },
+    #[error("descriptor has an empty store_id; refusing to pin it")]
+    EmptyStoreId,
+    #[error("descriptor has an empty key_id; refusing to pin it")]
+    EmptyKeyId,
+    #[error("descriptor public key {0:?} is not a 32-byte Ed25519 public key")]
+    BadPublicKey(String),
+    #[error("remote registry JSON failure: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Identity(#[from] IdentityError),
+}
+
+/// One retired key that still verifies until its overlap window ends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteOverlapKey {
+    pub key_id: String,
+    pub public_key: String,
+    /// Exclusive instant after which this key is rejected (rotation overlap end).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<i64>,
+}
+
+/// A pinned remote store: its Ed25519 identity plus the locator used to talk to it.
+///
+/// `endpoint` is only a locator; trust lives in `store_id`/`key_id`/`public_key`, so a moved or
+/// compromised endpoint cannot make an assertion look like it came from this store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteRecord {
+    pub name: String,
+    pub endpoint: String,
+    pub store_id: String,
+    pub display_name: String,
+    /// Currently signing key for this store, as verified from its descriptor.
+    pub key_id: String,
+    /// base64url (unpadded) raw 32-byte Ed25519 public key for `key_id`.
+    pub public_key: String,
+    /// Exclusive instant after which `key_id` is no longer trusted (rotation overlap end).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<i64>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    pub added_at: i64,
+    pub updated_at: i64,
+    /// Keys retired by a rotation that may still verify inside their overlap window.
+    #[serde(default)]
+    pub overlap_keys: Vec<RemoteOverlapKey>,
+}
+
+impl RemoteRecord {
+    pub fn active_pin(&self) -> PinnedKey {
+        PinnedKey {
+            store_id: self.store_id.clone(),
+            key_id: self.key_id.clone(),
+            public_key: self.public_key.clone(),
+            valid_until: self.valid_until,
+        }
+    }
+
+    /// Every key this pin currently trusts, active key first, then overlap keys.
+    pub fn pins(&self) -> Vec<PinnedKey> {
+        let mut pins = vec![self.active_pin()];
+        pins.extend(self.overlap_keys.iter().map(|key| PinnedKey {
+            store_id: self.store_id.clone(),
+            key_id: key.key_id.clone(),
+            public_key: key.public_key.clone(),
+            valid_until: key.valid_until,
+        }));
+        pins
+    }
+
+    /// Verify a remote descriptor offline against this pin at instant `now`.
+    ///
+    /// A descriptor signed by a key we never pinned is a key mismatch, not a hint to trust the
+    /// endpoint. Expired overlap keys fail with [`IdentityError::KeyRetired`].
+    pub fn verify(
+        &self,
+        descriptor_json: &str,
+        now: i64,
+    ) -> Result<StoreDescriptor, RemoteRegistryError> {
+        let descriptor = StoreDescriptor::from_json(descriptor_json)?;
+        if descriptor.store_id != self.store_id {
+            return Err(IdentityError::StoreMismatch {
+                expected: self.store_id.clone(),
+                found: descriptor.store_id.clone(),
+            }
+            .into());
+        }
+        let pin = self
+            .pins()
+            .into_iter()
+            .find(|pin| pin.key_id == descriptor.key_id)
+            .ok_or_else(|| IdentityError::KeyMismatch {
+                expected: self.key_id.clone(),
+                found: descriptor.key_id.clone(),
+            })?;
+        Ok(verify_descriptor(&descriptor, &pin, now)?)
+    }
+
+    /// Capabilities this pin grants for cross-store access.
+    ///
+    /// Always empty: a pin authenticates a remote's assertions for read-only aggregation and can
+    /// never authorize a write. Feature code must not widen this.
+    pub fn granted_capabilities(&self) -> &'static [&'static str] {
+        &[]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteRegistry {
+    pub version: u32,
+    #[serde(default)]
+    pub remotes: Vec<RemoteRecord>,
+}
+
+impl Default for RemoteRegistry {
+    fn default() -> Self {
+        Self {
+            version: REMOTE_REGISTRY_VERSION,
+            remotes: Vec::new(),
+        }
+    }
+}
+
+impl RemoteRegistry {
+    /// Load the registry at `path`. A missing file is an empty registry (nothing pinned yet).
+    pub fn load(path: &Path) -> Result<Self, RemoteRegistryError> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(source) => {
+                return Err(RemoteRegistryError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        let registry: Self =
+            serde_json::from_str(&text).map_err(|source| RemoteRegistryError::Parse {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if registry.version > REMOTE_REGISTRY_VERSION {
+            return Err(RemoteRegistryError::UnsupportedVersion {
+                found: registry.version,
+                supported: REMOTE_REGISTRY_VERSION,
+            });
+        }
+        Ok(registry)
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), RemoteRegistryError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| RemoteRegistryError::Write {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let text = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, format!("{text}\n")).map_err(|source| RemoteRegistryError::Write {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    pub fn get(&self, name: &str) -> Option<&RemoteRecord> {
+        self.remotes.iter().find(|record| record.name == name)
+    }
+
+    pub fn list(&self) -> &[RemoteRecord] {
+        &self.remotes
+    }
+
+    /// Pin a remote after verifying its descriptor. Nothing is written if verification fails.
+    ///
+    /// First contact is trust-on-first-use for the key the descriptor carries: the descriptor's
+    /// own signature is checked (so the sender holds the private key) and the store/key/public-key
+    /// triple is recorded verbatim. `--public-key` on `mb remote rotate` is the out-of-band path
+    /// for moving an existing pin to a new key.
+    pub fn add(
+        &mut self,
+        name: &str,
+        endpoint: &str,
+        descriptor_json: &str,
+        now: i64,
+    ) -> Result<&RemoteRecord, RemoteRegistryError> {
+        let name = validate_remote_name(name)?;
+        let endpoint = validate_endpoint(endpoint)?;
+        if self.get(name).is_some() {
+            return Err(RemoteRegistryError::Exists(name.to_string()));
+        }
+        let descriptor = verify_self_signed_descriptor(descriptor_json, now)?;
+        self.remotes.push(RemoteRecord {
+            name: name.to_string(),
+            endpoint: endpoint.to_string(),
+            store_id: descriptor.store_id,
+            display_name: descriptor.display_name,
+            key_id: descriptor.key_id,
+            public_key: descriptor.public_key,
+            valid_until: None,
+            capabilities: descriptor.capabilities,
+            added_at: now,
+            updated_at: now,
+            overlap_keys: Vec::new(),
+        });
+        Ok(self.remotes.last().expect("remote was just pushed"))
+    }
+
+    /// Remove the local pin only. The remote is never contacted and never mutated.
+    pub fn remove(&mut self, name: &str) -> Result<RemoteRecord, RemoteRegistryError> {
+        let index = self
+            .remotes
+            .iter()
+            .position(|record| record.name == name)
+            .ok_or_else(|| RemoteRegistryError::NotFound(name.to_string()))?;
+        Ok(self.remotes.remove(index))
+    }
+
+    /// Move a pin to the key in `descriptor_json`, keeping the old key valid until the overlap
+    /// window ends.
+    ///
+    /// The descriptor must belong to the pinned `store_id` and must be signed by the key it
+    /// advertises (proof of possession). The endpoint is the operator's locator and is never
+    /// rewritten from a descriptor, so a rotation cannot redirect traffic. When
+    /// `expected_public_key` is given, the new key must match it exactly — that is the
+    /// out-of-band confirmation for a key change.
+    pub fn rotate(
+        &mut self,
+        name: &str,
+        descriptor_json: &str,
+        expected_public_key: Option<&str>,
+        overlap_seconds: i64,
+        now: i64,
+    ) -> Result<RotationRecord, RemoteRegistryError> {
+        let index = self
+            .remotes
+            .iter()
+            .position(|record| record.name == name)
+            .ok_or_else(|| RemoteRegistryError::NotFound(name.to_string()))?;
+        let descriptor = verify_self_signed_descriptor(descriptor_json, now)?;
+        if let Some(expected) = expected_public_key
+            && expected != descriptor.public_key
+        {
+            return Err(IdentityError::PublicKeyMismatch(descriptor.key_id).into());
+        }
+        let record = &mut self.remotes[index];
+        if descriptor.store_id != record.store_id {
+            return Err(IdentityError::StoreMismatch {
+                expected: record.store_id.clone(),
+                found: descriptor.store_id.clone(),
+            }
+            .into());
+        }
+
+        if descriptor.key_id == record.key_id {
+            // Same key re-issued: refresh the advertised metadata, keep the pin unchanged.
+            record.display_name = descriptor.display_name;
+            record.capabilities = descriptor.capabilities;
+            record.updated_at = now;
+            return Ok(RotationRecord {
+                old_key_id: record.key_id.clone(),
+                new_key_id: record.key_id.clone(),
+                rotated_at: now,
+                overlap_until: record.valid_until.unwrap_or(now),
+            });
+        }
+
+        if record
+            .overlap_keys
+            .iter()
+            .any(|key| key.key_id == descriptor.key_id)
+        {
+            return Err(IdentityError::KeyRetired(
+                descriptor.key_id,
+                record.valid_until.unwrap_or(now),
+            )
+            .into());
+        }
+
+        let overlap_until = now.saturating_add(overlap_seconds.max(0));
+        // A second rotation inside the first overlap keeps the earliest retirement instant: an
+        // old key is never resurrected by a later rotation.
+        let old_valid_until = match record.valid_until {
+            Some(existing) => Some(existing.min(overlap_until)),
+            None => Some(overlap_until),
+        };
+        let old_key_id = record.key_id.clone();
+        record.overlap_keys.push(RemoteOverlapKey {
+            key_id: old_key_id.clone(),
+            public_key: record.public_key.clone(),
+            valid_until: old_valid_until,
+        });
+        record.display_name = descriptor.display_name;
+        record.key_id = descriptor.key_id;
+        record.public_key = descriptor.public_key;
+        record.valid_until = None;
+        record.capabilities = descriptor.capabilities;
+        record.updated_at = now;
+        Ok(RotationRecord {
+            old_key_id,
+            new_key_id: record.key_id.clone(),
+            rotated_at: now,
+            overlap_until,
+        })
+    }
+
+    /// Verify a descriptor that claims to come from remote `name`.
+    pub fn verify(
+        &self,
+        name: &str,
+        descriptor_json: &str,
+        now: i64,
+    ) -> Result<StoreDescriptor, RemoteRegistryError> {
+        let record = self
+            .get(name)
+            .ok_or_else(|| RemoteRegistryError::NotFound(name.to_string()))?;
+        record.verify(descriptor_json, now)
+    }
+}
+
+fn validate_remote_name(name: &str) -> Result<&str, RemoteRegistryError> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().any(char::is_whitespace) || name.contains('/') {
+        return Err(RemoteRegistryError::InvalidName(name.to_string()));
+    }
+    Ok(name)
+}
+
+fn validate_endpoint(endpoint: &str) -> Result<&str, RemoteRegistryError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Err(RemoteRegistryError::InvalidEndpoint(endpoint.to_string()));
+    }
+    Ok(endpoint)
+}
+
+/// Parse a descriptor and verify its self-signature, i.e. that whoever served it holds the private
+/// key it advertises and that the schema/key material is well formed.
+fn verify_self_signed_descriptor(
+    descriptor_json: &str,
+    now: i64,
+) -> Result<StoreDescriptor, RemoteRegistryError> {
+    let descriptor = StoreDescriptor::from_json(descriptor_json)?;
+    if descriptor.store_id.trim().is_empty() {
+        return Err(RemoteRegistryError::EmptyStoreId);
+    }
+    if descriptor.key_id.trim().is_empty() {
+        return Err(RemoteRegistryError::EmptyKeyId);
+    }
+    validate_public_key(&descriptor.key_id, &descriptor.public_key)?;
+    let pin = PinnedKey {
+        store_id: descriptor.store_id.clone(),
+        key_id: descriptor.key_id.clone(),
+        public_key: descriptor.public_key.clone(),
+        valid_until: None,
+    };
+    Ok(verify_descriptor(&descriptor, &pin, now)?)
+}
+
+fn validate_public_key(key_id: &str, encoded: &str) -> Result<(), RemoteRegistryError> {
+    let raw = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| RemoteRegistryError::BadPublicKey(key_id.to_string()))?;
+    if raw.len() != 32 {
+        return Err(RemoteRegistryError::BadPublicKey(key_id.to_string()));
+    }
+    PKey::public_key_from_raw_bytes(&raw, Id::ED25519)
+        .map_err(|_| RemoteRegistryError::BadPublicKey(key_id.to_string()))?;
+    Ok(())
+}
+
+/// Read a descriptor from a file path, or `-` for stdin. Network sources go through
+/// [`descriptor_from_arg`].
+pub fn read_descriptor_source(target: &str) -> Result<String, RemoteRegistryError> {
+    if target == "-" {
+        let mut buffer = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer).map_err(|source| {
+            RemoteRegistryError::DescriptorRead {
+                target: target.to_string(),
+                source,
+            }
+        })?;
+        return Ok(buffer);
+    }
+    std::fs::read_to_string(target).map_err(|source| RemoteRegistryError::DescriptorRead {
+        target: target.to_string(),
+        source,
+    })
+}
+
+/// Load a descriptor from a file path, `-` (stdin), or an `http(s)` URL.
+///
+/// Fetching is transport only: the bytes still have to verify against the pin, so a hostile or
+/// stale endpoint can only produce an error, never a new trusted identity.
+pub async fn descriptor_from_arg(target: &str) -> Result<String, RemoteRegistryError> {
+    let target = target.trim();
+    if target.starts_with("http://") || target.starts_with("https://") {
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(
+                DESCRIPTOR_FETCH_CONNECT_SECONDS,
+            ))
+            .timeout(std::time::Duration::from_secs(
+                DESCRIPTOR_FETCH_TIMEOUT_SECONDS,
+            ))
+            .build()
+            .map_err(|err| RemoteRegistryError::DescriptorFetch {
+                url: target.to_string(),
+                reason: err.to_string(),
+            })?;
+        let response = client.get(target).send().await.map_err(|err| {
+            RemoteRegistryError::DescriptorFetch {
+                url: target.to_string(),
+                reason: err.to_string(),
+            }
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(RemoteRegistryError::DescriptorFetch {
+                url: target.to_string(),
+                reason: format!("HTTP {status}"),
+            });
+        }
+        return response
+            .text()
+            .await
+            .map_err(|err| RemoteRegistryError::DescriptorFetch {
+                url: target.to_string(),
+                reason: err.to_string(),
+            });
+    }
+    read_descriptor_source(target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
