@@ -20,7 +20,10 @@ use marbles::auth::Auth;
 use marbles::client::Client;
 use marbles::config;
 use marbles::db::{CompanyStoreRegistry, CompanyStores, Db, now};
-use marbles::identity::{InitOptions, PinnedKey, StoreIdentity, verify_descriptor_json};
+use marbles::identity::{
+    InitOptions, PinnedKey, RemoteRegistry, StoreIdentity, descriptor_from_arg,
+    verify_descriptor_json,
+};
 use marbles::postgres_store::PostgresCompanyStores;
 use marbles::report;
 use marbles::setup::Profile;
@@ -259,6 +262,12 @@ enum Command {
         #[command(subcommand)]
         action: StoreAction,
     },
+    /// Read-only federated remotes: pin another store's Ed25519 identity, verify its assertions
+    /// offline, and rotate the pin with a named overlap window. Pins never grant writes.
+    Remote {
+        #[command(subcommand)]
+        action: RemoteAction,
+    },
     /// Plans are DAGs over issues: inspect the graph, schedule it, take the frontier, or
     /// draft one from a spec before dispatching any worker.
     Plan {
@@ -430,6 +439,43 @@ enum StoreIdentityAction {
     Show,
     /// Add a new active key. The old key keeps verifying until the overlap window ends.
     Rotate {
+        /// Seconds during which the old key still verifies (default 24h).
+        #[arg(
+            long,
+            default_value_t = marbles::identity::DEFAULT_OVERLAP_SECONDS,
+            value_name = "SECONDS"
+        )]
+        overlap_seconds: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum RemoteAction {
+    /// Verify a remote's `marbles.store/1` descriptor and pin its Ed25519 identity locally.
+    Add {
+        name: String,
+        /// Where the remote lives; a locator only — trust comes from the pinned key.
+        endpoint: String,
+        /// Descriptor JSON: file path, `-` for stdin, or an http(s) URL.
+        #[arg(long)]
+        descriptor: String,
+    },
+    /// List pinned remotes with their store_id + key_id (never a bare URL as trust).
+    List,
+    /// Show one pinned remote's verified identity.
+    Show { name: String },
+    /// Remove the local pin only; nothing is sent to the remote and no remote row changes.
+    Remove { name: String },
+    /// Move the pin to a rotated key, keeping the old key valid until the overlap ends.
+    Rotate {
+        name: String,
+        /// Descriptor JSON: file path, `-` for stdin, or an http(s) URL.
+        #[arg(long)]
+        descriptor: String,
+        /// Confirm the new base64url raw Ed25519 public key out of band. Strongly recommended
+        /// for a key change: without it the new key is accepted on first use, like `add`.
+        #[arg(long)]
+        public_key: Option<String>,
         /// Seconds during which the old key still verifies (default 24h).
         #[arg(
             long,
@@ -2206,6 +2252,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             Ok(())
         }
         Command::Store { action } => run_store(action, cli.json),
+        Command::Remote { action } => run_remote(action, cli.json).await,
     }
 }
 
@@ -2337,6 +2384,167 @@ fn run_store(action: &StoreAction, json: bool) -> Result<(), String> {
                 }
                 Err(err) => Err(format!("descriptor rejected: {err}")),
             }
+        }
+    }
+}
+
+/// Pinned remotes are local client state: `$MARBLES_HOME/remotes.json`, never the tracker API.
+/// A pin proves *who* a remote is for read-only aggregation; it can never authorize a write, and
+/// `remove`/`rotate` never mutate the remote itself.
+async fn run_remote(action: &RemoteAction, json: bool) -> Result<(), String> {
+    let path = config::remotes_path();
+    match action {
+        RemoteAction::Add {
+            name,
+            endpoint,
+            descriptor,
+        } => {
+            let text = descriptor_from_arg(descriptor)
+                .await
+                .map_err(|err| format!("descriptor rejected: {err}"))?;
+            let mut registry = RemoteRegistry::load(&path).map_err(|err| err.to_string())?;
+            let record = registry
+                .add(name, endpoint, &text, now())
+                .map_err(|err| format!("descriptor rejected: {err}"))?
+                .clone();
+            registry.save(&path).map_err(|err| err.to_string())?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "added": true,
+                        "registry": path,
+                        "remote": record,
+                    }))
+                    .map_err(|err| err.to_string())?
+                );
+            } else {
+                println!("pinned remote {}: {}", record.name, record.display_name);
+                println!("  store_id: {}", record.store_id);
+                println!("  key_id: {}", record.key_id);
+                println!("  endpoint: {} (locator only)", record.endpoint);
+            }
+            Ok(())
+        }
+        RemoteAction::List => {
+            let registry = RemoteRegistry::load(&path).map_err(|err| err.to_string())?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&registry.list()).map_err(|err| err.to_string())?
+                );
+            } else if registry.list().is_empty() {
+                println!("no remotes pinned ({})", path.display());
+            } else {
+                for record in registry.list() {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        record.name, record.store_id, record.key_id, record.endpoint
+                    );
+                }
+            }
+            Ok(())
+        }
+        RemoteAction::Show { name } => {
+            let registry = RemoteRegistry::load(&path).map_err(|err| err.to_string())?;
+            let record = registry
+                .get(name)
+                .ok_or_else(|| format!("remote {name:?} is not registered"))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(record).map_err(|err| err.to_string())?
+                );
+            } else {
+                println!("remote {}", record.name);
+                println!("  display_name: {}", record.display_name);
+                println!("  store_id: {}", record.store_id);
+                println!("  key_id: {}", record.key_id);
+                println!("  public_key: {}", record.public_key);
+                println!("  endpoint: {} (locator only)", record.endpoint);
+                println!(
+                    "  valid_until: {}",
+                    record
+                        .valid_until
+                        .map(|at| at.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                );
+                for key in &record.overlap_keys {
+                    println!(
+                        "  overlap key {}: valid until {}",
+                        key.key_id,
+                        key.valid_until
+                            .map(|at| at.to_string())
+                            .unwrap_or_else(|| "none".to_string())
+                    );
+                }
+                println!(
+                    "  capabilities: {} (read-only; pins never grant writes)",
+                    record.capabilities.join(", ")
+                );
+            }
+            Ok(())
+        }
+        RemoteAction::Remove { name } => {
+            let mut registry = RemoteRegistry::load(&path).map_err(|err| err.to_string())?;
+            let removed = registry.remove(name).map_err(|err| err.to_string())?;
+            registry.save(&path).map_err(|err| err.to_string())?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "removed": removed.name,
+                        "store_id": removed.store_id,
+                        "remote_unchanged": true,
+                    }))
+                    .map_err(|err| err.to_string())?
+                );
+            } else {
+                println!(
+                    "removed local pin for {} ({}) — the remote store was not contacted",
+                    removed.name, removed.store_id
+                );
+            }
+            Ok(())
+        }
+        RemoteAction::Rotate {
+            name,
+            descriptor,
+            public_key,
+            overlap_seconds,
+        } => {
+            let text = descriptor_from_arg(descriptor)
+                .await
+                .map_err(|err| format!("descriptor rejected: {err}"))?;
+            let mut registry = RemoteRegistry::load(&path).map_err(|err| err.to_string())?;
+            let record = registry
+                .rotate(name, &text, public_key.as_deref(), *overlap_seconds, now())
+                .map_err(|err| format!("rotation rejected: {err}"))?;
+            registry.save(&path).map_err(|err| err.to_string())?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "name": name,
+                        "old_key_id": record.old_key_id,
+                        "new_key_id": record.new_key_id,
+                        "rotated_at": record.rotated_at,
+                        "overlap_until": record.overlap_until,
+                        "note": "old key verifies until overlap_until, then fails closed",
+                    }))
+                    .map_err(|err| err.to_string())?
+                );
+            } else {
+                println!(
+                    "rotated remote {}: {} -> {}",
+                    name, record.old_key_id, record.new_key_id
+                );
+                println!(
+                    "  overlap until {} (old key verifies until then, then fails closed)",
+                    record.overlap_until
+                );
+            }
+            Ok(())
         }
     }
 }
