@@ -17,6 +17,7 @@ pub mod cache;
 pub mod client;
 pub mod config;
 pub mod db;
+pub mod identity;
 pub mod import;
 pub mod jsonl;
 pub mod oidc;
