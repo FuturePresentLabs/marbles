@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use crate::time::WorkWeek;
 use crate::types::*;
 
+pub mod snapshot;
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS project(
   slug        TEXT PRIMARY KEY,
