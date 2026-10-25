@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS history(
 );
 CREATE TABLE IF NOT EXISTS outbound_event(
   seq             INTEGER PRIMARY KEY,
+  store_id        TEXT NOT NULL,
   issue_id        TEXT NOT NULL,
   project         TEXT NOT NULL,
   occurred_at     INTEGER NOT NULL,
@@ -91,6 +92,10 @@ CREATE TABLE IF NOT EXISTS outbound_event(
 );
 CREATE INDEX IF NOT EXISTS outbound_event_pending
   ON outbound_event(delivered_at, next_attempt_at, seq);
+CREATE TABLE IF NOT EXISTS store_meta(
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -181,6 +186,9 @@ pub struct Db {
     conn: Mutex<Connection>,
     policy: Policy,
     week: WorkWeek,
+    /// Stable identity of this physical store. Federation event ids are scoped by it so two
+    /// independent stores can never mint the same identity for the same local sequence.
+    store_id: String,
     /// The on-disk path, when there is one. `None` for in-memory test stores.
     path: Option<PathBuf>,
 }
@@ -216,6 +224,7 @@ pub struct DoctorReport {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct OutboundEvent {
     pub seq: i64,
+    pub store_id: String,
     pub issue_id: String,
     pub project: String,
     pub occurred_at: i64,
@@ -344,6 +353,57 @@ pub fn now() -> i64 {
         .unwrap_or_default()
 }
 
+/// A fresh, opaque store id. Distinct physical stores must never share one, so this is random
+/// rather than derived from a path or hostname.
+fn new_store_id() -> String {
+    let mut bytes = [0u8; 12];
+    getrandom::fill(&mut bytes).expect("rng");
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("store_{hex}")
+}
+
+/// Read the identity persisted with this database, creating it on first open.
+fn load_or_create_store_id(conn: &Connection) -> Result<String> {
+    if let Some(store_id) = conn
+        .query_row(
+            "SELECT value FROM store_meta WHERE key='store_id'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        && !store_id.is_empty()
+    {
+        return Ok(store_id);
+    }
+    let store_id = new_store_id();
+    conn.execute(
+        "INSERT INTO store_meta(key,value) VALUES('store_id',?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![store_id],
+    )?;
+    Ok(store_id)
+}
+
+/// Add the store-scoped identity column to databases created before federation event identity.
+fn backfill_outbound_store_id(conn: &Connection, store_id: &str) -> Result<()> {
+    let present: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('outbound_event') WHERE name='store_id'",
+        [],
+        |row| row.get(0),
+    )?;
+    if present == 0 {
+        conn.execute(
+            "ALTER TABLE outbound_event ADD COLUMN store_id TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    conn.execute(
+        "UPDATE outbound_event SET store_id=?1 WHERE store_id=''",
+        params![store_id],
+    )?;
+    Ok(())
+}
+
 /// Beads-style short suffix: 4 chars of a lowercase alphabet, enough for human quoting and
 /// collision-light at tracker scale (the primary key check retries a rare miss).
 fn short_suffix() -> String {
@@ -385,23 +445,75 @@ impl Db {
         // writes (sweeper vs daemon tick vs CLI on one machine) a few seconds to queue.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
+        let store_id = load_or_create_store_id(&conn)?;
+        backfill_outbound_store_id(&conn, &store_id)?;
         Ok(Self {
             conn: Mutex::new(conn),
             policy: Policy::default(),
             week: WorkWeek::default(),
+            store_id,
             path: Some(path.to_path_buf()),
         })
+    }
+
+    /// Open a store with an explicit identity. Used when the identity is owned outside the
+    /// database (for example a test fixture or a future identity-backed store).
+    pub fn open_with_store_id(path: impl AsRef<Path>, store_id: impl Into<String>) -> Result<Self> {
+        let mut db = Self::open(path)?;
+        db.set_store_id(store_id.into())?;
+        Ok(db)
     }
 
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        let store_id = load_or_create_store_id(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             policy: Policy::default(),
             week: WorkWeek::default(),
+            store_id,
             path: None,
         })
+    }
+
+    pub fn in_memory_with_store_id(store_id: impl Into<String>) -> Result<Self> {
+        let mut db = Self::in_memory()?;
+        db.set_store_id(store_id.into())?;
+        Ok(db)
+    }
+
+    /// The stable identity of this physical store.
+    pub fn store_id(&self) -> &str {
+        &self.store_id
+    }
+
+    /// Replace the generated identity before any event exists. Refuses once the outbox has rows,
+    /// because rewriting already-minted event identities would hide a real collision.
+    fn set_store_id(&mut self, store_id: String) -> Result<()> {
+        if store_id.is_empty() {
+            return Err(Error::Bad("store id must not be empty".into()));
+        }
+        if self.store_id == store_id {
+            return Ok(());
+        }
+        self.tx(|tx| {
+            let existing: i64 =
+                tx.query_row("SELECT COUNT(*) FROM outbound_event", [], |r| r.get(0))?;
+            if existing > 0 {
+                return Err(Error::Bad(
+                    "cannot change store id after outbound events were recorded".into(),
+                ));
+            }
+            tx.execute(
+                "INSERT INTO store_meta(key,value) VALUES('store_id',?1)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![store_id],
+            )?;
+            Ok(())
+        })?;
+        self.store_id = store_id;
+        Ok(())
     }
 
     pub fn with_policy(mut self, policy: Policy, week: WorkWeek) -> Self {
@@ -638,7 +750,7 @@ impl Db {
         let mut out = Vec::new();
         self.query(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT seq, issue_id, project, occurred_at, event, attempts
+                "SELECT seq, store_id, issue_id, project, occurred_at, event, attempts
                  FROM outbound_event
                  WHERE delivered_at IS NULL AND next_attempt_at <= ?1
                  ORDER BY seq LIMIT ?2",
@@ -647,11 +759,12 @@ impl Db {
                 .query_map(params![at, limit as i64], |row| {
                     Ok(OutboundEvent {
                         seq: row.get(0)?,
-                        issue_id: row.get(1)?,
-                        project: row.get(2)?,
-                        occurred_at: row.get(3)?,
-                        event: row.get(4)?,
-                        attempts: row.get(5)?,
+                        store_id: row.get(1)?,
+                        issue_id: row.get(2)?,
+                        project: row.get(3)?,
+                        occurred_at: row.get(4)?,
+                        event: row.get(5)?,
+                        attempts: row.get(6)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -849,10 +962,10 @@ impl Db {
                 },
             };
             let labels = serde_json::to_string(&spec.labels)?;
-            let metadata = match spec.metadata.clone().unwrap_or_else(|| serde_json::json!({})) {
-                serde_json::Value::Object(map) => serde_json::Value::Object(map),
-                other => other,
-            };
+            let metadata = spec
+                .metadata
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({}));
             let metadata_json = if metadata.is_object() {
                 metadata.as_object().unwrap().clone()
             } else {
@@ -969,10 +1082,10 @@ impl Db {
     }
 
     pub fn update(&self, id: &str, patch: &IssuePatch, actor: &str, at: i64) -> Result<Issue> {
-        if let Some(status) = &patch.status {
-            if !STATUSES.contains(&status.as_str()) {
-                return Err(Error::BadStatus(status.clone()));
-            }
+        if let Some(status) = &patch.status
+            && !STATUSES.contains(&status.as_str())
+        {
+            return Err(Error::BadStatus(status.clone()));
         }
         self.tx(|tx| {
             let mut current = row_to_issue(tx, id)?.ok_or_else(|| Error::NotFound(id.to_string()))?;
@@ -1342,7 +1455,7 @@ impl Db {
     }
 
     pub fn supersede(&self, id: &str, replacement: &str, actor: &str, at: i64) -> Result<()> {
-        let _ = row_to_issue(&*self.conn.lock().expect("lock poisoned"), replacement)?
+        let _ = row_to_issue(&self.conn.lock().expect("lock poisoned"), replacement)?
             .ok_or_else(|| Error::NotFound(replacement.to_string()))?;
         // Supersession is a delivery decision by an operator, not an agent claiming a finish:
         // the ack carries that, and the label carries the pointer.
@@ -1632,8 +1745,9 @@ fn log_event(
     )?;
     let seq = tx.last_insert_rowid();
     tx.execute(
-        "INSERT INTO outbound_event(seq, issue_id, project, occurred_at, event, next_attempt_at)
-         SELECT ?1, i.id, i.project, ?2, ?3, ?2 FROM issue i WHERE i.id=?4",
+        "INSERT INTO outbound_event(seq, store_id, issue_id, project, occurred_at, event, next_attempt_at)
+         SELECT ?1, (SELECT value FROM store_meta WHERE key='store_id'), i.id, i.project, ?2, ?3, ?2
+         FROM issue i WHERE i.id=?4",
         params![seq, ts, event, id],
     )?;
     Ok(())
@@ -1654,6 +1768,7 @@ fn reachable(conn: &rusqlite::Connection, from: &str, target: &str) -> Result<bo
     Ok(found.is_some())
 }
 
+#[allow(clippy::type_complexity)]
 fn row_to_issue(conn: &rusqlite::Connection, id: &str) -> Result<Option<Issue>> {
     let base: Option<(
         String,

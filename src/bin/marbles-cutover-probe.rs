@@ -52,10 +52,10 @@ async fn main() -> ExitCode {
                 "probe failure sample={samples} health={} authenticated={}",
                 health_status
                     .map(|status| status.as_u16().to_string())
-                    .unwrap_or_else(|| health.err().expect("missing error").to_string()),
+                    .unwrap_or_else(|| health.expect_err("missing error").to_string()),
                 auth_status
                     .map(|status| status.as_u16().to_string())
-                    .unwrap_or_else(|| authenticated.err().expect("missing error").to_string()),
+                    .unwrap_or_else(|| authenticated.expect_err("missing error").to_string()),
             );
         }
         tokio::time::sleep(Duration::from_secs(args.interval_seconds)).await;

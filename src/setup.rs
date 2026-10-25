@@ -38,8 +38,7 @@ impl Profile {
 }
 
 fn body(profile: Profile) -> String {
-    let common = format!(
-        "## Marbles issue tracker\n\n\
+    let common = "## Marbles issue tracker\n\n\
          This project tracks work with `marbles` (`mb`). Issues, dependencies, and claims live in\n\
          the central Marbles server — never in markdown task lists, and never in a per-checkout\n\
          database that has to be synced.\n\n\
@@ -58,8 +57,7 @@ fn body(profile: Profile) -> String {
          delivery.\n\n\
          Claims carry TTLs. Agent claims are minutes long and renewed by heartbeats; an expired\n\
          agent claim re-queues automatically. Human holds are business-hours long and, when they\n\
-         lapse, escalate to the owner rather than silently re-queuing.\n"
-    );
+         lapse, escalate to the owner rather than silently re-queuing.\n";
     let hygiene = match profile {
         Profile::Conservative => "### Git policy\n\n\
              Do not create commits or push unless the repository instructions or the user\n\

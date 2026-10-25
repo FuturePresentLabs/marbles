@@ -827,7 +827,6 @@ fn print_folder_view(view: &FolderView, tree: bool) {
             parent: Option<&str>,
             depth: usize,
             children: &BTreeMap<Option<&str>, Vec<&Folder>>,
-            assignments: &BTreeMap<&str, &str>,
             view: &FolderView,
             out: &mut Vec<String>,
         ) {
@@ -848,18 +847,11 @@ fn print_folder_view(view: &FolderView, tree: bool) {
                     format!("  [{}]", projects.join(", "))
                 };
                 out.push(format!("{indent}{} ({}){suffix}", folder.name, folder.slug));
-                walk(
-                    Some(&folder.slug),
-                    depth + 1,
-                    children,
-                    assignments,
-                    view,
-                    out,
-                );
+                walk(Some(&folder.slug), depth + 1, children, view, out);
             }
         }
         let mut lines = Vec::new();
-        walk(None, 0, &children, &assignments, view, &mut lines);
+        walk(None, 0, &children, view, &mut lines);
         let unfiled: Vec<&str> = assignments
             .iter()
             .filter(|(_, folder)| !view.folders.iter().any(|f| f.slug == **folder))
@@ -1778,13 +1770,13 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                     if goal_issue.issue_type != "goal" {
                         return Err(format!("{goal} is a {}, not a goal", goal_issue.issue_type));
                     }
-                    if let Some(project) = args.project.as_deref() {
-                        if project != goal_issue.project {
-                            return Err(format!(
-                                "epic project {project} does not match goal project {}",
-                                goal_issue.project
-                            ));
-                        }
+                    if let Some(project) = args.project.as_deref()
+                        && project != goal_issue.project
+                    {
+                        return Err(format!(
+                            "epic project {project} does not match goal project {}",
+                            goal_issue.project
+                        ));
                     }
                     let spec = NewIssue {
                         title: args.title.clone(),
@@ -1824,13 +1816,13 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                             epic_issue.issue_type
                         ));
                     }
-                    if let Some(project) = args.project.as_deref() {
-                        if project != epic_issue.project {
-                            return Err(format!(
-                                "task project {project} does not match epic project {}",
-                                epic_issue.project
-                            ));
-                        }
+                    if let Some(project) = args.project.as_deref()
+                        && project != epic_issue.project
+                    {
+                        return Err(format!(
+                            "task project {project} does not match epic project {}",
+                            epic_issue.project
+                        ));
                     }
                     let spec = NewIssue {
                         title: args.title.clone(),
