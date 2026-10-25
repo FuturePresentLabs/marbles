@@ -408,7 +408,7 @@ async fn human_import_preserves_ids_deps_and_refuses_agents() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body.matches("demo-aaa").count() >= 1, true);
+    assert!(body.matches("demo-aaa").count() >= 1);
     let (status, _) = call(
         &app,
         "issues.get",

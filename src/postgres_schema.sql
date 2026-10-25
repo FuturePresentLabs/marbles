@@ -82,6 +82,7 @@ ALTER TABLE marbles_history
   DROP CONSTRAINT IF EXISTS marbles_history_company_id_issue_id_fkey;
 CREATE TABLE IF NOT EXISTS marbles_outbound_event (
   company_id TEXT NOT NULL,
+  store_id TEXT NOT NULL,
   seq BIGINT NOT NULL,
   issue_id TEXT NOT NULL,
   project TEXT NOT NULL,
@@ -94,5 +95,10 @@ CREATE TABLE IF NOT EXISTS marbles_outbound_event (
   PRIMARY KEY(company_id, seq),
   FOREIGN KEY(company_id, issue_id) REFERENCES marbles_issue(company_id, id)
 );
+-- Databases created before store-scoped event identity gain the column additively. The hosted
+-- tenant id is its stable store identity, so backfill is exact rather than a guess.
+ALTER TABLE marbles_outbound_event
+  ADD COLUMN IF NOT EXISTS store_id TEXT NOT NULL DEFAULT '';
+UPDATE marbles_outbound_event SET store_id=company_id WHERE store_id='';
 CREATE INDEX IF NOT EXISTS marbles_outbound_event_pending
   ON marbles_outbound_event(company_id, delivered_at, next_attempt_at, seq);

@@ -190,25 +190,22 @@ pub fn import(
     for row in rows.iter().filter(|r| r.get("_skip").is_none()) {
         let (id, original) = id_of(row)?;
         normalize_status(row["status"].as_str().unwrap_or("open"))?;
-        match db.get(id.as_str()).ok() {
-            Some(existing) => {
-                // Resume rule: a row carrying this importer's mark in the same project is a
-                // previously-imported (or half-imported) copy of this exact export row — the
-                // remaining phases are idempotent and will restate its status. Anything else
-                // sharing the id is a genuine conflict: one bead, two truths, a human picks.
-                let mine = existing.project == project
-                    && existing.metadata.get("marbles_import") == Some(&serde_json::json!(true));
-                if mine {
-                    report.unchanged += 1;
+        if let Ok(existing) = db.get(id.as_str()) {
+            // Resume rule: a row carrying this importer's mark in the same project is a
+            // previously-imported (or half-imported) copy of this exact export row — the
+            // remaining phases are idempotent and will restate its status. Anything else
+            // sharing the id is a genuine conflict: one bead, two truths, a human picks.
+            let mine = existing.project == project
+                && existing.metadata.get("marbles_import") == Some(&serde_json::json!(true));
+            if mine {
+                report.unchanged += 1;
+            } else {
+                report.conflicts.push(if original != id {
+                    format!("{original} → {id} ({})", existing.project)
                 } else {
-                    report.conflicts.push(if original != id {
-                        format!("{original} → {id} ({})", existing.project)
-                    } else {
-                        format!("{id} (project {})", existing.project)
-                    });
-                }
+                    format!("{id} (project {})", existing.project)
+                });
             }
-            None => {}
         }
         id_map.insert(original, id);
     }

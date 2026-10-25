@@ -461,6 +461,7 @@ impl Store for PostgresStore {
         })
     }
 
+    #[allow(clippy::field_reassign_with_default)]
     fn folder_view(&self) -> Result<FolderView> {
         self.with_client(|client| {
             let mut out = FolderView::default();
@@ -497,7 +498,7 @@ impl Store for PostgresStore {
     fn pending_events(&self, at: i64, limit: usize) -> Result<Vec<OutboundEvent>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         self.with_client(|client| {
-            Ok(client.query("SELECT seq,issue_id,project,occurred_at,event,attempts FROM marbles_outbound_event WHERE company_id=$1 AND delivered_at IS NULL AND next_attempt_at <= $2 ORDER BY seq LIMIT $3", &[&self.company_id,&at,&limit])?.into_iter().map(|r| OutboundEvent { seq:r.get(0), issue_id:r.get(1), project:r.get(2), occurred_at:r.get(3), event:r.get(4), attempts:r.get(5) }).collect())
+            Ok(client.query("SELECT seq,store_id,issue_id,project,occurred_at,event,attempts FROM marbles_outbound_event WHERE company_id=$1 AND delivered_at IS NULL AND next_attempt_at <= $2 ORDER BY seq LIMIT $3", &[&self.company_id,&at,&limit])?.into_iter().map(|r| OutboundEvent { seq:r.get(0), store_id:r.get(1), issue_id:r.get(2), project:r.get(3), occurred_at:r.get(4), event:r.get(5), attempts:r.get(6) }).collect())
         })
     }
 
@@ -813,7 +814,7 @@ fn log_event(
         )?
         .get(0);
     tx.execute("INSERT INTO marbles_history(company_id,seq,issue_id,ts,actor,event,detail) VALUES($1,$2,$3,$4,$5,$6,$7)", &[&company,&seq,&id,&ts,&actor,&event,&detail])?;
-    tx.execute("INSERT INTO marbles_outbound_event(company_id,seq,issue_id,project,occurred_at,event,next_attempt_at) SELECT $1,$2,id,project,$4,$5,$4 FROM marbles_issue WHERE company_id=$1 AND id=$3", &[&company,&seq,&id,&ts,&event])?;
+    tx.execute("INSERT INTO marbles_outbound_event(company_id,store_id,seq,issue_id,project,occurred_at,event,next_attempt_at) SELECT $1,$1,$2,id,project,$4,$5,$4 FROM marbles_issue WHERE company_id=$1 AND id=$3", &[&company,&seq,&id,&ts,&event])?;
     Ok(())
 }
 fn close_tx(

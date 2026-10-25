@@ -389,11 +389,12 @@ fn copy_outbound_events(
 ) -> Result<(), String> {
     let mut stmt=sqlite.prepare("SELECT seq,issue_id,project,occurred_at,event,delivered_at,attempts,next_attempt_at,last_error FROM outbound_event ORDER BY seq").map_err(|e|e.to_string())?;
     let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
-    let sink = tx.copy_in("COPY marbles_outbound_event(company_id,seq,issue_id,project,occurred_at,event,delivered_at,attempts,next_attempt_at,last_error) FROM STDIN BINARY")
+    let sink = tx.copy_in("COPY marbles_outbound_event(company_id,store_id,seq,issue_id,project,occurred_at,event,delivered_at,attempts,next_attempt_at,last_error) FROM STDIN BINARY")
         .map_err(|e| format!("starting outbox copy: {e}"))?;
     let mut writer = BinaryCopyInWriter::new(
         sink,
         &[
+            Type::TEXT,
             Type::TEXT,
             Type::INT8,
             Type::TEXT,
@@ -418,8 +419,8 @@ fn copy_outbound_events(
         let error: Option<String> = r.get(8).map_err(|e| e.to_string())?;
         writer
             .write(&[
-                &company, &seq, &issue, &project, &occurred, &event, &delivered, &attempts, &next,
-                &error,
+                &company, &company, &seq, &issue, &project, &occurred, &event, &delivered,
+                &attempts, &next, &error,
             ])
             .map_err(|e| format!("copying outbound event {seq}: {e}"))?;
     }
