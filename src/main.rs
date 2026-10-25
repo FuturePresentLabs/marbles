@@ -20,6 +20,7 @@ use marbles::auth::Auth;
 use marbles::client::Client;
 use marbles::config;
 use marbles::db::{CompanyStoreRegistry, CompanyStores, Db, now};
+use marbles::identity::{InitOptions, PinnedKey, StoreIdentity, verify_descriptor_json};
 use marbles::postgres_store::PostgresCompanyStores;
 use marbles::report;
 use marbles::setup::Profile;
@@ -253,6 +254,11 @@ enum Command {
     },
     /// Check integrity, settings, row counts, and WAL size (local mode only).
     Doctor,
+    /// Store identity: Ed25519 keypair, rotation, and the public `marbles.store/1` descriptor.
+    Store {
+        #[command(subcommand)]
+        action: StoreAction,
+    },
     /// Plans are DAGs over issues: inspect the graph, schedule it, take the frontier, or
     /// draft one from a spec before dispatching any worker.
     Plan {
@@ -374,6 +380,64 @@ struct UpdateArgs {
 enum ProjectAction {
     /// Delete a store and every issue/edge/history row that touched it.
     Rm { slug: String },
+}
+
+#[derive(Subcommand)]
+enum StoreAction {
+    /// Create or inspect this store's Ed25519 identity.
+    Identity {
+        #[command(subcommand)]
+        action: StoreIdentityAction,
+    },
+    /// Print the public, signed `marbles.store/1` descriptor.
+    Descriptor {
+        /// Emit compact single-line JSON instead of pretty JSON.
+        #[arg(long)]
+        compact: bool,
+    },
+    /// Verify a descriptor offline from a pinned store_id + key_id + public key.
+    Verify {
+        /// Descriptor JSON file, or `-` for stdin.
+        descriptor: PathBuf,
+        #[arg(long)]
+        store_id: String,
+        #[arg(long)]
+        key_id: String,
+        /// base64url raw Ed25519 public key the verifier pinned.
+        #[arg(long)]
+        public_key: String,
+        /// Trust the key only until this unix timestamp (exclusive).
+        #[arg(long)]
+        valid_until: Option<i64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum StoreIdentityAction {
+    /// Create the identity if absent. Re-running is idempotent.
+    Init {
+        /// Human-readable store name (defaults to $HOSTNAME).
+        #[arg(long)]
+        display_name: Option<String>,
+        /// Public endpoint advertised in the descriptor.
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Capability to advertise; repeat for several (defaults to issues, claims, plans).
+        #[arg(long = "capability")]
+        capabilities: Vec<String>,
+    },
+    /// Show ids and key history; never private key material.
+    Show,
+    /// Add a new active key. The old key keeps verifying until the overlap window ends.
+    Rotate {
+        /// Seconds during which the old key still verifies (default 24h).
+        #[arg(
+            long,
+            default_value_t = marbles::identity::DEFAULT_OVERLAP_SECONDS,
+            value_name = "SECONDS"
+        )]
+        overlap_seconds: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2148,6 +2212,139 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                 if *remove { "cleaned" } else { "updated" }
             );
             Ok(())
+        }
+        Command::Store { action } => run_store(action, cli.json),
+    }
+}
+
+/// Store identity is local state: it never travels over the tracker API and must not use the
+/// webhook HMAC secret. Private keys stay under `$MARBLES_HOME` and are never printed.
+fn run_store(action: &StoreAction, json: bool) -> Result<(), String> {
+    let path = config::identity_path();
+    match action {
+        StoreAction::Identity { action } => match action {
+            StoreIdentityAction::Init {
+                display_name,
+                endpoint,
+                capabilities,
+            } => {
+                let existed = path.exists();
+                let mut opts = InitOptions::new(
+                    display_name
+                        .clone()
+                        .or_else(|| std::env::var("HOSTNAME").ok())
+                        .unwrap_or_else(|| "marbles".to_string()),
+                );
+                opts.endpoint = endpoint.clone();
+                if !capabilities.is_empty() {
+                    opts.capabilities = capabilities.clone();
+                }
+                let identity =
+                    StoreIdentity::init_at(&path, &opts, now()).map_err(|err| err.to_string())?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "created": !existed,
+                            "path": path,
+                            "store_id": identity.store_id,
+                            "key_id": identity.active_key_id,
+                        }))
+                        .map_err(|err| err.to_string())?
+                    );
+                } else if existed {
+                    println!(
+                        "store identity already initialized: {} ({})",
+                        identity.store_id, identity.active_key_id
+                    );
+                } else {
+                    println!(
+                        "initialized store identity {} with key {}",
+                        identity.store_id, identity.active_key_id
+                    );
+                    println!("identity file: {} (keep private)", path.display());
+                }
+                Ok(())
+            }
+            StoreIdentityAction::Show => {
+                let identity = StoreIdentity::load(&path).map_err(|err| err.to_string())?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&identity.public_view())
+                        .map_err(|err| err.to_string())?
+                );
+                Ok(())
+            }
+            StoreIdentityAction::Rotate { overlap_seconds } => {
+                let mut identity = StoreIdentity::load(&path).map_err(|err| err.to_string())?;
+                let record = identity
+                    .rotate(now(), *overlap_seconds)
+                    .map_err(|err| err.to_string())?;
+                identity.save(&path).map_err(|err| err.to_string())?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "old_key_id": record.old_key_id,
+                        "new_key_id": record.new_key_id,
+                        "rotated_at": record.rotated_at,
+                        "overlap_until": record.overlap_until,
+                        "note": "old key verifies until overlap_until, then fails closed",
+                    }))
+                    .map_err(|err| err.to_string())?
+                );
+                Ok(())
+            }
+        },
+        StoreAction::Descriptor { compact } => {
+            let identity = StoreIdentity::load(&path).map_err(|err| err.to_string())?;
+            let descriptor = identity.descriptor(now()).map_err(|err| err.to_string())?;
+            let text = if *compact {
+                serde_json::to_string(&descriptor).map_err(|err| err.to_string())?
+            } else {
+                descriptor.to_json_pretty().map_err(|err| err.to_string())?
+            };
+            println!("{text}");
+            Ok(())
+        }
+        StoreAction::Verify {
+            descriptor,
+            store_id,
+            key_id,
+            public_key,
+            valid_until,
+        } => {
+            let text = if descriptor == std::path::Path::new("-") {
+                let mut buffer = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)
+                    .map_err(|err| format!("reading stdin: {err}"))?;
+                buffer
+            } else {
+                std::fs::read_to_string(descriptor)
+                    .map_err(|err| format!("reading {}: {err}", descriptor.display()))?
+            };
+            let pin = PinnedKey {
+                store_id: store_id.clone(),
+                key_id: key_id.clone(),
+                public_key: public_key.clone(),
+                valid_until: *valid_until,
+            };
+            match verify_descriptor_json(&text, &pin, now()) {
+                Ok(verified) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "verified": true,
+                            "store_id": verified.store_id,
+                            "key_id": verified.key_id,
+                            "display_name": verified.display_name,
+                            "issued_at": verified.issued_at,
+                        }))
+                        .map_err(|err| err.to_string())?
+                    );
+                    Ok(())
+                }
+                Err(err) => Err(format!("descriptor rejected: {err}")),
+            }
         }
     }
 }

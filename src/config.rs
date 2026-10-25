@@ -72,6 +72,12 @@ pub fn server_config_path() -> PathBuf {
     state_dir().join("server.toml")
 }
 
+/// Ed25519 store identity + `marbles.store/1` descriptor metadata. Contains private keys, so the
+/// file is written with owner-only permissions and must never be copied into a repo or artifact.
+pub fn identity_path() -> PathBuf {
+    state_dir().join("store-identity.toml")
+}
+
 pub fn server_config() -> ServerConfig {
     match std::fs::read_to_string(server_config_path()) {
         Ok(text) => toml::from_str(&text).expect("server.toml must parse if present"),
