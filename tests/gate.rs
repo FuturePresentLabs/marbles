@@ -6,14 +6,31 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+/// Contract tests need a repository checkout. The Docker builder deliberately copies
+/// only `Cargo.toml`, `src/` and `tests/` (no `.git`, no `tools/`, no `.github/`), so
+/// there is nothing to assert there — the repository gate is what enforces these
+/// contracts, not the image build. A checkout without `.git` is treated as a bare
+/// package build; a checkout *with* `.git` is held to the contract, so deleting the
+/// gate script or the CI wiring still fails.
+fn checkout_root() -> Option<PathBuf> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if root.join(".git").exists() {
+        Some(root)
+    } else {
+        eprintln!(
+            "skipping gate contract test: {} is a bare package build, not a checkout",
+            root.display()
+        );
+        None
+    }
 }
 
 /// `tools/check.sh --self-test` must exit 0 and name every mutation it caught.
 #[test]
 fn self_test_proves_the_gate_can_go_red() {
-    let root = repo_root();
+    let Some(root) = checkout_root() else {
+        return;
+    };
     let gate = root.join("tools/check.sh");
     assert!(gate.is_file(), "missing gate script: {}", gate.display());
 
@@ -52,7 +69,9 @@ fn self_test_proves_the_gate_can_go_red() {
 /// CI must invoke the gate itself, not a hand-maintained copy of its steps.
 #[test]
 fn ci_runs_the_gate_not_a_reimplementation() {
-    let root = repo_root();
+    let Some(root) = checkout_root() else {
+        return;
+    };
     let ci = root.join(".github/workflows/ci.yml");
     let text = std::fs::read_to_string(&ci).expect("read .github/workflows/ci.yml");
 

@@ -69,6 +69,11 @@ the gate's own red/green behaviour is part of the suite. That test also asserts
 `.github/workflows/ci.yml` invokes `tools/check.sh`, so deleting the CI wiring fails the
 build. The fixtures have no dependencies, so the self-test needs no network.
 
+The contract tests need a checkout (they look for `.git` at `CARGO_MANIFEST_DIR`). A
+bare package build — the Docker builder copies only `Cargo.toml`, `src/` and `tests/` —
+has no repository layout to assert, so they are explicitly skipped there; the gate
+itself is what enforces these contracts. A checkout with `.git` is always held to them.
+
 ## CI
 
 `.github/workflows/ci.yml` replaces the separate `cargo fmt`/`cargo clippy`/`cargo test`
