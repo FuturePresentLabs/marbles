@@ -23,9 +23,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88
         with:
           components: rustfmt, clippy
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --all-features
-      - run: cargo test --all-targets --all-features
+      # One command, same as local. The transcript binds this run to the merge-result
+      # HEAD and a clean tree; a PR without a green transcript is unlandable.
+      - name: Repository gate (fail-closed)
+        run: |
+          if ! tools/check.sh --transcript target/check-transcript.txt; then
+            echo "::group::gate transcript"
+            cat target/check-transcript.txt || true
+            echo "::endgroup::"
+            exit 1
+          fi
+          cat target/check-transcript.txt
       - name: Install FPL registry client certs
         if: env.HAS_REGISTRY_CREDS == 'true'
         env:
@@ -73,4 +81,4 @@ jobs:
         run: |
           # The Bob image is private, so a fork PR cannot perform the image build. No cache
           # credential is involved in this decision.
-          echo "::notice title=docker build skipped::FPL registry credentials are not available to this run (fork PR or unconfigured repo secrets); rust fmt/clippy/test still ran"
+          echo "::notice title=docker build skipped::FPL registry credentials are not available to this run (fork PR or unconfigured repo secrets); the repository gate still ran"
