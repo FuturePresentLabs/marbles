@@ -378,9 +378,15 @@ fn local_dependencies_keep_current_behavior() {
     let parent = fx.issue("parent", at - 3_600);
     fx.ok(&["dep", "add", &child, &parent]);
 
-    // Local blocker open: the child is not in the ready report at all, exactly as before.
+    // Local blocker open: the child is not in the ready report at all, exactly as before. The
+    // open parent itself is ready work.
     let (rows, _) = fx.ready();
-    assert!(rows.is_empty(), "local deps still hide blocked work: {rows:?}");
+    assert_eq!(rows.len(), 1, "only the open parent is ready: {rows:?}");
+    assert_eq!(rows[0]["id"], serde_json::json!(parent));
+    assert!(
+        rows.iter().all(|row| row["id"] != serde_json::json!(child)),
+        "a local blocker still hides dependent work: {rows:?}"
+    );
 
     fx.ok(&["update", &parent, "--status", "closed"]);
     let (rows, _) = fx.ready();
