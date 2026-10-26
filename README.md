@@ -89,6 +89,24 @@ agent leases and escalates expired human holds.
 Sandboxes get an agent token and zero file access to the database. That is the
 point.
 
+### Read-only remotes
+
+A remote store is a **pin**, not a project. `mb remote add` verifies another store's signed
+`marbles.store/1` descriptor and pins its `(store_id, key_id, public_key)` locally; `mb remotes`
+then shows the separate, read-only **Remotes workspace**:
+
+```bash
+mb remote add acme https://marbles.acme.example --descriptor ./acme-descriptor.json
+mb remotes                       # name, store_id, key_id, endpoint, named freshness
+mb remote assertions acme        # per-issue verified state + fresh/stale/unknown/unverifiable
+```
+
+Remote stores never enter the local folder tree, `mb projects`, `mb portfolio`, or `mb ready`, and
+no read/list path creates a local project or issue row for them. `mb claim`, `mb update
+--assignee`, and `mb close` on a remote reference fail with a named `remote refs are read-only:
+<store_id>/<issue>` error rather than falling through to local work. A missing registry prints
+`no remotes pinned` and exits 0; a corrupt one fails closed.
+
 ## The work model
 
 ```text

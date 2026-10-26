@@ -585,10 +585,7 @@ fn remote_entry(
 ) -> RemoteWorkspaceEntry {
     let views = cache.read_all(registry, &record.store_id, now);
     let freshness = remote_workspace_freshness(&views);
-    let observed_at = views
-        .iter()
-        .filter_map(AssertionView::observed_at)
-        .max();
+    let observed_at = views.iter().filter_map(AssertionView::observed_at).max();
     let problem = views.iter().find_map(|view| view.problem.clone());
     RemoteWorkspaceEntry {
         name: record.name.clone(),
