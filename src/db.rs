@@ -1343,6 +1343,27 @@ impl Db {
         Ok(out)
     }
 
+    /// Locally-ready work paired with every remote edge attached to it.
+    ///
+    /// This is the readiness *input*, not the verdict: the SQL rules in [`Self::ready`] decide
+    /// local eligibility exactly as before (local deps closed, past grace, unclaimed), and remote
+    /// edges are returned un-filtered so the caller can re-verify each one against the current
+    /// pin. A remote edge never removes a row from this list, because a failed verification must
+    /// become a *named reason*, not a silently vanished issue.
+    pub fn ready_with_remote_edges(
+        &self,
+        project: Option<&str>,
+        at: i64,
+    ) -> Result<Vec<(Issue, Vec<RemoteDependency>)>> {
+        let rows = self.ready(project, at)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for issue in rows {
+            let edges = self.remote_dependencies(&issue.id)?;
+            out.push((issue, edges));
+        }
+        Ok(out)
+    }
+
     /// Remove one remote dependency edge. This changes local state only; the remote is untouched.
     pub fn remove_remote_dep(
         &self,
