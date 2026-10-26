@@ -1312,6 +1312,37 @@ impl Db {
         })
     }
 
+    /// Read the verified remote dependency edges attached to `child`, newest assertion per ref.
+    ///
+    /// The stored rows carry the last assertion. Freshness is deliberately *not* computed here:
+    /// the caller re-verifies against the current pin (see `refs::remote_dependency_freshness`).
+    pub fn remote_dependencies(&self, child: &str) -> Result<Vec<RemoteDependency>> {
+        let mut out = Vec::new();
+        self.query(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT canonical_ref, store_id, remote_issue_id, state, asserted_at, observed_at,
+                        signature, key_id
+                 FROM remote_dep WHERE issue_id = ?1 ORDER BY canonical_ref",
+            )?;
+            let mut rows = stmt.query(params![child])?;
+            while let Some(row) = rows.next()? {
+                out.push(RemoteDependency {
+                    canonical_ref: row.get(0)?,
+                    store_id: row.get(1)?,
+                    remote_issue_id: row.get(2)?,
+                    state: row.get(3)?,
+                    asserted_at: row.get(4)?,
+                    observed_at: row.get(5)?,
+                    signature: row.get(6)?,
+                    key_id: row.get(7)?,
+                    freshness: None,
+                });
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     /// Remove one remote dependency edge. This changes local state only; the remote is untouched.
     pub fn remove_remote_dep(
         &self,
@@ -1955,26 +1986,6 @@ fn row_to_issue(conn: &rusqlite::Connection, id: &str) -> Result<Option<Issue>> 
             depends_on_id: Some(row.get(0)?),
         });
     }
-    let mut remote_dependencies = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT canonical_ref, store_id, remote_issue_id, state, asserted_at, observed_at,
-                signature, key_id
-         FROM remote_dep WHERE issue_id = ?1 ORDER BY canonical_ref",
-    )?;
-    let mut rows = stmt.query(params![id])?;
-    while let Some(row) = rows.next()? {
-        remote_dependencies.push(RemoteDependency {
-            canonical_ref: row.get(0)?,
-            store_id: row.get(1)?,
-            remote_issue_id: row.get(2)?,
-            state: row.get(3)?,
-            asserted_at: row.get(4)?,
-            observed_at: row.get(5)?,
-            signature: row.get(6)?,
-            key_id: row.get(7)?,
-            freshness: None,
-        });
-    }
     let dependency_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM dep d JOIN issue p ON p.id = d.depends_on
          WHERE d.issue_id = ?1 AND p.status != 'closed'",
@@ -2001,7 +2012,6 @@ fn row_to_issue(conn: &rusqlite::Connection, id: &str) -> Result<Option<Issue>> 
         dependency_count,
         dependent_count,
         dependencies,
-        remote_dependencies,
         evidence,
         parent,
         assignee,

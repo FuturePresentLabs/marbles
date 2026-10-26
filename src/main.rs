@@ -1333,16 +1333,30 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             // A one-element array: mirrors `bd show --json`, which the migrating clients parse as
             // a list. Boring compatibility is worth more than purity here.
             let body = serde_json::json!({"id": id});
-            let mut row: Issue = mode
+            let row: Issue = mode
                 .call("issues.get", &body, |db| {
                     db.get(id).map_err(|e| e.to_string())
                 })
                 .await?;
-            annotate_remote_dependencies(&mut row)?;
+            let mut remote_dependencies = match mode {
+                Mode::Local(db) => db.remote_dependencies(id).map_err(|e| e.to_string())?,
+                // The edge itself is local client state; read it from the local store when the
+                // issue body came over HTTP as well.
+                Mode::Http(_) => Db::open(config::db_path())
+                    .ok()
+                    .and_then(|db| db.remote_dependencies(id).ok())
+                    .unwrap_or_default(),
+            };
+            annotate_remote_dependencies(&mut remote_dependencies)?;
             if cli.json {
+                let mut value = serde_json::to_value(&row).map_err(|e| e.to_string())?;
+                if !remote_dependencies.is_empty() {
+                    value["remote_dependencies"] =
+                        serde_json::to_value(&remote_dependencies).map_err(|e| e.to_string())?;
+                }
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&vec![row]).map_err(|e| e.to_string())?
+                    serde_json::to_string_pretty(&vec![value]).map_err(|e| e.to_string())?
                 );
             } else {
                 let issue = row;
@@ -1353,7 +1367,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                         issue.actor_kind.as_deref().unwrap_or("?")
                     );
                 }
-                for dependency in &issue.remote_dependencies {
+                for dependency in &remote_dependencies {
                     println!(
                         "waits on {} (remote; {}; state: {}; observed_at: {})",
                         dependency.canonical_ref,
@@ -1564,7 +1578,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                 };
                 let at = now();
                 if add {
-                    let registry = RemoteRegistry::load(config::remotes_path())
+                    let registry = RemoteRegistry::load(&config::remotes_path())
                         .map_err(|error| format!("remote registry rejected: {error}"))?;
                     let cache = AssertionCache::at(config::assertion_cache_dir());
                     let view = cache.read(
@@ -2562,14 +2576,14 @@ fn run_store(action: &StoreAction, json: bool) -> Result<(), String> {
 
 /// Fill each remote edge's named freshness by re-verifying its stored assertion against the
 /// current pin. A missing/corrupt registry makes every remote edge `unverifiable`, never fresh.
-fn annotate_remote_dependencies(issue: &mut Issue) -> Result<(), String> {
-    if issue.remote_dependencies.is_empty() {
+fn annotate_remote_dependencies(dependencies: &mut [RemoteDependency]) -> Result<(), String> {
+    if dependencies.is_empty() {
         return Ok(());
     }
-    let registry = RemoteRegistry::load(config::remotes_path()).unwrap_or_default();
+    let registry = RemoteRegistry::load(&config::remotes_path()).unwrap_or_default();
     let window = AssertionCache::at(config::assertion_cache_dir()).freshness_window_seconds();
     let at = now();
-    for dependency in &mut issue.remote_dependencies {
+    for dependency in dependencies {
         dependency.freshness = Some(
             remote_dependency_freshness(dependency, &registry, at, window)
                 .as_str()

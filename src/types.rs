@@ -133,10 +133,6 @@ pub struct Issue {
     pub dependent_count: i64,
     #[serde(default)]
     pub dependencies: Vec<Dependency>,
-    /// Cross-store blocker edges. These carry a canonical ref and a verified assertion; they never
-    /// create a local issue or a local `dep` row.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub remote_dependencies: Vec<RemoteDependency>,
     /// What justified the close (empty until it happens). See [`Evidence`].
     #[serde(default)]
     pub evidence: Vec<Evidence>,
