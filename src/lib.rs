@@ -12,6 +12,7 @@
 //! the debt is real.
 
 pub mod api;
+pub mod assertion_cache;
 pub mod auth;
 pub mod cache;
 pub mod client;

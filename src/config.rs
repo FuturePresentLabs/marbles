@@ -84,6 +84,12 @@ pub fn remotes_path() -> PathBuf {
     state_dir().join("remotes.json")
 }
 
+/// Local cache of verified remote issue assertions, one entry per `(store_id, remote_issue_id)`.
+/// Client state only: nothing here is uploaded and nothing here can mutate a remote store.
+pub fn assertion_cache_dir() -> PathBuf {
+    state_dir().join("assertions")
+}
+
 pub fn server_config() -> ServerConfig {
     match std::fs::read_to_string(server_config_path()) {
         Ok(text) => toml::from_str(&text).expect("server.toml must parse if present"),

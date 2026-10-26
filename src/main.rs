@@ -16,6 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
+use marbles::assertion_cache::AssertionCache;
 use marbles::auth::Auth;
 use marbles::client::Client;
 use marbles::config;
@@ -464,6 +465,8 @@ enum RemoteAction {
     List,
     /// Show one pinned remote's verified identity.
     Show { name: String },
+    /// Show cached issue assertions for a pinned remote, each with its named freshness.
+    Assertions { name: String },
     /// Remove the local pin only; nothing is sent to the remote and no remote row changes.
     Remove { name: String },
     /// Move the pin to a rotated key, keeping the old key valid until the overlap ends.
@@ -2482,6 +2485,47 @@ async fn run_remote(action: &RemoteAction, json: bool) -> Result<(), String> {
                     "  capabilities: {} (read-only; pins never grant writes)",
                     record.capabilities.join(", ")
                 );
+            }
+            Ok(())
+        }
+        RemoteAction::Assertions { name } => {
+            let registry = RemoteRegistry::load(&path).map_err(|err| err.to_string())?;
+            let record = registry
+                .get(name)
+                .ok_or_else(|| format!("remote {name:?} is not registered"))?;
+            let cache = AssertionCache::at(config::assertion_cache_dir());
+            let views = cache.read_all(&registry, &record.store_id, now());
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "remote": record.name,
+                        "store_id": record.store_id,
+                        "freshness_window_seconds": cache.freshness_window_seconds(),
+                        "assertions": views,
+                    }))
+                    .map_err(|err| err.to_string())?
+                );
+            } else if views.is_empty() {
+                println!(
+                    "no cached assertions for {} ({})",
+                    record.name, record.store_id
+                );
+            } else {
+                for view in &views {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        view.remote_issue_id,
+                        view.asserted_state().unwrap_or("-"),
+                        view.freshness.as_str(),
+                        view.observed_at()
+                            .map(|at| at.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                    );
+                    if let Some(reason) = &view.problem {
+                        println!("  {reason}");
+                    }
+                }
             }
             Ok(())
         }
