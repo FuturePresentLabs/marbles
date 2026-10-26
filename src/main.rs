@@ -26,6 +26,7 @@ use marbles::identity::{
     verify_descriptor_json,
 };
 use marbles::postgres_store::PostgresCompanyStores;
+use marbles::refs::{CanonicalRef, remote_dependency_freshness};
 use marbles::report;
 use marbles::setup::Profile;
 use marbles::types::*;
@@ -1332,11 +1333,12 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             // A one-element array: mirrors `bd show --json`, which the migrating clients parse as
             // a list. Boring compatibility is worth more than purity here.
             let body = serde_json::json!({"id": id});
-            let row: Issue = mode
+            let mut row: Issue = mode
                 .call("issues.get", &body, |db| {
                     db.get(id).map_err(|e| e.to_string())
                 })
                 .await?;
+            annotate_remote_dependencies(&mut row)?;
             if cli.json {
                 println!(
                     "{}",
@@ -1349,6 +1351,15 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                     println!(
                         "claimed by {a} ({})",
                         issue.actor_kind.as_deref().unwrap_or("?")
+                    );
+                }
+                for dependency in &issue.remote_dependencies {
+                    println!(
+                        "waits on {} (remote; {}; state: {}; observed_at: {})",
+                        dependency.canonical_ref,
+                        dependency.freshness.as_deref().unwrap_or("unverifiable"),
+                        dependency.state,
+                        dependency.observed_at,
                     );
                 }
                 println!("{}", issue.description.trim());
@@ -1540,6 +1551,58 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                 DepAction::Rm { child, parent } => (child, parent, false),
             };
             reject_remote_mutation(child, "add a dependency to")?;
+            // A canonical parent is a remote edge, not a local dep. It is verified offline from
+            // local pins/cache and stored on the child; the remote issue never becomes a row.
+            if parent.starts_with("marbles://") {
+                let reference = CanonicalRef::parse(parent)
+                    .map_err(|error| format!("invalid canonical remote ref {parent:?}: {error}"))?;
+                let Mode::Local(db) = mode else {
+                    return Err(format!(
+                        "remote dependencies are local client state; `mb dep` over HTTP cannot \
+                         store the verified edge for {reference} (run it against the local store)"
+                    ));
+                };
+                let at = now();
+                if add {
+                    let registry = RemoteRegistry::load(config::remotes_path())
+                        .map_err(|error| format!("remote registry rejected: {error}"))?;
+                    let cache = AssertionCache::at(config::assertion_cache_dir());
+                    let view = cache.read(
+                        &registry,
+                        &reference.store_id,
+                        reference.remote_issue_id(),
+                        at,
+                    );
+                    let Some(assertion) = view.assertion else {
+                        return Err(format!(
+                            "cannot add remote dependency {reference}: {} ({})",
+                            view.freshness,
+                            view.problem
+                                .or_else(|| view.missing.map(|reason| format!("{reason:?}")))
+                                .unwrap_or_else(|| "no verified assertion".to_string())
+                        ));
+                    };
+                    let dependency = RemoteDependency {
+                        canonical_ref: reference.to_string(),
+                        store_id: assertion.store_id,
+                        remote_issue_id: assertion.remote_issue_id,
+                        state: assertion.state,
+                        asserted_at: assertion.asserted_at,
+                        observed_at: assertion.observed_at,
+                        signature: assertion.signature,
+                        key_id: assertion.key_id,
+                        freshness: None,
+                    };
+                    db.add_remote_dep(child, &dependency, &actor, at)
+                        .map_err(|error| error.to_string())?;
+                    println!("ok");
+                } else {
+                    db.remove_remote_dep(child, &reference.to_string(), &actor, at)
+                        .map_err(|error| error.to_string())?;
+                    println!("ok");
+                }
+                return Ok(());
+            }
             reject_remote_mutation(parent, "add a dependency to")?;
             let body = serde_json::json!({"child": child, "parent": parent});
             let _: serde_json::Value = mode
@@ -2495,6 +2558,25 @@ fn run_store(action: &StoreAction, json: bool) -> Result<(), String> {
             }
         }
     }
+}
+
+/// Fill each remote edge's named freshness by re-verifying its stored assertion against the
+/// current pin. A missing/corrupt registry makes every remote edge `unverifiable`, never fresh.
+fn annotate_remote_dependencies(issue: &mut Issue) -> Result<(), String> {
+    if issue.remote_dependencies.is_empty() {
+        return Ok(());
+    }
+    let registry = RemoteRegistry::load(config::remotes_path()).unwrap_or_default();
+    let window = AssertionCache::at(config::assertion_cache_dir()).freshness_window_seconds();
+    let at = now();
+    for dependency in &mut issue.remote_dependencies {
+        dependency.freshness = Some(
+            remote_dependency_freshness(dependency, &registry, at, window)
+                .as_str()
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Pinned remotes are local client state: `$MARBLES_HOME/remotes.json`, never the tracker API.

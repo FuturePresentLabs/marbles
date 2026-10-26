@@ -129,6 +129,7 @@ mod tests {
                     depends_on_id: Some(d.to_string()),
                 })
                 .collect(),
+            remote_dependencies: Vec::new(),
             parent: None,
             evidence: Vec::new(),
             metadata: serde_json::json!({}),

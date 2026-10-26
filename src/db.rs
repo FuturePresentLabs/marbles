@@ -70,6 +70,21 @@ CREATE TABLE IF NOT EXISTS dep(
   depends_on  TEXT NOT NULL,
   PRIMARY KEY(issue_id, depends_on)
 );
+-- Cross-store blocker edges. The child is local; the reference names an issue in another
+-- store and carries the last verified assertion. This table never creates an `issue` row and is
+-- deliberately separate from `dep`, whose `depends_on` must resolve locally.
+CREATE TABLE IF NOT EXISTS remote_dep(
+  issue_id        TEXT NOT NULL,
+  canonical_ref   TEXT NOT NULL,
+  store_id        TEXT NOT NULL,
+  remote_issue_id TEXT NOT NULL,
+  state           TEXT NOT NULL,
+  asserted_at     INTEGER NOT NULL,
+  observed_at     INTEGER NOT NULL,
+  signature       TEXT NOT NULL,
+  key_id          TEXT NOT NULL,
+  PRIMARY KEY(issue_id, canonical_ref)
+);
 CREATE TABLE IF NOT EXISTS history(
   seq      INTEGER PRIMARY KEY AUTOINCREMENT,
   issue_id TEXT NOT NULL,
@@ -585,6 +600,10 @@ impl Db {
             )?;
             tx.execute(
                 &format!("DELETE FROM dep WHERE issue_id IN {mine} OR depends_on IN {mine}"),
+                params![slug],
+            )?;
+            tx.execute(
+                &format!("DELETE FROM remote_dep WHERE issue_id IN {mine}"),
                 params![slug],
             )?;
             tx.execute("DELETE FROM issue WHERE project = ?1", params![slug])?;
@@ -1231,6 +1250,85 @@ impl Db {
         })
     }
 
+    /// Store or refresh a remote dependency edge for `child`.
+    ///
+    /// The caller must have already verified `dependency` against the pinned key; this method
+    /// only persists the verified assertion. It never inserts an `issue` row, never inserts a
+    /// local `dep` row, and refuses a remote child (a cross-store edge must originate locally).
+    pub fn add_remote_dep(
+        &self,
+        child: &str,
+        dependency: &RemoteDependency,
+        actor: &str,
+        at: i64,
+    ) -> Result<()> {
+        let parsed = crate::refs::CanonicalRef::parse(&dependency.canonical_ref)
+            .map_err(|error| Error::Bad(format!("invalid canonical ref: {error}")))?;
+        if !parsed.names(&dependency.store_id, &dependency.remote_issue_id) {
+            return Err(Error::Bad(format!(
+                "canonical ref {} does not name store {} issue {}",
+                dependency.canonical_ref, dependency.store_id, dependency.remote_issue_id
+            )));
+        }
+        self.tx(|tx| {
+            let _ = row_to_issue(tx, child)?.ok_or_else(|| Error::NotFound(child.to_string()))?;
+            tx.execute(
+                "INSERT INTO remote_dep(
+                    issue_id, canonical_ref, store_id, remote_issue_id, state, asserted_at,
+                    observed_at, signature, key_id)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                 ON CONFLICT(issue_id, canonical_ref) DO UPDATE SET
+                    store_id=excluded.store_id,
+                    remote_issue_id=excluded.remote_issue_id,
+                    state=excluded.state,
+                    asserted_at=excluded.asserted_at,
+                    observed_at=excluded.observed_at,
+                    signature=excluded.signature,
+                    key_id=excluded.key_id",
+                params![
+                    child,
+                    dependency.canonical_ref,
+                    dependency.store_id,
+                    dependency.remote_issue_id,
+                    dependency.state,
+                    dependency.asserted_at,
+                    dependency.observed_at,
+                    dependency.signature,
+                    dependency.key_id,
+                ],
+            )?;
+            tx.execute(
+                "UPDATE issue SET updated_at=?2 WHERE id=?1",
+                params![child, at],
+            )?;
+            log_event(
+                tx,
+                child,
+                at,
+                actor,
+                "depends_on_remote",
+                &dependency.canonical_ref,
+            )
+        })
+    }
+
+    /// Remove one remote dependency edge. This changes local state only; the remote is untouched.
+    pub fn remove_remote_dep(
+        &self,
+        child: &str,
+        canonical_ref: &str,
+        actor: &str,
+        at: i64,
+    ) -> Result<()> {
+        self.tx(|tx| {
+            tx.execute(
+                "DELETE FROM remote_dep WHERE issue_id=?1 AND canonical_ref=?2",
+                params![child, canonical_ref],
+            )?;
+            log_event(tx, child, at, actor, "unblocked_from_remote", canonical_ref)
+        })
+    }
+
     // ---- claims ----
 
     /// Atomic claim. Succeeds when unclaimed or the holder's lease lapsed; a live foreign claim
@@ -1857,6 +1955,26 @@ fn row_to_issue(conn: &rusqlite::Connection, id: &str) -> Result<Option<Issue>> 
             depends_on_id: Some(row.get(0)?),
         });
     }
+    let mut remote_dependencies = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT canonical_ref, store_id, remote_issue_id, state, asserted_at, observed_at,
+                signature, key_id
+         FROM remote_dep WHERE issue_id = ?1 ORDER BY canonical_ref",
+    )?;
+    let mut rows = stmt.query(params![id])?;
+    while let Some(row) = rows.next()? {
+        remote_dependencies.push(RemoteDependency {
+            canonical_ref: row.get(0)?,
+            store_id: row.get(1)?,
+            remote_issue_id: row.get(2)?,
+            state: row.get(3)?,
+            asserted_at: row.get(4)?,
+            observed_at: row.get(5)?,
+            signature: row.get(6)?,
+            key_id: row.get(7)?,
+            freshness: None,
+        });
+    }
     let dependency_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM dep d JOIN issue p ON p.id = d.depends_on
          WHERE d.issue_id = ?1 AND p.status != 'closed'",
@@ -1883,6 +2001,7 @@ fn row_to_issue(conn: &rusqlite::Connection, id: &str) -> Result<Option<Issue>> 
         dependency_count,
         dependent_count,
         dependencies,
+        remote_dependencies,
         evidence,
         parent,
         assignee,

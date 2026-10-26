@@ -781,6 +781,7 @@ fn row_to_issue(client: &mut impl GenericClient, company: &str, id: &str) -> Res
         external_ref: r.get(17),
         evidence: serde_json::from_str(r.get(18))?,
         dependencies: deps,
+        remote_dependencies: Vec::new(),
         dependency_count,
         dependent_count,
     }))
