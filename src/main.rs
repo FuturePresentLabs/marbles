@@ -269,6 +269,11 @@ enum Command {
         #[command(subcommand)]
         action: RemoteAction,
     },
+    /// The read-only Remotes workspace: each pinned store's identity and named freshness.
+    ///
+    /// Remote stores are not local work: they never appear in `mb projects`, `mb folder tree`,
+    /// `mb portfolio`, or `mb ready`, and cannot be claimed, assigned, or closed locally.
+    Remotes,
     /// Plans are DAGs over issues: inspect the graph, schedule it, take the frontier, or
     /// draft one from a spec before dispatching any worker.
     Plan {
@@ -378,6 +383,10 @@ struct UpdateArgs {
     append_notes: Option<String>,
     #[arg(long)]
     title: Option<String>,
+    /// Claim the issue to this actor (`update` assignment is a claim, not a metadata edit).
+    /// Remote refs are rejected: remote work is read-only.
+    #[arg(long)]
+    assignee: Option<String>,
     /// JSON object merged into metadata (null values delete keys).
     #[arg(long)]
     metadata: Option<String>,
@@ -710,6 +719,49 @@ fn actor_default() -> String {
 fn fail(message: impl std::fmt::Display) -> ExitCode {
     eprintln!("marbles: {message}");
     ExitCode::FAILURE
+}
+
+/// Split a remote reference into `(store, issue)`.
+///
+/// Two forms are recognized for F1.2: the canonical `marbles://<store>/<...>` prefix that F2 will
+/// own, and the shorthand `<store_or_pin>/<issue>`. Local issue ids never contain `/`, so this
+/// cannot mistake ordinary local work for a remote ref.
+fn remote_ref_parts(id: &str) -> Option<(&str, &str)> {
+    let rest = id.strip_prefix("marbles://").unwrap_or(id);
+    if id.trim() != id || id.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let (store, issue) = rest.split_once('/')?;
+    if store.is_empty() || issue.is_empty() {
+        return None;
+    }
+    Some((store, issue))
+}
+
+/// Refuse to mutate a remote reference before any local database or HTTP call happens.
+///
+/// This is the boundary that keeps a remote issue from ever looking local: a remote ref is a named
+/// error with the pinned store_id, never a silent no-op and never a local row insert. A ref whose
+/// store is not pinned is still rejected (read-only) with an actionable hint, so a typo cannot
+/// accidentally fall through to the local store.
+fn reject_remote_mutation(id: &str, action: &str) -> Result<(), String> {
+    let Some((store, issue)) = remote_ref_parts(id) else {
+        return Ok(());
+    };
+    let path = config::remotes_path();
+    let registry = RemoteRegistry::load(&path).map_err(|err| {
+        format!("remote refs are read-only: {id}; cannot {action} a remote issue ({err})")
+    })?;
+    let store_id = registry
+        .list()
+        .iter()
+        .find(|record| record.store_id == store || record.name == store)
+        .map(|record| record.store_id.as_str())
+        .unwrap_or(store);
+    Err(format!(
+        "remote refs are read-only: {store_id}/{issue}; cannot {action} a remote issue locally \
+         (remote pins are for read-only aggregation; inspect them with `mb remotes`)"
+    ))
 }
 
 /// The project a command runs against: explicit flag, else discovery from -C.
@@ -1304,6 +1356,14 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             Ok(())
         }
         Command::Update(args) => {
+            reject_remote_mutation(
+                &args.id,
+                if args.assignee.is_some() {
+                    "assign"
+                } else {
+                    "update"
+                },
+            )?;
             let metadata = match (json_arg(args.metadata.as_deref())?, &args.set_metadata) {
                 (base, Some(kv)) => {
                     let (key, value) = kv
@@ -1331,6 +1391,41 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                 evidence: None,
                 metadata,
             };
+            if let Some(assignee) = &args.assignee {
+                let body = serde_json::json!({
+                    "id": args.id.clone(),
+                    "assignee": assignee.clone(),
+                    "ttl_seconds": null,
+                });
+                let receipt: ClaimReceipt = mode
+                    .call("claims.claim", &body, |db| {
+                        let kind = if assignee == &actor_default() {
+                            ActorKind::Human
+                        } else {
+                            ActorKind::Agent
+                        };
+                        db.claim(
+                            &ClaimRequest {
+                                id: args.id.clone(),
+                                assignee: assignee.clone(),
+                                actor_kind: kind,
+                                ttl_seconds: None,
+                            },
+                            now(),
+                        )
+                        .map_err(|e| e.to_string())
+                    })
+                    .await?;
+                if !cli.json {
+                    println!(
+                        "assigned {} to {} ({}) until {}",
+                        receipt.id,
+                        receipt.assignee,
+                        receipt.actor_kind.as_str(),
+                        receipt.expires_at
+                    );
+                }
+            }
             let body = serde_json::json!({"id": args.id, "patch": patch});
             let issue: Issue = mode
                 .call("issues.update", &body, |db| {
@@ -1349,6 +1444,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             Ok(())
         }
         Command::Review { id, pr, commit } => {
+            reject_remote_mutation(id, "review")?;
             let body = serde_json::json!({"id": id});
             let existing: Issue = mode
                 .call("issues.get", &body, |db| {
@@ -1396,6 +1492,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             commit,
             ack,
         } => {
+            reject_remote_mutation(id, "close")?;
             let mut evidence: Vec<Evidence> = Vec::new();
             if let Some(pr) = pr {
                 evidence.push(Evidence::pr(pr.clone()));
@@ -1424,6 +1521,8 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             Ok(())
         }
         Command::Supersede { id, with } => {
+            reject_remote_mutation(id, "supersede")?;
+            reject_remote_mutation(with, "supersede")?;
             let body = serde_json::json!({"id": id, "replacement": with});
             let _: serde_json::Value = mode
                 .call("issues.supersede", &body, |db| {
@@ -1440,6 +1539,8 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                 DepAction::Add { child, parent } => (child, parent, true),
                 DepAction::Rm { child, parent } => (child, parent, false),
             };
+            reject_remote_mutation(child, "add a dependency to")?;
+            reject_remote_mutation(parent, "add a dependency to")?;
             let body = serde_json::json!({"child": child, "parent": parent});
             let _: serde_json::Value = mode
                 .call(if add { "deps.add" } else { "deps.remove" }, &body, |db| {
@@ -1460,6 +1561,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                 LabelAction::Add { id, label } => (id, label, true),
                 LabelAction::Remove { id, label } => (id, label, false),
             };
+            reject_remote_mutation(id, "label")?;
             let body = serde_json::json!({"id": id, "label": label});
             let _: serde_json::Value = mode
                 .call(
@@ -1480,6 +1582,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             Ok(())
         }
         Command::Claim { id, as_, ttl } => {
+            reject_remote_mutation(id, "claim")?;
             let assignee = as_.clone().unwrap_or_else(|| actor.clone());
             let body = serde_json::json!({"id": id, "assignee": assignee, "ttl_seconds": ttl});
             let receipt: ClaimReceipt = mode
@@ -1518,6 +1621,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             Ok(())
         }
         Command::Touch { id, as_ } => {
+            reject_remote_mutation(id, "touch")?;
             let holder = as_.clone().unwrap_or_else(|| actor.clone());
             let body = serde_json::json!({"id": id, "assignee": holder});
             let _: serde_json::Value = mode
@@ -1531,6 +1635,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             Ok(())
         }
         Command::Release { id, as_ } => {
+            reject_remote_mutation(id, "release")?;
             let holder = as_.clone().unwrap_or_else(|| actor.clone());
             let body = serde_json::json!({"id": id, "assignee": holder});
             let _: serde_json::Value = mode
@@ -2256,6 +2361,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
         }
         Command::Store { action } => run_store(action, cli.json),
         Command::Remote { action } => run_remote(action, cli.json).await,
+        Command::Remotes => run_remotes(cli.json),
     }
 }
 
@@ -2591,6 +2697,70 @@ async fn run_remote(action: &RemoteAction, json: bool) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+/// `mb remotes` is the Remotes workspace, not a project list.
+///
+/// It projects local client state only: the pinned registry plus the assertion cache. It never
+/// opens the tracker API and never writes a local row, so a remote store can never leak into the
+/// authoritative project/folder/issue tables. A missing registry is stated plainly and exits 0;
+/// a corrupt registry fails closed with the parser's named error.
+fn run_remotes(json: bool) -> Result<(), String> {
+    let path = config::remotes_path();
+    let registry =
+        RemoteRegistry::load(&path).map_err(|err| format!("remote registry rejected: {err}"))?;
+    let cache = AssertionCache::at(config::assertion_cache_dir());
+    let workspace = report::remotes_workspace(&registry, &cache, &path, now());
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&workspace).map_err(|err| err.to_string())?
+        );
+        return Ok(());
+    }
+    if workspace.remotes.is_empty() {
+        if workspace.registry_present {
+            println!("no remotes pinned ({})", path.display());
+        } else {
+            println!(
+                "no remotes pinned yet: registry does not exist ({})",
+                path.display()
+            );
+        }
+        println!(
+            "remote stores are a separate read-only workspace: they never appear in local \
+             projects, folders, portfolio, or ready work"
+        );
+        return Ok(());
+    }
+    println!(
+        "remotes — {} pinned, read-only; never local projects or ready work",
+        workspace.remotes.len()
+    );
+    println!("name\tstore_id\tkey_id\tendpoint\tfreshness\tobserved_at\treferences");
+    for entry in &workspace.remotes {
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            entry.name,
+            entry.store_id,
+            entry.key_id,
+            entry.endpoint,
+            entry.freshness.as_str(),
+            entry
+                .observed_at
+                .map(|at| at.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            entry.references,
+        );
+        if let Some(problem) = &entry.problem {
+            println!("  {problem}");
+        }
+    }
+    println!(
+        "freshness window: {}s; per-issue detail: `mb remote assertions <name>`",
+        workspace.freshness_window_seconds
+    );
+    Ok(())
 }
 
 /// The URL the current command is actually using. Remote client selection is resolved before

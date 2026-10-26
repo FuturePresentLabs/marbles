@@ -5,10 +5,13 @@
 //! in local mode and against the hosted API.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::assertion_cache::{AssertionCache, AssertionFreshness, AssertionView};
+use crate::identity::RemoteRegistry;
 use crate::types::{Folder, Issue, STATUSES};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -504,6 +507,119 @@ pub fn portfolio(
         folders: folder_rollups,
         unfiled,
         totals,
+    }
+}
+
+/// One pinned remote as it appears in the **Remotes workspace**.
+///
+/// This is a projection of local client state (`remotes.json` + the assertion cache). It is not a
+/// project, issue, or folder row, and nothing in the projection can create one: a remote store is
+/// listed here precisely so it never has to look like local work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteWorkspaceEntry {
+    pub name: String,
+    pub display_name: String,
+    pub store_id: String,
+    pub key_id: String,
+    /// Locator only; trust comes from `store_id`/`key_id`, never from the endpoint.
+    pub endpoint: String,
+    /// Named freshness for the remote as a whole (see [`remote_workspace_freshness`]).
+    pub freshness: AssertionFreshness,
+    /// Newest observation we hold for any of this remote's references, when one verified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<i64>,
+    /// Cached references (remote issues) we hold for this store.
+    pub references: usize,
+    /// Why the remote is `unverifiable`, when it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
+}
+
+/// The whole read-only Remotes workspace: pinned stores, their identities, and freshness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemotesWorkspace {
+    pub registry: String,
+    /// False before the first pin; the view still succeeds and says so plainly.
+    pub registry_present: bool,
+    pub freshness_window_seconds: i64,
+    pub remotes: Vec<RemoteWorkspaceEntry>,
+}
+
+/// Aggregate a remote's cached references into one named freshness.
+///
+/// The aggregate is deliberately fail-closed and never reports more health than the weakest
+/// reference we hold:
+///
+/// * any `unverifiable` reference makes the remote `unverifiable`;
+/// * any `unknown` reference (an unreachable observation, or no observation ever) makes the
+///   remote `unknown` — an outage can never read as healthy;
+/// * otherwise any `stale` reference makes it `stale`;
+/// * only when every reference verifies inside the window is the remote `fresh`.
+///
+/// No references means `unknown`, never `fresh`/zero.
+pub fn remote_workspace_freshness(views: &[AssertionView]) -> AssertionFreshness {
+    let mut stale = false;
+    let mut fresh = false;
+    for view in views {
+        match view.freshness {
+            AssertionFreshness::Unverifiable => return AssertionFreshness::Unverifiable,
+            AssertionFreshness::Unknown => return AssertionFreshness::Unknown,
+            AssertionFreshness::Stale => stale = true,
+            AssertionFreshness::Fresh => fresh = true,
+        }
+    }
+    if stale {
+        AssertionFreshness::Stale
+    } else if fresh {
+        AssertionFreshness::Fresh
+    } else {
+        AssertionFreshness::Unknown
+    }
+}
+
+fn remote_entry(
+    registry: &RemoteRegistry,
+    cache: &AssertionCache,
+    record: &crate::identity::RemoteRecord,
+    now: i64,
+) -> RemoteWorkspaceEntry {
+    let views = cache.read_all(registry, &record.store_id, now);
+    let freshness = remote_workspace_freshness(&views);
+    let observed_at = views.iter().filter_map(AssertionView::observed_at).max();
+    let problem = views.iter().find_map(|view| view.problem.clone());
+    RemoteWorkspaceEntry {
+        name: record.name.clone(),
+        display_name: record.display_name.clone(),
+        store_id: record.store_id.clone(),
+        key_id: record.key_id.clone(),
+        endpoint: record.endpoint.clone(),
+        freshness,
+        observed_at,
+        references: views.len(),
+        problem,
+    }
+}
+
+/// Build the Remotes workspace from the registry and assertion cache.
+///
+/// A missing registry is an empty workspace (`registry_present = false`), not an error. A corrupt
+/// registry is rejected by [`RemoteRegistry::load`] before this function runs, so the CLI fails
+/// closed with a named error rather than showing a half-built view.
+pub fn remotes_workspace(
+    registry: &RemoteRegistry,
+    cache: &AssertionCache,
+    registry_path: &Path,
+    now: i64,
+) -> RemotesWorkspace {
+    RemotesWorkspace {
+        registry: registry_path.display().to_string(),
+        registry_present: registry_path.exists(),
+        freshness_window_seconds: cache.freshness_window_seconds(),
+        remotes: registry
+            .list()
+            .iter()
+            .map(|record| remote_entry(registry, cache, record, now))
+            .collect(),
     }
 }
 
