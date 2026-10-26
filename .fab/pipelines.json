@@ -15,6 +15,11 @@
         "name": "marbles-gate",
         "steps": [
           {
+            "name": "gate:prereqs",
+            "shell": "/bin/bash",
+            "run": "set -euo pipefail\nmissing=0\nfor tool in git cargo; do\n  command -v \"$tool\" >/dev/null 2>&1 || { echo \"FAIL missing prerequisite: $tool\"; missing=1; }\ndone\n[ -f Cargo.lock ] || { echo \"FAIL missing prerequisite: Cargo.lock (offline workspace test)\"; missing=1; }\nexit \"$missing\"\n"
+          },
+          {
             "name": "gate:freshness",
             "shell": "/bin/bash",
             "run": "set -euo pipefail\nbase=\"${FAB_BASE_REF:-origin/main}\"\ngit fetch --quiet --depth 50 origin \"${base#origin/}\" || { echo \"FAIL missing prerequisite: cannot fetch $base\"; exit 127; }\nhead_ref=\"${FAB_GIT_REF:-$(git rev-parse --abbrev-ref HEAD)}\"\ncase \"$head_ref\" in main|refs/heads/main) echo \"freshness: base branch run\"; exit 0;; esac\nif ! git merge-base --is-ancestor \"$base\" HEAD; then\n  echo \"remote: stale \u2014 $base has moved; rebase before this run can be CI evidence\"\n  exit 1\nfi\necho \"freshness: $base is an ancestor of $head_ref\"\n"
@@ -39,6 +44,11 @@
         "type": "workflow",
         "name": "marbles-release",
         "steps": [
+          {
+            "name": "gate:prereqs",
+            "shell": "/bin/bash",
+            "run": "set -euo pipefail\nmissing=0\nfor tool in git cargo; do\n  command -v \"$tool\" >/dev/null 2>&1 || { echo \"FAIL missing prerequisite: $tool\"; missing=1; }\ndone\n[ -f Cargo.lock ] || { echo \"FAIL missing prerequisite: Cargo.lock (offline workspace test)\"; missing=1; }\nexit \"$missing\"\n"
+          },
           {
             "name": "gate:freshness",
             "shell": "/bin/bash",
