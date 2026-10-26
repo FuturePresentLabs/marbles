@@ -193,7 +193,11 @@ impl Fixture {
 }
 
 fn assert_only_child(rows: &[serde_json::Value], child: &str) {
-    assert_eq!(rows.len(), 1, "only the local dependent should appear: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the local dependent should appear: {rows:?}"
+    );
     assert_eq!(rows[0]["id"], serde_json::json!(child));
 }
 

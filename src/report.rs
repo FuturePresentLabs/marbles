@@ -718,7 +718,11 @@ mod tests {
         );
         for (freshness, state, expected) in [
             (AssertionFreshness::Fresh, Some("open"), "remote: open"),
-            (AssertionFreshness::Fresh, Some("blocked"), "remote: blocked"),
+            (
+                AssertionFreshness::Fresh,
+                Some("blocked"),
+                "remote: blocked",
+            ),
             (AssertionFreshness::Stale, Some("closed"), "remote: stale"),
             (AssertionFreshness::Unknown, None, "remote: unknown"),
             (
