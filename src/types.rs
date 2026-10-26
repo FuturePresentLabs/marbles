@@ -83,6 +83,29 @@ pub struct Dependency {
     pub depends_on_id: Option<String>,
 }
 
+/// A dependency on an issue in another store, stored as a reference plus the last verified
+/// assertion we observed.
+///
+/// This is deliberately *not* a [`Dependency`]: the remote issue has no local row, so its id must
+/// never be mistaken for local work. The canonical reference is the stable address; the assertion
+/// fields are the last state we saw, and [`Self::freshness`] is filled by a read that re-verifies
+/// against the current pin (absent on the stored row itself).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteDependency {
+    /// `marbles://<store_id>/<company>/<project>/<issue_id>`.
+    pub canonical_ref: String,
+    pub store_id: String,
+    pub remote_issue_id: String,
+    pub state: String,
+    pub asserted_at: i64,
+    pub observed_at: i64,
+    pub signature: String,
+    pub key_id: String,
+    /// Named freshness (`fresh` | `stale` | `unknown` | `unverifiable`), computed on display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Issue {
     pub id: String,

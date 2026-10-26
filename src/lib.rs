@@ -25,6 +25,7 @@ pub mod oidc;
 pub mod plan;
 pub mod postgres_migration;
 pub mod postgres_store;
+pub mod refs;
 pub mod setup;
 pub mod time;
 pub mod types;
