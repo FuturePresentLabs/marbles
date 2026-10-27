@@ -3,3 +3,4 @@
 .worktrees/
 __pycache__/
 *.pyc
+/viewer/marbles-view/target/

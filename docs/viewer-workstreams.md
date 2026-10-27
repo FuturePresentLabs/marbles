@@ -13,7 +13,7 @@ issue graph. No view owns state, invents values, or creates a second source of t
   mode so the layout can be reviewed without a tracker.
 - The Gantt view reuses the plan scheduler, reports `estimate_source: "metadata" | "default"`,
   excludes goals and closed work by default, and fails closed on a cycle.
-- `marbles-canvas-sync` (Rust, `src/bin/marbles-canvas-sync.rs`) projects `views.dashboard` into the `marbles-live` Canvas workspace and
+- `marbles-canvas-sync` (Rust host, `src/bin/marbles-canvas-sync.rs`) fetches `views.dashboard`, runs the no-import `viewer/marbles-view` wasm projection, and applies the result to the `marbles-live` Canvas workspace. It
   refreshes it on an interval. It reads the owner token afresh each cycle, refuses redirects,
   keeps the last good workspace on a failed fetch, and never writes tracker state.
 
@@ -165,14 +165,17 @@ harness, not a third design system; replace it with the Canvas renderer when B2 
 
 ### B2 — Canvas widget adapter
 
-Implemented as the Rust binary `marbles-canvas-sync`:
+Implemented as the Rust host `marbles-canvas-sync` plus the `viewer/marbles-view` wasm module:
 
-- fetch `views.dashboard` with the owner credential and map it to durable `WidgetSpec`s:
-  `metric_board` for totals, `table` for ready/in-flight work, and `table` for the critical path
+- the wasm module owns the dashboard -> `WidgetSpec` projection: `metric_board` for totals,
+  `table` for ready/in-flight work, and `table` for the critical path
+- the host fetches `views.dashboard` with the owner credential, runs the module under wasmtime,
+  and applies the document through the owner control socket; the Marbles bearer never enters the
+  wasm module or the browser
+- the same core wasm ABI is run by the browser/V8 host in `viewer/marbles-view/web`; it has no
+  imports, so there is no ambient network, filesystem, clock, or token access
 - keep provenance/freshness in `WidgetData`; the footer carries `observed_at`, and a failed fetch
   leaves the last good workspace on screen instead of drawing a healthy-looking zero
-- apply the document through the owner control socket (`canvasctl doc`), so the Marbles bearer
-  never enters the browser
 - bump the widget spec id with the document revision. Canvas deliberately retains a live widget
   when the spec id and family are unchanged (for stream-bound values), so this is what makes a
   snapshot refresh decode instead of leaving stale data on screen.

@@ -1,12 +1,14 @@
 //! Refresh the `marbles-live` Canvas workspace from the read-only views API.
 //!
-//! This is an adapter, not a second source of truth. It reads
-//! `views.dashboard`, projects it into Canvas widget JSON, and applies that
-//! document through the owner's local `canvasctl`. It never writes tracker
-//! state and never invents rows when the API is unavailable. A failed fetch or
-//! apply leaves the last good workspace on screen and retries on the interval.
+//! The dashboard -> widget projection lives in `viewer/marbles-view`, compiled
+//! to a no-import core wasm module. This binary is only the host: fetch the
+//! authenticated dashboard, run the module under wasmtime, then apply the
+//! resulting Canvas document through the owner's local `canvasctl`.
+//!
+//! It never writes tracker state and never invents rows when the API is
+//! unavailable. A failed fetch, wasm render, or apply leaves the last good
+//! workspace on screen and retries on the interval.
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -17,13 +19,13 @@ use clap::Parser;
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use wasmtime::{Engine, Instance, Module, Store};
 
 use marbles::client::{Client, Options};
 use marbles::config;
 
-const READY_ROWS: usize = 18;
-const FLOW_ROWS: usize = 10;
-const GANTT_ROWS: usize = 10;
+const MAX_VIEW_BYTES: usize = 16 * 1024 * 1024;
+const FUEL_BUDGET: u64 = 1_000_000_000;
 
 #[derive(Parser)]
 #[command(about = "refresh the Marbles Canvas workspace from the read-only views API")]
@@ -36,6 +38,12 @@ struct Args {
     token_file: Option<PathBuf>,
     #[arg(long, env = "CANVASCTL", default_value = "canvasctl")]
     canvasctl: PathBuf,
+    #[arg(
+        long,
+        env = "MARBLES_VIEW_WASM",
+        default_value = "viewer/marbles-view/target/wasm32-unknown-unknown/release/marbles_view.wasm"
+    )]
+    wasm: PathBuf,
     #[arg(long, default_value_t = 30.0)]
     interval: f64,
     #[arg(long, default_value_t = 20)]
@@ -60,6 +68,76 @@ struct Args {
 
 type Result<T> = std::result::Result<T, String>;
 
+struct ViewModule {
+    engine: Engine,
+    module: Module,
+}
+
+impl ViewModule {
+    fn load(path: &Path) -> Result<Self> {
+        let mut config = wasmtime::Config::new();
+        config.consume_fuel(true);
+        let engine = Engine::new(&config).map_err(|error| format!("wasmtime engine: {error}"))?;
+        let module = Module::from_file(&engine, path)
+            .map_err(|error| format!("read wasm module {}: {error:#}", path.display()))?;
+        Ok(Self { engine, module })
+    }
+
+    fn render(&self, dashboard: &Value) -> Result<Value> {
+        let input =
+            serde_json::to_vec(dashboard).map_err(|error| format!("dashboard JSON: {error}"))?;
+        if input.len() > MAX_VIEW_BYTES {
+            return Err(format!("dashboard exceeds {MAX_VIEW_BYTES} bytes"));
+        }
+        let mut store = Store::new(&self.engine, ());
+        store
+            .set_fuel(FUEL_BUDGET)
+            .map_err(|error| format!("wasm fuel: {error}"))?;
+        let instance = Instance::new(&mut store, &self.module, &[])
+            .map_err(|error| format!("instantiate marbles-view: {error:#}"))?;
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| "marbles-view has no memory export".to_owned())?;
+        let alloc = instance
+            .get_typed_func::<i32, i32>(&mut store, "alloc")
+            .map_err(|error| format!("marbles-view alloc export: {error}"))?;
+        let render = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "render_block")
+            .map_err(|error| format!("marbles-view render_block export: {error}"))?;
+
+        let input_ptr = alloc
+            .call(&mut store, input.len() as i32)
+            .map_err(|error| format!("marbles-view alloc: {error}"))?;
+        memory
+            .write(&mut store, input_ptr as usize, &input)
+            .map_err(|error| format!("marbles-view input write: {error}"))?;
+        let result_ptr = render
+            .call(&mut store, (input_ptr, input.len() as i32))
+            .map_err(|error| format!("marbles-view render: {error:#}"))?;
+
+        let mut header = [0u8; 4];
+        memory
+            .read(&store, result_ptr as usize, &mut header)
+            .map_err(|error| format!("marbles-view result header: {error}"))?;
+        let length = u32::from_le_bytes(header) as usize;
+        if length > MAX_VIEW_BYTES {
+            return Err(format!(
+                "marbles-view result exceeds {MAX_VIEW_BYTES} bytes"
+            ));
+        }
+        let mut output = vec![0u8; length];
+        memory
+            .read(&store, result_ptr as usize + 4, &mut output)
+            .map_err(|error| format!("marbles-view result: {error}"))?;
+        let value: Value = serde_json::from_slice(&output)
+            .map_err(|error| format!("marbles-view result JSON: {error}"))?;
+        if let Some(error) = value.get("error").and_then(Value::as_str) {
+            return Err(format!("marbles-view rejected dashboard: {error}"));
+        }
+        Ok(value)
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
@@ -67,10 +145,17 @@ async fn main() -> ExitCode {
         eprintln!("interval must be positive");
         return ExitCode::FAILURE;
     }
+    let view = match ViewModule::load(&args.wasm) {
+        Ok(view) => view,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let interval = Duration::from_secs_f64(args.interval);
     loop {
         let started = Instant::now();
-        match refresh(&args).await {
+        match refresh(&args, &view).await {
             Ok(()) => {}
             Err(error) => {
                 log(&format!("error: {error}"));
@@ -157,206 +242,8 @@ async fn fetch_dashboard(args: &Args) -> Result<Value> {
     Ok(dashboard)
 }
 
-fn observed_at(epoch: i64) -> String {
-    chrono::DateTime::from_timestamp(epoch, 0)
-        .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, false))
-        .unwrap_or_else(|| epoch.to_string())
-}
-
 fn number(value: &Value) -> i64 {
     value.as_i64().unwrap_or(0)
-}
-
-fn text(value: &Value) -> &str {
-    value.as_str().unwrap_or("")
-}
-
-fn estimate(value: &Value) -> String {
-    match value.as_i64() {
-        Some(value) => value.to_string(),
-        None => String::new(),
-    }
-}
-
-fn card_row(card: &Value, status: &str) -> Value {
-    json!([
-        status,
-        text(&card["id"]),
-        text(&card["project"]),
-        text(&card["title"]),
-        text(&card["assignee"]),
-        number(&card["blocked_by"]).to_string(),
-        estimate(&card["estimate"]),
-    ])
-}
-
-fn build_document(dashboard: &Value, revision: u64) -> Value {
-    let generated_at = number(&dashboard["generated_at"]);
-    let observed_at = observed_at(generated_at);
-    let data = json!({
-        "state": "ready",
-        "source": "marbles:views",
-        "observed_at": observed_at,
-        "window": "now",
-        "provenance": "live",
-    });
-    let totals = &dashboard["totals"];
-    let total = number(&totals["total"]);
-    let percent_done = totals["percent_done"].as_f64().unwrap_or(0.0);
-
-    let mut ready = Vec::new();
-    let mut in_flight = Vec::new();
-    if let Some(columns) = dashboard["scrum"]["columns"].as_array() {
-        for column in columns {
-            let status = text(&column["status"]);
-            let cards = column["cards"].as_array().cloned().unwrap_or_default();
-            if status == "open" {
-                ready = cards
-                    .into_iter()
-                    .filter(|card| number(&card["blocked_by"]) == 0)
-                    .collect();
-            } else if status == "in_progress" {
-                in_flight = cards;
-            }
-        }
-    }
-    let ready_rows: Vec<Value> = ready
-        .iter()
-        .take(READY_ROWS)
-        .map(|card| card_row(card, "open"))
-        .collect();
-    let flow_rows: Vec<Value> = in_flight
-        .iter()
-        .take(FLOW_ROWS)
-        .map(|card| card_row(card, "in_progress"))
-        .collect();
-
-    let nodes = dashboard["gantt"]["nodes"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let mut by_id: HashMap<String, &Value> = HashMap::new();
-    for node in &nodes {
-        for key in ["id", "key"] {
-            if let Some(id) = node[key].as_str() {
-                by_id.insert(id.to_owned(), node);
-            }
-        }
-    }
-    let mut gantt_rows = Vec::new();
-    if let Some(path) = dashboard["gantt"]["critical_path"].as_array() {
-        for id in path.iter().filter_map(Value::as_str).take(GANTT_ROWS) {
-            let Some(node) = by_id.get(id) else {
-                continue;
-            };
-            gantt_rows.push(json!([
-                format!("{}m", number(&node["start_min"])),
-                format!("{}m", number(&node["finish_min"])),
-                "critical",
-                text(&node["status"]),
-                text(&node["key"]),
-                text(&node["title"]),
-                estimate(&node["estimate"]),
-            ]));
-        }
-    }
-
-    // Canvas retains a live widget when its spec id and family are unchanged,
-    // preserving stream-bound values. A snapshot refresh is a new value, so
-    // give the retained widget a new id; the surface id and layout stay put.
-    let suffix = format!("-{revision}");
-    let summary_id = format!("marbles-summary{suffix}");
-    let ready_id = format!("marbles-ready{suffix}");
-    let flow_id = format!("marbles-flow{suffix}");
-    let gantt_id = format!("marbles-gantt{suffix}");
-
-    json!({
-        "schema_version": 1,
-        "theme": {"source": "project"},
-        "background": {"kind": "theme"},
-        "chrome": {"title": "hidden", "canvas_padding": 12, "surface_gap": 12},
-        "pages": [],
-        "active_page": 0,
-        "id": "marbles-live",
-        "project_id": "marbles",
-        "revision": revision,
-        "layout": {
-            "kind": "canvas",
-            "placements": [
-                {"surface_id": "marbles-summary", "bounds": {"x": 0.01, "y": 0.01, "width": 0.48, "height": 0.31}, "layer": 0},
-                {"surface_id": "marbles-gantt", "bounds": {"x": 0.50, "y": 0.01, "width": 0.49, "height": 0.60}, "layer": 0},
-                {"surface_id": "marbles-ready", "bounds": {"x": 0.01, "y": 0.33, "width": 0.48, "height": 0.66}, "layer": 0},
-                {"surface_id": "marbles-flow", "bounds": {"x": 0.50, "y": 0.62, "width": 0.49, "height": 0.37}, "layer": 0},
-            ],
-        },
-        "bindings": [],
-        "focused_surface_id": "marbles-summary",
-        "surfaces": [
-            {
-                "id": "marbles-summary",
-                "title": "Marbles fleet",
-                "content": {"kind": "widget", "spec": {
-                    "schema_version": 2,
-                    "id": summary_id,
-                    "kind": "metric_board",
-                    "title": "Marbles fleet",
-                    "style": "bullet",
-                    "metrics": [
-                        {"label": "Ready", "value": number(&totals["ready"]), "max": total, "state": "good"},
-                        {"label": "In progress", "value": number(&totals["in_progress"]), "max": total},
-                        {"label": "Review", "value": number(&totals["review"]), "max": total, "state": "warning"},
-                        {"label": "Blocked", "value": number(&totals["blocked"]), "max": total, "state": "critical"},
-                        {"label": "Stale", "value": number(&totals["stale"]), "max": total, "state": "warning"},
-                        {"label": "Done", "value": percent_done, "max": 100, "target": 100, "state": "neutral"},
-                    ],
-                    "data": data.clone(),
-                }},
-                "inputs": [],
-            },
-            {
-                "id": "marbles-ready",
-                "title": "Ready work",
-                "content": {"kind": "widget", "spec": {
-                    "schema_version": 2,
-                    "id": ready_id,
-                    "kind": "table",
-                    "title": "Ready work",
-                    "columns": ["Status", "ID", "Project", "Title", "Claim", "Blockers", "Min"],
-                    "rows": ready_rows,
-                    "data": data.clone(),
-                }},
-                "inputs": [],
-            },
-            {
-                "id": "marbles-flow",
-                "title": "In flight",
-                "content": {"kind": "widget", "spec": {
-                    "schema_version": 2,
-                    "id": flow_id,
-                    "kind": "table",
-                    "title": "In flight",
-                    "columns": ["Status", "ID", "Project", "Title", "Claim", "Blockers", "Min"],
-                    "rows": flow_rows,
-                    "data": data.clone(),
-                }},
-                "inputs": [],
-            },
-            {
-                "id": "marbles-gantt",
-                "title": "Gantt · critical path",
-                "content": {"kind": "widget", "spec": {
-                    "schema_version": 2,
-                    "id": gantt_id,
-                    "kind": "table",
-                    "title": "Gantt · critical path",
-                    "columns": ["Start", "End", "Path", "Status", "ID", "Title", "Min"],
-                    "rows": gantt_rows,
-                    "data": data,
-                }},
-                "inputs": [],
-            },
-        ],
-    })
 }
 
 fn read_state_revision(path: &Path) -> Option<u64> {
@@ -478,8 +365,8 @@ async fn apply_document(args: &Args, document: &Value, runtime_revision: u64) ->
     Ok(())
 }
 
-async fn refresh(args: &Args) -> Result<()> {
-    let dashboard = fetch_dashboard(args).await?;
+async fn refresh(args: &Args, view: &ViewModule) -> Result<()> {
+    let mut dashboard = fetch_dashboard(args).await?;
     let state = state_path(args);
     let state_revision = read_state_revision(&state).unwrap_or(0);
     let (canvas_revision, runtime_revision) = if args.dry_run {
@@ -488,11 +375,19 @@ async fn refresh(args: &Args) -> Result<()> {
         canvas_revisions(args).await?
     };
     let revision = state_revision.max(canvas_revision) + 1;
-    let document = build_document(&dashboard, revision);
+    dashboard["view_revision"] = json!(revision);
+    let mut document = view.render(&dashboard)?;
+    if document["revision"].as_u64() != Some(revision) {
+        return Err(format!(
+            "marbles-view revision mismatch: expected {revision}, got {}",
+            document["revision"]
+        ));
+    }
+    document["revision"] = json!(revision);
     write_document(&state, &document)?;
     let totals = &dashboard["totals"];
     log(&format!(
-        "fetched total={} ready={} in_progress={} critical={} revision={revision}",
+        "rendered total={} ready={} in_progress={} critical={} revision={revision}",
         number(&totals["total"]),
         number(&totals["ready"]),
         number(&totals["in_progress"]),
@@ -517,61 +412,5 @@ mod tests {
         assert_eq!(revision_after(text, "document rev "), Some(17));
         assert_eq!(revision_after(text, "runtime rev "), Some(19));
         assert_eq!(revision_after(text, "missing "), None);
-    }
-
-    #[test]
-    fn document_projects_ready_flow_and_critical_path() {
-        let dashboard = json!({
-            "generated_at": 0,
-            "totals": {
-                "total": 3,
-                "ready": 1,
-                "in_progress": 1,
-                "review": 0,
-                "blocked": 1,
-                "stale": 0,
-                "percent_done": 33.3
-            },
-            "scrum": {"columns": [
-                {"status": "open", "cards": [
-                    {"id": "ready", "project": "demo", "title": "Ready", "blocked_by": 0},
-                    {"id": "blocked", "project": "demo", "title": "Blocked", "blocked_by": 2}
-                ]},
-                {"status": "in_progress", "cards": [
-                    {"id": "running", "project": "demo", "title": "Running", "blocked_by": 0}
-                ]}
-            ]},
-            "gantt": {
-                "critical_path": ["ready"],
-                "nodes": [{
-                    "id": "ready",
-                    "key": "ready",
-                    "title": "Ready",
-                    "status": "open",
-                    "start_min": 0,
-                    "finish_min": 30,
-                    "estimate": 30
-                }]
-            }
-        });
-        let document = build_document(&dashboard, 9);
-        assert_eq!(document["revision"], 9);
-        assert_eq!(
-            document["surfaces"][0]["content"]["spec"]["id"],
-            "marbles-summary-9"
-        );
-        assert_eq!(
-            document["surfaces"][0]["content"]["spec"]["data"]["observed_at"],
-            "1970-01-01T00:00:00+00:00"
-        );
-        let ready = &document["surfaces"][1]["content"]["spec"]["rows"];
-        assert_eq!(ready.as_array().map(Vec::len), Some(1));
-        assert_eq!(ready[0][1], "ready");
-        let flow = &document["surfaces"][2]["content"]["spec"]["rows"];
-        assert_eq!(flow.as_array().map(Vec::len), Some(1));
-        assert_eq!(flow[0][1], "running");
-        let gantt = &document["surfaces"][3]["content"]["spec"]["rows"];
-        assert_eq!(gantt[0][0], "0m");
-        assert_eq!(gantt[0][2], "critical");
     }
 }

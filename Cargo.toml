@@ -28,6 +28,7 @@ sha2        = "0.10"
 thiserror   = "2"
 tokio       = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "signal"] }
 toml        = "0.9"
+wasmtime    = { version = "34", default-features = false, features = ["cranelift", "runtime", "std"] }
 
 [dev-dependencies]
 tempfile = "3"

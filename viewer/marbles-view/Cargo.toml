@@ -1,0 +1,18 @@
+[package]
+name = "marbles-view"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Pure Marbles view projection compiled to a no-import core wasm module"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
