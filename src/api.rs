@@ -59,6 +59,9 @@ impl Api {
             .route("/v1/plans.gantt", post(plans_gantt))
             .route("/v1/plans.ready", post(plans_ready))
             .route("/v1/plans.create", post(plans_create))
+            .route("/v1/views.dashboard", post(views_dashboard))
+            .route("/v1/views.scrum", post(views_scrum))
+            .route("/v1/views.gantt", post(views_gantt))
             .route("/v1/issues.update", post(issues_update))
             .route("/v1/issues.close", post(issues_close))
             .route("/v1/issues.supersede", post(issues_supersede))
@@ -232,6 +235,24 @@ storage_handler!(
     crate::plan::ResolvedPlan,
     crate::plan::CreateReport
 );
+storage_handler!(
+    views_dashboard,
+    views_dashboard_blocking,
+    ViewsDashboardBody,
+    crate::report::Dashboard
+);
+storage_handler!(
+    views_scrum,
+    views_scrum_blocking,
+    ViewsScopeBody,
+    crate::report::ScrumView
+);
+storage_handler!(
+    views_gantt,
+    views_gantt_blocking,
+    ViewsGanttBody,
+    crate::plan::GanttView
+);
 
 /// Plans are views over ordinary issues, so every endpoint resolves the caller's company store
 /// exactly like the issue endpoints do. Local and hosted Marbles therefore compute the same DAG.
@@ -278,6 +299,159 @@ fn plans_create_blocking(
     let report = crate::plan::create(&*store, &body, crate::db::now(), &principal.name)
         .map_err(DbError::Bad)?;
     Ok(Json(report))
+}
+
+#[derive(Deserialize)]
+struct ViewsScopeBody {
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    folder: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+}
+
+impl ViewsScopeBody {
+    fn scope(&self) -> crate::report::ViewScope {
+        crate::report::ViewScope {
+            project: self.project.clone(),
+            folder: self.folder.clone(),
+            plan: self.plan.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ViewsDashboardBody {
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    folder: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default = "default_days")]
+    days: i64,
+    #[serde(default = "default_stale_days")]
+    stale_days: i64,
+}
+
+fn default_days() -> i64 {
+    14
+}
+
+fn default_stale_days() -> i64 {
+    7
+}
+
+#[derive(Deserialize)]
+struct ViewsGanttBody {
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    folder: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    include_closed: bool,
+    #[serde(default = "default_view_estimate_min")]
+    default_estimate_min: i64,
+}
+
+fn default_view_estimate_min() -> i64 {
+    60
+}
+
+fn view_projects(store: &dyn Store) -> Result<Vec<crate::report::ProjectInfo>, DbError> {
+    let rows = store.projects()?;
+    let folders = store.folder_view()?;
+    Ok(rows
+        .into_iter()
+        .map(|(slug, root, prefix)| {
+            let folder = folders
+                .projects
+                .iter()
+                .find(|project| project.project == slug)
+                .map(|project| project.folder.clone());
+            crate::report::ProjectInfo {
+                slug,
+                root,
+                prefix,
+                folder,
+            }
+        })
+        .collect())
+}
+
+fn views_dashboard_blocking(
+    State(api): State<Arc<Api>>,
+    Extension(principal): Extension<Principal>,
+    Json(body): Json<ViewsDashboardBody>,
+) -> Res<crate::report::Dashboard> {
+    let store = api.db_for(&principal)?;
+    let all = store.list(None, true, None)?;
+    let projects = view_projects(&*store)?;
+    let folders = store.folder_view()?.folders;
+    Ok(Json(crate::report::dashboard(
+        &projects,
+        &folders,
+        &all,
+        crate::report::ViewScope {
+            project: body.project,
+            folder: body.folder,
+            plan: body.plan,
+        },
+        body.days,
+        body.stale_days,
+        crate::plan::DEFAULT_ESTIMATE_MINUTES,
+        crate::db::now(),
+    )?))
+}
+
+fn views_scrum_blocking(
+    State(api): State<Arc<Api>>,
+    Extension(principal): Extension<Principal>,
+    Json(body): Json<ViewsScopeBody>,
+) -> Res<crate::report::ScrumView> {
+    let store = api.db_for(&principal)?;
+    let all = store.list(None, true, None)?;
+    let projects = view_projects(&*store)?;
+    let scope = body.scope();
+    let selected = crate::report::scope_issues(&all, &projects, &scope);
+    Ok(Json(crate::report::ScrumView {
+        schema: "marbles.view.scrum.v1".into(),
+        generated_at: crate::db::now(),
+        scope,
+        board: crate::report::scrum(&selected, &all, crate::db::now()),
+    }))
+}
+
+fn views_gantt_blocking(
+    State(api): State<Arc<Api>>,
+    Extension(principal): Extension<Principal>,
+    Json(body): Json<ViewsGanttBody>,
+) -> Res<crate::plan::GanttView> {
+    let store = api.db_for(&principal)?;
+    let all = store.list(None, true, None)?;
+    let projects = view_projects(&*store)?;
+    let scope = crate::report::ViewScope {
+        project: body.project.clone(),
+        folder: body.folder.clone(),
+        plan: body.plan.clone(),
+    };
+    let selected = crate::report::scope_issues(&all, &projects, &scope);
+    let gantt_scope = crate::plan::GanttScope {
+        project: body.project,
+        folder: body.folder,
+        plan: body.plan,
+    };
+    Ok(Json(crate::plan::gantt_scoped(
+        &all,
+        selected,
+        gantt_scope,
+        body.include_closed,
+        body.default_estimate_min.max(1),
+        crate::db::now(),
+    )?))
 }
 
 fn metrics_blocking(

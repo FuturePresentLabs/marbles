@@ -68,9 +68,22 @@ pub fn plan_name_of(issue: &Issue) -> Option<&str> {
 /// The estimate in minutes; never zero, so the Gantt and critical path stay meaningful for
 /// nodes whose spec omitted one.
 pub fn estimate_of(issue: &Issue) -> i64 {
-    meta_i64(issue, META_ESTIMATE)
-        .filter(|m| *m > 0)
-        .unwrap_or(DEFAULT_ESTIMATE_MINUTES)
+    estimate_of_with_default(issue, DEFAULT_ESTIMATE_MINUTES).0
+}
+
+/// The numeric estimate carried in metadata, when it is usable. This is the raw field the scrum
+/// card reports; the Gantt applies the scheduler's default when it is absent.
+pub fn metadata_estimate(issue: &Issue) -> Option<i64> {
+    meta_i64(issue, META_ESTIMATE).filter(|minutes| *minutes > 0)
+}
+
+/// Resolve one node's duration and where it came from. `default` is explicit so a view can ask
+/// for its own estimate without changing plan semantics.
+pub fn estimate_of_with_default(issue: &Issue, default: i64) -> (i64, &'static str) {
+    match metadata_estimate(issue) {
+        Some(minutes) => (minutes, "metadata"),
+        None => (default.max(1), "default"),
+    }
 }
 
 fn conflict_group(issue: &Issue) -> Option<&str> {
@@ -281,6 +294,7 @@ pub struct PlanGraph {
     pub plan: String,
     nodes: Vec<Issue>,
     status_of: HashMap<String, String>,
+    default_estimate: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -348,6 +362,25 @@ pub struct CreateReport {
 impl PlanGraph {
     pub fn nodes(&self) -> &[Issue] {
         &self.nodes
+    }
+
+    /// Build a graph over an arbitrary issue scope. The plan loader uses this for named plans;
+    /// the view API uses it for project/folder scopes with an explicit default estimate.
+    pub fn scoped(
+        name: impl Into<String>,
+        nodes: Vec<Issue>,
+        status_of: HashMap<String, String>,
+        default_estimate: i64,
+    ) -> Result<Self> {
+        let graph = Self {
+            plan: name.into(),
+            nodes,
+            status_of,
+            default_estimate: default_estimate.max(1),
+        };
+        // A read must fail closed: a hand-edited cycle never produces a partial chart.
+        graph.topo()?;
+        Ok(graph)
     }
 
     fn index(&self) -> HashMap<&str, &Issue> {
@@ -431,7 +464,7 @@ impl PlanGraph {
             repo: meta_str(issue, META_REPO).map(str::to_owned),
             conflict_group: conflict_group(issue).map(str::to_owned),
             risk: meta_str(issue, META_RISK).map(str::to_owned),
-            estimate: estimate_of(issue),
+            estimate: estimate_of_with_default(issue, self.default_estimate).0,
             done_means: meta_str(issue, META_DONE).map(str::to_owned),
             acceptance: meta_str(issue, META_ACCEPTANCE).map(str::to_owned),
             deps: self
@@ -513,6 +546,7 @@ pub fn load(store: &dyn Store, plan_name: &str) -> Result<PlanGraph> {
         plan: plan_name.to_owned(),
         nodes,
         status_of,
+        default_estimate: DEFAULT_ESTIMATE_MINUTES,
     };
     // Validate the DAG as loaded, so a hand-edited cycle surfaces on `show` rather than hanging
     // an executor that assumes a topological frontier.
@@ -669,6 +703,8 @@ pub struct GanttNode {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conflict_group: Option<String>,
     pub estimate: i64,
+    /// `metadata` when the issue carried an estimate, `default` when the scheduler supplied one.
+    pub estimate_source: String,
     /// Minutes from plan start (`started_at`).
     pub start_min: i64,
     pub finish_min: i64,
@@ -706,7 +742,12 @@ pub fn gantt(graph: &PlanGraph, now: i64) -> Result<Gantt> {
         .map(|(i, n)| (n.id.as_str(), i))
         .collect();
     let n = graph.nodes.len();
-    let durations: Vec<i64> = graph.nodes.iter().map(estimate_of).collect();
+    let estimates: Vec<(i64, &'static str)> = graph
+        .nodes
+        .iter()
+        .map(|issue| estimate_of_with_default(issue, graph.default_estimate))
+        .collect();
+    let durations: Vec<i64> = estimates.iter().map(|(minutes, _)| *minutes).collect();
     let mut start = vec![0i64; n];
     let mut finish = vec![0i64; n];
     for &i in &order {
@@ -784,6 +825,7 @@ pub fn gantt(graph: &PlanGraph, now: i64) -> Result<Gantt> {
                 repo: meta_str(issue, META_REPO).map(str::to_owned),
                 conflict_group: conflict_group(issue).map(str::to_owned),
                 estimate: durations[i],
+                estimate_source: estimates[i].1.to_owned(),
                 start_min: start[i],
                 finish_min: finish[i],
                 slack_min: slack[i],
@@ -811,6 +853,72 @@ pub fn gantt(graph: &PlanGraph, now: i64) -> Result<Gantt> {
         total_minutes: total,
         current_concurrency,
         peak_concurrency: peak as usize,
+    })
+}
+
+/// The scope a generalized Gantt view was requested over. Nulls mean "not filtered".
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GanttScope {
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub plan: Option<String>,
+}
+
+/// A Gantt chart over an ordinary issue scope. It flattens [`Gantt`] so existing plan consumers
+/// keep the same node/critical-path shape, then adds the scope and estimate policy that produced it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GanttView {
+    #[serde(flatten)]
+    pub gantt: Gantt,
+    pub scope: GanttScope,
+    pub default_estimate_min: i64,
+}
+
+/// Schedule a plan or an ordinary issue scope through the same scheduler as `plans.gantt`.
+///
+/// Goals are containers and never become work cards. Closed issues are excluded unless
+/// `include_closed` is explicit. `all_issues` supplies dependency statuses outside the selected
+/// scope, so an external blocker still gates readiness; a dependency missing from the store is
+/// simply absent (the Gantt cannot schedule an edge it has no row for).
+pub fn gantt_scoped(
+    all_issues: &[Issue],
+    selected: Vec<Issue>,
+    scope: GanttScope,
+    include_closed: bool,
+    default_estimate_min: i64,
+    now: i64,
+) -> Result<GanttView> {
+    let status_of: HashMap<String, String> = all_issues
+        .iter()
+        .map(|issue| (issue.id.clone(), issue.status.clone()))
+        .collect();
+    let mut nodes: Vec<Issue> = selected
+        .into_iter()
+        .filter(|issue| issue.issue_type != "goal")
+        .filter(|issue| include_closed || issue.status != "closed")
+        .collect();
+    nodes.sort_by_key(|i| {
+        (
+            i.priority,
+            i.created_at,
+            meta_str(i, META_KEY).unwrap_or(i.id.as_str()).to_owned(),
+            i.id.clone(),
+        )
+    });
+    let name = scope
+        .plan
+        .clone()
+        .or_else(|| scope.project.clone())
+        .or_else(|| scope.folder.clone())
+        .unwrap_or_else(|| "all".into());
+    let graph = PlanGraph::scoped(name, nodes, status_of, default_estimate_min)?;
+    Ok(GanttView {
+        gantt: gantt(&graph, now)?,
+        scope,
+        default_estimate_min: default_estimate_min.max(1),
     })
 }
 
@@ -1283,5 +1391,66 @@ deps = ["a"]
         let draft = draft(&plan).unwrap();
         assert_eq!(draft.edges.len(), 1);
         assert_eq!(draft.nodes[1].metadata[META_PLAN], "p");
+    }
+
+    fn scoped_issue(id: &str, deps: &[&str], estimate: Option<i64>) -> Issue {
+        Issue {
+            id: id.into(),
+            title: id.into(),
+            status: "open".into(),
+            issue_type: "task".into(),
+            project: "p".into(),
+            dependencies: deps
+                .iter()
+                .map(|dep| crate::types::Dependency {
+                    depends_on_id: Some((*dep).into()),
+                })
+                .collect(),
+            metadata: estimate
+                .map(|minutes| serde_json::json!({META_ESTIMATE: minutes}))
+                .unwrap_or(serde_json::json!({})),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn scoped_gantt_uses_metadata_estimates_and_reports_the_default() {
+        let all = vec![
+            scoped_issue("a", &[], Some(20)),
+            scoped_issue("b", &["a"], None),
+        ];
+        let view = gantt_scoped(
+            &all,
+            all.clone(),
+            GanttScope {
+                project: Some("p".into()),
+                ..Default::default()
+            },
+            false,
+            60,
+            1_000,
+        )
+        .unwrap();
+        let a = view.gantt.nodes.iter().find(|node| node.id == "a").unwrap();
+        let b = view.gantt.nodes.iter().find(|node| node.id == "b").unwrap();
+        assert_eq!(a.estimate, 20);
+        assert_eq!(a.estimate_source, "metadata");
+        assert_eq!(b.estimate, 60);
+        assert_eq!(b.estimate_source, "default");
+        assert_eq!(a.start_min, 0);
+        assert_eq!(b.start_min, 20);
+        assert_eq!(
+            view.gantt.critical_path,
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn scoped_gantt_fails_closed_on_a_cycle() {
+        let all = vec![
+            scoped_issue("a", &["b"], None),
+            scoped_issue("b", &["a"], None),
+        ];
+        assert!(gantt_scoped(&all, all.clone(), GanttScope::default(), false, 60, 1_000).is_err());
     }
 }

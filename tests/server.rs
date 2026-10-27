@@ -431,3 +431,63 @@ async fn human_import_preserves_ids_deps_and_refuses_agents() {
         "{body}"
     );
 }
+
+#[tokio::test]
+async fn view_apis_are_read_only_and_share_the_issue_scope() {
+    let (app, dir) = app();
+    let token = token_file(dir.path(), "human-avery");
+
+    let (status, _) = call(&app, "views.dashboard", serde_json::json!({}), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = call(
+        &app,
+        "issues.create",
+        serde_json::json!({
+            "title": "view task",
+            "project": "demo",
+            "available_at": 0,
+            "metadata": {"plan": "v1", "estimate": 15},
+        }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = call(
+        &app,
+        "views.dashboard",
+        serde_json::json!({"project": "demo", "days": 14, "stale_days": 7}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["schema"], "marbles.view.dashboard.v1");
+    assert_eq!(value["totals"]["total"], 1);
+    assert_eq!(value["scrum"]["columns"][0]["status"], "open");
+
+    let (status, body) = call(
+        &app,
+        "views.scrum",
+        serde_json::json!({"plan": "v1"}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["schema"], "marbles.view.scrum.v1");
+    assert_eq!(value["columns"][0]["cards"][0]["estimate"], 15);
+
+    let (status, body) = call(
+        &app,
+        "views.gantt",
+        serde_json::json!({"project": "demo", "default_estimate_min": 45}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["nodes"][0]["estimate_source"], "metadata");
+    assert_eq!(value["scope"]["project"], "demo");
+}

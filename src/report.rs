@@ -413,7 +413,21 @@ pub fn portfolio(
     days: i64,
     stale_days: i64,
 ) -> Portfolio {
-    let statuses: BTreeMap<&str, &str> = issues
+    portfolio_with_universe(projects, folders, issues, issues, now, days, stale_days)
+}
+
+/// The same portfolio calculation when the projected rows are a scope but readiness must still
+/// see dependency statuses from the whole store.
+fn portfolio_with_universe(
+    projects: &[ProjectInfo],
+    folders: &[Folder],
+    issues: &[Issue],
+    status_universe: &[Issue],
+    now: i64,
+    days: i64,
+    stale_days: i64,
+) -> Portfolio {
+    let statuses: BTreeMap<&str, &str> = status_universe
         .iter()
         .map(|issue| (issue.id.as_str(), issue.status.as_str()))
         .collect();
@@ -508,6 +522,339 @@ pub fn portfolio(
         unfiled,
         totals,
     }
+}
+
+/// The filter shared by every `views.*` operation. Nulls mean "not filtered".
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ViewScope {
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub plan: Option<String>,
+}
+
+/// Select the issue rows a view may project. Scope filters never invent rows; dependencies outside
+/// the selected scope remain available through the full store when readiness is computed.
+pub fn scope_issues(issues: &[Issue], projects: &[ProjectInfo], scope: &ViewScope) -> Vec<Issue> {
+    let folder_projects: BTreeSet<&str> = scope
+        .folder
+        .as_deref()
+        .map(|folder| {
+            projects
+                .iter()
+                .filter(|project| project.folder.as_deref() == Some(folder))
+                .map(|project| project.slug.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    issues
+        .iter()
+        .filter(|issue| {
+            scope
+                .project
+                .as_deref()
+                .is_none_or(|project| issue.project == project)
+                && scope
+                    .folder
+                    .as_deref()
+                    .is_none_or(|_| folder_projects.contains(issue.project.as_str()))
+                && scope
+                    .plan
+                    .as_deref()
+                    .is_none_or(|plan| crate::plan::plan_name_of(issue) == Some(plan))
+        })
+        .cloned()
+        .collect()
+}
+
+fn selected_projects(
+    projects: &[ProjectInfo],
+    selected: &[Issue],
+    scope: &ViewScope,
+) -> Vec<ProjectInfo> {
+    let present: BTreeSet<&str> = selected
+        .iter()
+        .map(|issue| issue.project.as_str())
+        .collect();
+    projects
+        .iter()
+        .filter(|project| {
+            scope
+                .project
+                .as_deref()
+                .is_none_or(|slug| project.slug == slug)
+        })
+        .filter(|project| {
+            scope
+                .folder
+                .as_deref()
+                .is_none_or(|folder| project.folder.as_deref() == Some(folder))
+        })
+        .filter(|project| scope.plan.is_none() || present.contains(project.slug.as_str()))
+        .cloned()
+        .collect()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DashboardTotals {
+    pub total: i64,
+    pub open: i64,
+    pub in_progress: i64,
+    pub review: i64,
+    pub blocked: i64,
+    pub closed: i64,
+    pub ready: i64,
+    pub stale: i64,
+    pub percent_done: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Dashboard {
+    pub schema: String,
+    pub generated_at: i64,
+    pub scope: ViewScope,
+    pub totals: DashboardTotals,
+    pub portfolio: Portfolio,
+    pub burndown: Burndown,
+    pub scrum: ScrumBoard,
+    pub gantt: crate::plan::Gantt,
+}
+
+/// One board column. The vocabulary and order are [`STATUSES`], never a view-specific status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScrumColumn {
+    pub status: String,
+    pub title: String,
+    pub count: i64,
+    pub wip_limit: Option<i64>,
+    pub cards: Vec<ScrumCard>,
+}
+
+/// A bounded card projection, not a full `Issue` row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScrumCard {
+    pub id: String,
+    pub title: String,
+    pub project: String,
+    pub priority: i64,
+    pub issue_type: String,
+    pub assignee: Option<String>,
+    pub labels: Vec<String>,
+    pub epic: Option<String>,
+    pub blocked_by: i64,
+    pub age_seconds: i64,
+    pub estimate: Option<i64>,
+    pub plan: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScrumSwimlane {
+    pub key: String,
+    pub title: String,
+    pub columns: Vec<ScrumColumn>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScrumBoard {
+    pub columns: Vec<ScrumColumn>,
+    pub swimlanes: Vec<ScrumSwimlane>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScrumView {
+    pub schema: String,
+    pub generated_at: i64,
+    pub scope: ViewScope,
+    #[serde(flatten)]
+    pub board: ScrumBoard,
+}
+
+fn column_title(status: &str) -> &'static str {
+    match status {
+        "open" => "Ready",
+        "in_progress" => "In progress",
+        "review" => "Review",
+        "blocked" => "Blocked",
+        "deferred" => "Deferred",
+        "closed" => "Closed",
+        _ => "Unknown",
+    }
+}
+
+/// Count dependencies that still block this issue. Unlike the ready rule (which ignores a
+/// dependency row missing from the store), a missing row is not evidence of closure: the scrum
+/// card counts it as unresolved so the board cannot look healthier than the record it has.
+fn blocked_by(issue: &Issue, statuses: &BTreeMap<&str, &str>) -> i64 {
+    issue
+        .dependencies
+        .iter()
+        .filter(|dep| {
+            dep.depends_on_id
+                .as_deref()
+                .is_none_or(|id| statuses.get(id).is_none_or(|status| *status != "closed"))
+        })
+        .count() as i64
+}
+
+fn scrum_card(issue: &Issue, statuses: &BTreeMap<&str, &str>, now: i64) -> ScrumCard {
+    ScrumCard {
+        id: issue.id.clone(),
+        title: issue.title.clone(),
+        project: issue.project.clone(),
+        priority: issue.priority,
+        issue_type: issue.issue_type.clone(),
+        assignee: issue.assignee.clone(),
+        labels: issue.labels.clone(),
+        epic: issue.parent.clone(),
+        blocked_by: blocked_by(issue, statuses),
+        age_seconds: (now - issue.created_at).max(0),
+        estimate: crate::plan::metadata_estimate(issue),
+        plan: crate::plan::plan_name_of(issue).map(str::to_owned),
+    }
+}
+
+fn scrum_columns(work: &[&Issue], statuses: &BTreeMap<&str, &str>, now: i64) -> Vec<ScrumColumn> {
+    STATUSES
+        .iter()
+        .map(|status| {
+            let cards: Vec<ScrumCard> = work
+                .iter()
+                .filter(|issue| issue.status == *status)
+                .map(|issue| scrum_card(issue, statuses, now))
+                .collect();
+            ScrumColumn {
+                status: (*status).to_owned(),
+                title: column_title(status).to_owned(),
+                count: cards.len() as i64,
+                // No explicit policy exists in the store; a hard-coded limit would invent one.
+                wip_limit: None,
+                cards,
+            }
+        })
+        .collect()
+}
+
+/// Build the scrum projection over an already-selected issue scope. `all_issues` is the full store
+/// used to resolve dependency status; goals are containers and never appear as cards.
+pub fn scrum(selected: &[Issue], all_issues: &[Issue], now: i64) -> ScrumBoard {
+    let statuses: BTreeMap<&str, &str> = all_issues
+        .iter()
+        .map(|issue| (issue.id.as_str(), issue.status.as_str()))
+        .collect();
+    let mut work: Vec<&Issue> = selected
+        .iter()
+        .filter(|issue| issue.issue_type != "goal")
+        .collect();
+    work.sort_by_key(|issue| (issue.priority, issue.created_at, issue.id.clone()));
+    let projects: BTreeSet<&str> = work.iter().map(|issue| issue.project.as_str()).collect();
+    let swimlanes = projects
+        .into_iter()
+        .map(|project| {
+            let lane: Vec<&Issue> = work
+                .iter()
+                .copied()
+                .filter(|issue| issue.project == project)
+                .collect();
+            ScrumSwimlane {
+                key: project.to_owned(),
+                title: project.to_owned(),
+                columns: scrum_columns(&lane, &statuses, now),
+            }
+        })
+        .collect();
+    ScrumBoard {
+        columns: scrum_columns(&work, &statuses, now),
+        swimlanes,
+    }
+}
+
+/// One bounded aggregate for the landing screen. It fetches nothing itself: the caller supplies
+/// the same issue page, projects, and folders used by portfolio/burndown/scrum/gantt.
+pub fn dashboard(
+    projects: &[ProjectInfo],
+    folders: &[Folder],
+    all_issues: &[Issue],
+    scope: ViewScope,
+    days: i64,
+    stale_days: i64,
+    default_estimate_min: i64,
+    now: i64,
+) -> Result<Dashboard, crate::db::Error> {
+    let days = days.max(1);
+    let selected = scope_issues(all_issues, projects, &scope);
+    let work: Vec<&Issue> = selected
+        .iter()
+        .filter(|issue| issue.issue_type != "goal")
+        .collect();
+    let all_statuses: BTreeMap<&str, &str> = all_issues
+        .iter()
+        .map(|issue| (issue.id.as_str(), issue.status.as_str()))
+        .collect();
+    let progress = Progress::from_issues(&work);
+    let stale_cutoff = now.saturating_sub(stale_days.max(0).saturating_mul(86_400));
+    let totals = DashboardTotals {
+        total: progress.total,
+        open: progress.open,
+        in_progress: progress.in_progress,
+        review: progress.review,
+        blocked: progress.blocked,
+        closed: progress.closed,
+        ready: work
+            .iter()
+            .filter(|issue| is_ready(issue, &all_statuses, now))
+            .count() as i64,
+        stale: work
+            .iter()
+            .filter(|issue| matches!(issue.status.as_str(), "open" | "in_progress"))
+            .filter(|issue| issue.updated_at < stale_cutoff)
+            .count() as i64,
+        percent_done: progress.percent_done,
+    };
+    let portfolio_projects = selected_projects(projects, &selected, &scope);
+    let portfolio = portfolio_with_universe(
+        &portfolio_projects,
+        folders,
+        &selected,
+        all_issues,
+        now,
+        days,
+        stale_days,
+    );
+    let burndown = burndown(
+        &work
+            .iter()
+            .map(|issue| (*issue).clone())
+            .collect::<Vec<_>>(),
+        days,
+        now,
+    );
+    let scrum = scrum(&selected, all_issues, now);
+    let gantt_scope = crate::plan::GanttScope {
+        project: scope.project.clone(),
+        folder: scope.folder.clone(),
+        plan: scope.plan.clone(),
+    };
+    let gantt = crate::plan::gantt_scoped(
+        all_issues,
+        selected,
+        gantt_scope,
+        false,
+        default_estimate_min,
+        now,
+    )?
+    .gantt;
+    Ok(Dashboard {
+        schema: "marbles.view.dashboard.v1".into(),
+        generated_at: now,
+        scope,
+        totals,
+        portfolio,
+        burndown,
+        scrum,
+        gantt,
+    })
 }
 
 /// One pinned remote as it appears in the **Remotes workspace**.
@@ -781,5 +1128,107 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, crate::db::Error::Bad(_)));
+    }
+
+    #[test]
+    fn scope_filters_project_folder_and_plan_without_inventing_rows() {
+        let mut a = issue("a", None, "task", "open", 0, None);
+        a.project = "alpha".into();
+        a.available_at = Some(0);
+        a.metadata = serde_json::json!({"plan": "p1"});
+        let mut b = issue("b", None, "task", "open", 0, None);
+        b.project = "beta".into();
+        b.available_at = Some(0);
+        b.metadata = serde_json::json!({"plan": "p2"});
+        let issues = vec![a, b];
+        let projects = vec![
+            ProjectInfo {
+                slug: "alpha".into(),
+                root: "/a".into(),
+                prefix: "a".into(),
+                folder: Some("work".into()),
+            },
+            ProjectInfo {
+                slug: "beta".into(),
+                root: "/b".into(),
+                prefix: "b".into(),
+                folder: Some("other".into()),
+            },
+        ];
+        let scope = |project: Option<&str>, folder: Option<&str>, plan: Option<&str>| ViewScope {
+            project: project.map(str::to_owned),
+            folder: folder.map(str::to_owned),
+            plan: plan.map(str::to_owned),
+        };
+        assert_eq!(
+            scope_issues(&issues, &projects, &scope(Some("alpha"), None, None)).len(),
+            1
+        );
+        assert_eq!(
+            scope_issues(&issues, &projects, &scope(None, Some("work"), None)).len(),
+            1
+        );
+        assert_eq!(
+            scope_issues(&issues, &projects, &scope(None, None, Some("p2")))[0].id,
+            "b"
+        );
+        assert!(scope_issues(&issues, &projects, &scope(Some("nope"), None, None)).is_empty());
+    }
+
+    #[test]
+    fn scrum_excludes_goals_and_counts_a_missing_dependency_as_blocking() {
+        let mut task = issue("t", None, "task", "open", 0, None);
+        task.dependencies = vec![Dependency {
+            depends_on_id: Some("missing".into()),
+        }];
+        let goal = issue("g", None, "goal", "open", 0, None);
+        let all = vec![task.clone(), goal];
+        let board = scrum(&all, &all, 10);
+        let cards: Vec<_> = board
+            .columns
+            .iter()
+            .flat_map(|column| column.cards.iter())
+            .collect();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].id, "t");
+        assert_eq!(cards[0].blocked_by, 1);
+        assert_eq!(board.swimlanes.len(), 1);
+    }
+
+    #[test]
+    fn dashboard_scope_totals_exclude_goal_containers() {
+        let now = 10 * 86_400;
+        let mut task = issue("t", None, "task", "open", 0, None);
+        task.available_at = Some(0);
+        let goal = issue("g", None, "goal", "open", 0, None);
+        let mut closed = issue("c", None, "task", "closed", 0, Some(86_400));
+        closed.available_at = Some(0);
+        let issues = vec![task, goal, closed];
+        let projects = vec![ProjectInfo {
+            slug: "p".into(),
+            root: "/p".into(),
+            prefix: "p".into(),
+            folder: None,
+        }];
+        let report = dashboard(
+            &projects,
+            &[],
+            &issues,
+            ViewScope::default(),
+            14,
+            7,
+            60,
+            now,
+        )
+        .unwrap();
+        assert_eq!(report.schema, "marbles.view.dashboard.v1");
+        assert_eq!(report.totals.total, 2, "goal is not work");
+        assert_eq!(report.totals.ready, 1);
+        assert_eq!(report.scrum.columns.iter().map(|c| c.count).sum::<i64>(), 2);
+        assert_eq!(
+            report.gantt.nodes.len(),
+            1,
+            "closed work is excluded from Gantt by default"
+        );
     }
 }
