@@ -91,6 +91,10 @@ fn project(dashboard: &Value) -> Value {
         "window": "now",
         "provenance": "live",
     });
+    if dashboard["view_mode"] == "burndown" {
+        return project_burndown(dashboard, revision, data);
+    }
+
     let totals = &dashboard["totals"];
     let total = number(&totals["total"]);
     let percent_done = totals["percent_done"].as_f64().unwrap_or(0.0);
@@ -251,6 +255,58 @@ fn project(dashboard: &Value) -> Value {
     })
 }
 
+fn project_burndown(dashboard: &Value, revision: u64, data: Value) -> Value {
+    let mut remaining = Vec::new();
+    let mut ideal = Vec::new();
+    if let Some(points) = dashboard["burndown"]["points"].as_array() {
+        for (index, point) in points.iter().enumerate() {
+            let x = index as f64;
+            remaining.push(json!({"x": x, "y": number(&point["remaining"]) as f64}));
+            ideal.push(json!({"x": x, "y": number(&point["ideal_remaining"]) as f64}));
+        }
+    }
+    let widget_id = format!("marbles-burndown-{revision}");
+    json!({
+        "schema_version": 1,
+        "theme": {"source": "project"},
+        "background": {"kind": "theme"},
+        "chrome": {"title": "hidden", "canvas_padding": 12, "surface_gap": 12},
+        "pages": [],
+        "active_page": 0,
+        "id": "marbles-burndown",
+        "project_id": "marbles",
+        "revision": revision,
+        "layout": {
+            "kind": "canvas",
+            "placements": [
+                {"surface_id": "marbles-burndown", "bounds": {"x": 0.02, "y": 0.02, "width": 0.96, "height": 0.96}, "layer": 0}
+            ],
+        },
+        "bindings": [],
+        "focused_surface_id": null,
+        "surfaces": [{
+            "id": "marbles-burndown",
+            "title": "Marbles burndown",
+            "content": {"kind": "widget", "spec": {
+                "schema_version": 2,
+                "id": widget_id,
+                "kind": "time_series",
+                "title": "Marbles burndown",
+                "unit": "issues",
+                // Canvas on FireTV derives its headline value from the last
+                // series. Keep Remaining last so the headline is the actual
+                // remaining count, not the ideal line's zero endpoint.
+                "series": [
+                    {"label": "Ideal", "points": ideal},
+                    {"label": "Remaining", "points": remaining},
+                ],
+                "data": data,
+            }},
+            "inputs": [],
+        }],
+    })
+}
+
 /// Reserve `len` bytes for the host to write input JSON into.
 #[unsafe(no_mangle)]
 pub extern "C" fn alloc(len: i32) -> i32 {
@@ -352,5 +408,28 @@ mod tests {
     fn invalid_schema_is_an_error_not_a_zero_dashboard() {
         let error = render(br#"{"schema":"wrong"}"#).unwrap_err();
         assert!(error.contains("unexpected dashboard schema"), "{error}");
+    }
+
+    #[test]
+    fn burndown_mode_returns_one_time_series_surface() {
+        let mut dashboard = dashboard();
+        dashboard["view_mode"] = json!("burndown");
+        dashboard["burndown"] = json!({
+            "points": [
+                {"remaining": 12, "ideal_remaining": 12},
+                {"remaining": 8, "ideal_remaining": 6},
+                {"remaining": 4, "ideal_remaining": 0}
+            ]
+        });
+        let output = render(&serde_json::to_vec(&dashboard).unwrap()).unwrap();
+        let document: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(document["id"], "marbles-burndown");
+        assert_eq!(document["surfaces"].as_array().map(Vec::len), Some(1));
+        let spec = &document["surfaces"][0]["content"]["spec"];
+        assert_eq!(spec["kind"], "time_series");
+        assert_eq!(spec["series"][0]["label"], "Ideal");
+        assert_eq!(spec["series"][0]["points"][2]["y"], 0.0);
+        assert_eq!(spec["series"][1]["label"], "Remaining");
+        assert_eq!(spec["series"][1]["points"][2]["y"], 4.0);
     }
 }

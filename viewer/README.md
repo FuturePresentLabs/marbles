@@ -17,6 +17,8 @@ cargo build --manifest-path viewer/marbles-view/Cargo.toml \
 cargo build --bin marbles-canvas-sync
 CANVASCTL=/path/to/canvasctl target/debug/marbles-canvas-sync --once
 CANVASCTL=/path/to/canvasctl target/debug/marbles-canvas-sync --interval 30
+CANVASCTL=/path/to/canvasctl target/debug/marbles-canvas-sync --once --dry-run \
+  --mode burndown --state /tmp/marbles-burndown.json
 ```
 
 Defaults:
@@ -25,6 +27,7 @@ Defaults:
 - token: `MARBLES_TOKEN`, else `MARBLES_TOKEN_FILE`, else
   `~/.marbles/tokens/human-avery`
 - Canvas CLI: `canvasctl` on `PATH` (`--canvasctl` / `CANVASCTL`)
+- `--mode burndown` emits a one-surface `time_series` workspace (Remaining + Ideal).
 - wasm artifact: `viewer/marbles-view/target/wasm32-unknown-unknown/release/marbles_view.wasm`
   (`--wasm` / `MARBLES_VIEW_WASM`)
 - rendered document: the platform cache directory, e.g.
