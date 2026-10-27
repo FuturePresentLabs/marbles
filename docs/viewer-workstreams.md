@@ -1,8 +1,20 @@
 # Marbles views and Canvas viewer
 
-Status: proposed. This note splits the UI work into two parallel workstreams with a shared
-contract. It does not change the work model: every view is a read-only projection over the same
+Status: workstreams A, B0/B1, and the first B2 Canvas adapter are implemented; B3 (Soil) remains. This
+note records the shared contract and the staged plan. It does not change the work model: every view is a read-only projection over the same
 issue graph. No view owns state, invents values, or creates a second source of truth.
+
+## Implemented now
+
+- `POST /v1/views.dashboard`, `/v1/views.scrum`, and `/v1/views.gantt` are read-only, share the
+  `ViewScope` filters, and are in `client::READ_OPS`.
+- The earlier `/view` HTML shell has been retired. The viewer is Canvas: a thin host fetches the
+  read-only view API and runs a no-import wasm projection; Marbles serves data, not a second UI.
+- The Gantt view reuses the plan scheduler, reports `estimate_source: "metadata" | "default"`,
+  excludes goals and closed work by default, and fails closed on a cycle.
+- `marbles-canvas-sync` (Rust host, `src/bin/marbles-canvas-sync.rs`) fetches `views.dashboard`, runs the no-import `viewer/marbles-view` wasm projection, and applies the result to the `marbles-live` Canvas workspace. It
+  refreshes it on an interval. It reads the owner token afresh each cycle, refuses redirects,
+  keeps the last good workspace on a failed fetch, and never writes tracker state.
 
 ## What exists today
 
@@ -26,17 +38,12 @@ issue graph. No view owns state, invents values, or creates a second source of t
 
 ## Deployment decision
 
-Serve the viewer from the Marbles server itself, under the same origin:
+Marbles serves the authenticated view APIs only. The viewer is a separate Canvas host: it fetches
+the API with the owner credential, runs the no-import wasm projection, and applies the workspace
+through the owner control socket. There is no `/view` ingress and no second UI in the Marbles
+server.
 
-- hosted: `https://marbles.fpl.dev/view`
-- local/Agora: `http://<marbles-host>:7878/view`
-- optional later Mycelium name: `https://marbles.<host>.<site>.myc:<advertised-port>/view`
-
-Same-origin removes CORS from the critical path and lets the viewer use the existing API without
-a second ingress. A Mycelium DNS alias is a naming convenience, not a deployment prerequisite.
-
-The viewer is read-only for the first cut. Claims, close/review, and other mutations stay in the
-CLI until the view contract and auth path are proven.
+The viewer is read-only. Claims, close/review, and other mutations stay in the CLI.
 
 ## Workstream A — view APIs
 
@@ -137,31 +144,28 @@ Rules:
 Define `marbles.view.v1` JSON as the stable boundary. The browser and Canvas adapters consume the
 same payloads. A Canvas `WidgetSpec` is a rendering artifact, never the API response itself.
 
-### B1 — same-origin browser viewer
+### B1 — retired browser shell
 
-Add a read-only `/view` route served by Marbles. First cut:
-
-- project/folder/plan selector
-- dashboard totals, ready queue, WIP/review/blocked
-- scrum columns
-- Gantt with critical path
-- explicit stale/generated-at labels
-
-The first cut may use a small static HTML/JS shell to validate the API contract. It is a test
-harness, not a third design system; replace it with the Canvas renderer when B2 lands.
+The temporary same-origin `/view` HTML shell was removed once the Canvas host and wasm projection
+landed. It duplicated the view rendering and kept the bearer token in the browser. The retained
+contract is the read-only `marbles.view.v1` API.
 
 ### B2 — Canvas widget adapter
 
-Add a Marbles data adapter to the Canvas host (repository directory `dock`, crate boundary to be
-decided):
+Implemented as the Rust host `marbles-canvas-sync` plus the `viewer/marbles-view` wasm module:
 
-- fetch `views.dashboard`, `views.scrum`, `views.gantt` with the browser/owner credential
-- map to durable `WidgetSpec`s: `metric_board`/`status_list` for totals, `table`/`rich_card` for
-  cards, `dag_graph` or a new generic `gantt` widget for scheduling
-- prefer a new generic Canvas widget kind over a Marbles-specific renderer if the board/timeline
-  semantics are reusable
-- keep provenance/freshness in `WidgetData`; a failed fetch must render stale/error, never a
-  healthy-looking zero
+- the wasm module owns the dashboard -> `WidgetSpec` projection: `metric_board` for totals,
+  `table` for ready/in-flight work, and `table` for the critical path
+- the host fetches `views.dashboard` with the owner credential, runs the module under wasmtime,
+  and applies the document through the owner control socket; the Marbles bearer never enters the
+  wasm module or the browser
+- the same core wasm ABI is run by the browser/V8 host in `viewer/marbles-view/web`; it has no
+  imports, so there is no ambient network, filesystem, clock, or token access
+- keep provenance/freshness in `WidgetData`; the footer carries `observed_at`, and a failed fetch
+  leaves the last good workspace on screen instead of drawing a healthy-looking zero
+- bump the widget spec id with the document revision. Canvas deliberately retains a live widget
+  when the spec id and family are unchanged (for stream-bound values), so this is what makes a
+  snapshot refresh decode instead of leaving stale data on screen.
 
 Canvas Web can host the renderer. If Canvas Web cannot fetch Marbles directly, add a bounded
 same-origin bridge rather than exposing the Marbles token to arbitrary surfaces.
@@ -177,9 +181,9 @@ Do not put OIDC client secrets, bearer tokens, or database access in a Spore man
 
 The browser must never hold the OIDC client secret. Two viable paths:
 
-1. **OIDC PKCE public client** (`marbles-web`): exact redirect URIs for `/view/callback` and local
-   development; id/access token kept in memory or session storage; company claim still enforced
-   server-side.
+1. **OIDC PKCE public client** (Canvas browser host): exact redirect URIs for the Canvas host
+   callback and local development; id/access token kept in memory or session storage; company
+   claim still enforced server-side.
 2. **Same-origin BFF**: server-side session cookie, refresh handled server-side, API proxied or
    cookie-authenticated. More code, but the better default for a product viewer.
 

@@ -28,6 +28,9 @@ pub const READ_OPS: &[&str] = &[
     "history.get",
     "stats",
     "projects.list",
+    "views.dashboard",
+    "views.scrum",
+    "views.gantt",
 ];
 
 pub fn is_read_op(op: &str) -> bool {

@@ -1,2 +1,6 @@
 /target
 *.pdb
+.worktrees/
+__pycache__/
+*.pyc
+/viewer/marbles-view/target/

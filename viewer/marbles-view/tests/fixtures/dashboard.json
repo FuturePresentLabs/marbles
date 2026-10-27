@@ -1,0 +1,44 @@
+{
+  "schema": "marbles.view.dashboard.v1",
+  "generated_at": 0,
+  "totals": {
+    "total": 3,
+    "ready": 1,
+    "in_progress": 1,
+    "review": 0,
+    "blocked": 1,
+    "stale": 0,
+    "percent_done": 33.3
+  },
+  "scrum": {
+    "columns": [
+      {
+        "status": "open",
+        "cards": [
+          {"id": "ready", "project": "demo", "title": "Ready", "blocked_by": 0},
+          {"id": "blocked", "project": "demo", "title": "Blocked", "blocked_by": 2}
+        ]
+      },
+      {
+        "status": "in_progress",
+        "cards": [
+          {"id": "running", "project": "demo", "title": "Running", "blocked_by": 0}
+        ]
+      }
+    ]
+  },
+  "gantt": {
+    "critical_path": ["ready"],
+    "nodes": [
+      {
+        "id": "ready",
+        "key": "ready",
+        "title": "Ready",
+        "status": "open",
+        "start_min": 0,
+        "finish_min": 30,
+        "estimate": 30
+      }
+    ]
+  }
+}

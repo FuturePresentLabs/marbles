@@ -107,6 +107,17 @@ no read/list path creates a local project or issue row for them. `mb claim`, `mb
 <store_id>/<issue>` error rather than falling through to local work. A missing registry prints
 `no remotes pinned` and exits 0; a corrupt one fails closed.
 
+## Viewer
+
+The browser `/view` shell has been retired. The viewer is Canvas: `marbles-canvas-sync` reads
+`views.dashboard`, runs the no-import `viewer/marbles-view` wasm projection, and applies the
+resulting workspace through the local Canvas control socket. The same wasm ABI is executable by
+the browser/V8 host in `viewer/marbles-view/web`.
+
+The viewer is read-only. Claims, review, and close stay in the CLI. See
+[`docs/viewer-workstreams.md`](docs/viewer-workstreams.md) for the API contract and the staged
+Canvas and Soil workstreams.
+
 ## The work model
 
 ```text
