@@ -13,7 +13,7 @@ issue graph. No view owns state, invents values, or creates a second source of t
   mode so the layout can be reviewed without a tracker.
 - The Gantt view reuses the plan scheduler, reports `estimate_source: "metadata" | "default"`,
   excludes goals and closed work by default, and fails closed on a cycle.
-- `viewer/canvas_sync.py` projects `views.dashboard` into the `marbles-live` Canvas workspace and
+- `marbles-canvas-sync` (Rust, `src/bin/marbles-canvas-sync.rs`) projects `views.dashboard` into the `marbles-live` Canvas workspace and
   refreshes it on an interval. It reads the owner token afresh each cycle, refuses redirects,
   keeps the last good workspace on a failed fetch, and never writes tracker state.
 
@@ -165,7 +165,7 @@ harness, not a third design system; replace it with the Canvas renderer when B2 
 
 ### B2 — Canvas widget adapter
 
-Implemented as `viewer/canvas_sync.py`:
+Implemented as the Rust binary `marbles-canvas-sync`:
 
 - fetch `views.dashboard` with the owner credential and map it to durable `WidgetSpec`s:
   `metric_board` for totals, `table` for ready/in-flight work, and `table` for the critical path
