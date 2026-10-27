@@ -46,6 +46,13 @@ impl Api {
         Router::new()
             .route("/healthz", axum::routing::get(health))
             .route("/metrics", axum::routing::get(metrics))
+            .route("/view", axum::routing::get(crate::viewer::index))
+            .route("/view/", axum::routing::get(crate::viewer::index))
+            .route("/view/app.js", axum::routing::get(crate::viewer::app_js))
+            .route(
+                "/view/style.css",
+                axum::routing::get(crate::viewer::style_css),
+            )
             .route("/v1/projects.ensure", post(projects_ensure))
             .route("/v1/projects.list", post(projects_list))
             .route("/v1/projects.move", post(projects_move))
@@ -298,7 +305,9 @@ fn metrics_blocking(
 }
 
 async fn require_principal(State(api): State<Arc<Api>>, mut req: Request, next: Next) -> Response {
-    if req.uri().path() == "/healthz" {
+    let path = req.uri().path();
+    // The viewer shell is public static assets. Its data calls still go through `/v1`.
+    if path == "/healthz" || path == "/view" || path.starts_with("/view/") {
         return next.run(req).await;
     }
     let bearer = req
