@@ -1,6 +1,6 @@
 # Marbles views and Canvas viewer
 
-Status: workstreams A and B0/B1 are implemented; B2 (Canvas adapter) and B3 (Soil) remain. This
+Status: workstreams A, B0/B1, and the first B2 Canvas adapter are implemented; B3 (Soil) remains. This
 note records the shared contract and the staged plan. It does not change the work model: every view is a read-only projection over the same
 issue graph. No view owns state, invents values, or creates a second source of truth.
 
@@ -13,6 +13,9 @@ issue graph. No view owns state, invents values, or creates a second source of t
   mode so the layout can be reviewed without a tracker.
 - The Gantt view reuses the plan scheduler, reports `estimate_source: "metadata" | "default"`,
   excludes goals and closed work by default, and fails closed on a cycle.
+- `viewer/canvas_sync.py` projects `views.dashboard` into the `marbles-live` Canvas workspace and
+  refreshes it on an interval. It reads the owner token afresh each cycle, refuses redirects,
+  keeps the last good workspace on a failed fetch, and never writes tracker state.
 
 ## What exists today
 
@@ -162,16 +165,17 @@ harness, not a third design system; replace it with the Canvas renderer when B2 
 
 ### B2 — Canvas widget adapter
 
-Add a Marbles data adapter to the Canvas host (repository directory `dock`, crate boundary to be
-decided):
+Implemented as `viewer/canvas_sync.py`:
 
-- fetch `views.dashboard`, `views.scrum`, `views.gantt` with the browser/owner credential
-- map to durable `WidgetSpec`s: `metric_board`/`status_list` for totals, `table`/`rich_card` for
-  cards, `dag_graph` or a new generic `gantt` widget for scheduling
-- prefer a new generic Canvas widget kind over a Marbles-specific renderer if the board/timeline
-  semantics are reusable
-- keep provenance/freshness in `WidgetData`; a failed fetch must render stale/error, never a
-  healthy-looking zero
+- fetch `views.dashboard` with the owner credential and map it to durable `WidgetSpec`s:
+  `metric_board` for totals, `table` for ready/in-flight work, and `table` for the critical path
+- keep provenance/freshness in `WidgetData`; the footer carries `observed_at`, and a failed fetch
+  leaves the last good workspace on screen instead of drawing a healthy-looking zero
+- apply the document through the owner control socket (`canvasctl doc`), so the Marbles bearer
+  never enters the browser
+- bump the widget spec id with the document revision. Canvas deliberately retains a live widget
+  when the spec id and family are unchanged (for stream-bound values), so this is what makes a
+  snapshot refresh decode instead of leaving stale data on screen.
 
 Canvas Web can host the renderer. If Canvas Web cannot fetch Marbles directly, add a bounded
 same-origin bridge rather than exposing the Marbles token to arbitrary surfaces.

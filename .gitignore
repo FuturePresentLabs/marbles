@@ -1,3 +1,5 @@
 /target
 *.pdb
 .worktrees/
+__pycache__/
+*.pyc
