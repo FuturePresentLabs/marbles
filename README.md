@@ -107,19 +107,16 @@ no read/list path creates a local project or issue row for them. `mb claim`, `mb
 <store_id>/<issue>` error rather than falling through to local work. A missing registry prints
 `no remotes pinned` and exits 0; a corrupt one fails closed.
 
-## Browser viewer
+## Viewer
 
-`marbles serve` also serves a read-only browser viewer at `/view` (for example
-`http://127.0.0.1:7878/view` or `https://marbles.fpl.dev/view`). It reads the same
-`views.dashboard`, `views.scrum`, and `views.gantt` APIs as any client: dashboard totals, ready and
-blocked work, scrum columns, and a Gantt with critical path. The static shell is public; the data
-calls still require a bearer token, and the token is kept only in the tab's `sessionStorage`.
-Use the **Demo data** switch to review the layout without a tracker.
+The browser `/view` shell has been retired. The viewer is Canvas: `marbles-canvas-sync` reads
+`views.dashboard`, runs the no-import `viewer/marbles-view` wasm projection, and applies the
+resulting workspace through the local Canvas control socket. The same wasm ABI is executable by
+the browser/V8 host in `viewer/marbles-view/web`.
 
-The viewer is read-only. Claims, review, and close stay in the CLI until the view contract and
-browser authentication path are proven. See
-[`docs/viewer-workstreams.md`](docs/viewer-workstreams.md) for the API contract and the staged Canvas
-and Soil workstreams.
+The viewer is read-only. Claims, review, and close stay in the CLI. See
+[`docs/viewer-workstreams.md`](docs/viewer-workstreams.md) for the API contract and the staged
+Canvas and Soil workstreams.
 
 ## The work model
 
