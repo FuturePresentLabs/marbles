@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::assertion_cache::{AssertionCache, AssertionFreshness, AssertionView};
 use crate::identity::RemoteRegistry;
+use crate::refs::{ReceiptState, ReferenceAudit};
 use crate::types::{Folder, Issue, STATUSES};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -617,6 +618,39 @@ pub struct ReadinessRow {
 impl ReadinessRow {
     pub fn is_ready(&self) -> bool {
         self.blocking_reasons.is_empty()
+    }
+}
+
+/// Render one audited remote reference as a single human-readable line.
+///
+/// A verified receipt prints all six fields explicitly. A rejected one prints the named state and
+/// the evidence anyway: hiding it would make the rejection unauditable.
+pub fn audit_receipt_line(audit: &ReferenceAudit) -> String {
+    match &audit.receipt {
+        Some(receipt) if audit.state == ReceiptState::Verified => format!(
+            "receipt {}: verified; store_id={}; remote_issue_id={}; state={}; asserted_at={}; key_id={}; signature={}",
+            audit.reference,
+            receipt.store_id,
+            receipt.remote_issue_id,
+            receipt.state,
+            receipt.asserted_at,
+            receipt.key_id,
+            receipt.signature,
+        ),
+        Some(receipt) => format!(
+            "receipt {}: {}; receipt(signature={}, asserted_at={}); detail: {}",
+            audit.reference,
+            audit.state,
+            receipt.signature,
+            receipt.asserted_at,
+            audit.detail.as_deref().unwrap_or("-"),
+        ),
+        None => format!(
+            "receipt {}: {}; detail: {}",
+            audit.reference,
+            audit.state,
+            audit.detail.as_deref().unwrap_or("-"),
+        ),
     }
 }
 

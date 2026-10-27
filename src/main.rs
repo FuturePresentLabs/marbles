@@ -26,7 +26,7 @@ use marbles::identity::{
     verify_descriptor_json,
 };
 use marbles::postgres_store::PostgresCompanyStores;
-use marbles::refs::{CanonicalRef, remote_dependency_freshness};
+use marbles::refs::{CanonicalRef, audit_remote_dependency, remote_dependency_freshness};
 use marbles::report;
 use marbles::setup::Profile;
 use marbles::types::*;
@@ -1455,11 +1455,16 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                     .unwrap_or_default(),
             };
             annotate_remote_dependencies(&mut remote_dependencies)?;
+            let audits = audit_remote_dependencies(&remote_dependencies);
             if cli.json {
                 let mut value = serde_json::to_value(&row).map_err(|e| e.to_string())?;
                 if !remote_dependencies.is_empty() {
                     value["remote_dependencies"] =
                         serde_json::to_value(&remote_dependencies).map_err(|e| e.to_string())?;
+                    // Every remote reference carries its six-field audit receipt plus the named
+                    // verification state (never a silent pass).
+                    value["remote_audit"] =
+                        serde_json::to_value(&audits).map_err(|e| e.to_string())?;
                 }
                 println!(
                     "{}",
@@ -1474,7 +1479,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                         issue.actor_kind.as_deref().unwrap_or("?")
                     );
                 }
-                for dependency in &remote_dependencies {
+                for (dependency, audit) in remote_dependencies.iter().zip(&audits) {
                     println!(
                         "waits on {} (remote; {}; state: {}; observed_at: {})",
                         dependency.canonical_ref,
@@ -1482,6 +1487,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                         dependency.state,
                         dependency.observed_at,
                     );
+                    println!("{}", report::audit_receipt_line(audit));
                 }
                 println!("{}", issue.description.trim());
             }
@@ -2705,6 +2711,22 @@ fn annotate_remote_dependencies(dependencies: &mut [RemoteDependency]) -> Result
         );
     }
     Ok(())
+}
+
+/// Audit every remote edge offline, preserving one named verdict per reference.
+fn audit_remote_dependencies(
+    dependencies: &[RemoteDependency],
+) -> Vec<marbles::refs::ReferenceAudit> {
+    if dependencies.is_empty() {
+        return Vec::new();
+    }
+    let registry = RemoteRegistry::load(&config::remotes_path()).unwrap_or_default();
+    let window = AssertionCache::at(config::assertion_cache_dir()).freshness_window_seconds();
+    let at = now();
+    dependencies
+        .iter()
+        .map(|dependency| audit_remote_dependency(dependency, &registry, at, window))
+        .collect()
 }
 
 /// Pinned remotes are local client state: `$MARBLES_HOME/remotes.json`, never the tracker API.
