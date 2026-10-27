@@ -14,7 +14,8 @@
 use std::fmt;
 
 use crate::assertion_cache::{
-    AssertionFreshness, ISSUE_ASSERTION_SCHEMA, IssueAssertion, verify_issue_assertion,
+    AssertionError, AssertionFreshness, CachedAssertion, ISSUE_ASSERTION_SCHEMA, IssueAssertion,
+    verify_issue_assertion,
 };
 use crate::identity::{PinnedKey, RemoteRegistry};
 use crate::types::RemoteDependency;
@@ -194,6 +195,287 @@ pub fn remote_dependency_freshness(
         AssertionFreshness::Stale
     } else {
         AssertionFreshness::Fresh
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Audit receipts
+// ---------------------------------------------------------------------------------------------
+//
+// A remote reference is only as trustworthy as the evidence shown next to it. Every reference
+// therefore carries a receipt with exactly the six fields a verifier needs, and every way that
+// evidence can be wrong is a *named rejection state* rather than a silent downgrade. Verification
+// is entirely offline: the pinned key comes from [`RemoteRegistry`], nothing here touches the
+// network, and a rejected receipt never reads as fresh/ready.
+
+/// The six fields every remote reference must carry. None of them is optional.
+///
+/// The signature covers `store_id`, `remote_issue_id`, `state`, `asserted_at`, and `key_id` in
+/// that declared order, matching [`IssueAssertion::signing_bytes`], so the same Ed25519 check used
+/// by the assertion cache verifies a receipt without a second crypto path.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AuditReceipt {
+    pub store_id: String,
+    pub remote_issue_id: String,
+    pub state: String,
+    pub asserted_at: i64,
+    pub signature: String,
+    pub key_id: String,
+}
+
+impl AuditReceipt {
+    pub fn new(
+        store_id: impl Into<String>,
+        remote_issue_id: impl Into<String>,
+        state: impl Into<String>,
+        asserted_at: i64,
+        signature: impl Into<String>,
+        key_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            store_id: store_id.into(),
+            remote_issue_id: remote_issue_id.into(),
+            state: state.into(),
+            asserted_at,
+            signature: signature.into(),
+            key_id: key_id.into(),
+        }
+    }
+
+    /// Build a receipt from the last observed assertion on a stored remote edge.
+    pub fn from_dependency(dependency: &RemoteDependency) -> Self {
+        Self {
+            store_id: dependency.store_id.clone(),
+            remote_issue_id: dependency.remote_issue_id.clone(),
+            state: dependency.state.clone(),
+            asserted_at: dependency.asserted_at,
+            signature: dependency.signature.clone(),
+            key_id: dependency.key_id.clone(),
+        }
+    }
+
+    /// Build a receipt from a cached assertion that already verified once.
+    pub fn from_cached(assertion: &CachedAssertion) -> Self {
+        Self {
+            store_id: assertion.store_id.clone(),
+            remote_issue_id: assertion.remote_issue_id.clone(),
+            state: assertion.state.clone(),
+            asserted_at: assertion.asserted_at,
+            signature: assertion.signature.clone(),
+            key_id: assertion.key_id.clone(),
+        }
+    }
+
+    /// Reconstruct the signed wire form so verification reuses the cache's crypto path.
+    pub fn to_assertion(&self) -> IssueAssertion {
+        IssueAssertion {
+            schema: ISSUE_ASSERTION_SCHEMA.to_string(),
+            store_id: self.store_id.clone(),
+            remote_issue_id: self.remote_issue_id.clone(),
+            state: self.state.clone(),
+            asserted_at: self.asserted_at,
+            key_id: self.key_id.clone(),
+            signature: Some(self.signature.clone()),
+        }
+    }
+
+    /// The exact bytes the signature covers.
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, AssertionError> {
+        self.to_assertion().signing_bytes()
+    }
+}
+
+/// Every named way a remote receipt can be refused. There is deliberately no `ok`/`ready` variant
+/// other than [`Self::Verified`], and no `Default`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptState {
+    /// Signature verified under the pinned key, the ref matches the signed issue id, and the
+    /// observation is inside the freshness window.
+    Verified,
+    /// The receipt is signed by a key that is not the pinned `key_id` for this store.
+    WrongKey,
+    /// The receipt claims a different store than the pinned record for this reference.
+    WrongStore,
+    /// The signature verifies, but the observation is older than the freshness window.
+    Stale,
+    /// A valid signature over a different issue id: it proves nothing about this reference.
+    DifferentIssue,
+    /// Missing, undecodable, or cryptographically invalid signature under the pinned key.
+    ForgedSignature,
+    /// The reference's store has no local pin, so nothing can be verified offline.
+    AbsentStore,
+    /// There is no receipt at all for the reference (never silence, never a default).
+    MissingReceipt,
+    /// The stored canonical reference cannot be parsed.
+    MalformedReference,
+}
+
+impl ReceiptState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::WrongKey => "wrong_key",
+            Self::WrongStore => "wrong_store",
+            Self::Stale => "stale",
+            Self::DifferentIssue => "different_issue",
+            Self::ForgedSignature => "forged_signature",
+            Self::AbsentStore => "absent_store",
+            Self::MissingReceipt => "missing_receipt",
+            Self::MalformedReference => "malformed_reference",
+        }
+    }
+
+    /// True only for a fully verified receipt. Callers must not infer trust any other way.
+    pub const fn is_verified(self) -> bool {
+        matches!(self, Self::Verified)
+    }
+}
+
+impl std::fmt::Display for ReceiptState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One audited remote reference: the named verdict plus the receipt that produced it.
+///
+/// `receipt` is kept even when the verdict rejects it (the evidence is what the audit is about),
+/// but only [`ReceiptState::Verified`] makes it authoritative. Rendering always shows `state`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReferenceAudit {
+    pub reference: String,
+    pub store_id: String,
+    pub remote_issue_id: String,
+    pub state: ReceiptState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<AuditReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl ReferenceAudit {
+    pub const fn is_verified(&self) -> bool {
+        self.state.is_verified()
+    }
+}
+
+/// Verify one receipt offline against the pinned key and the exact reference being shown.
+///
+/// `observed_at` is when *we* recorded the assertion; staleness is judged against it, because a
+/// signed assertion has no way to prove it was delivered promptly. When no observation instant is
+/// available the assertion timestamp is used, which can only make a receipt look older.
+pub fn audit_receipt(
+    reference: &CanonicalRef,
+    receipt: Option<&AuditReceipt>,
+    registry: &RemoteRegistry,
+    observed_at: Option<i64>,
+    now: i64,
+    freshness_window_seconds: i64,
+) -> ReferenceAudit {
+    let mut audit = ReferenceAudit {
+        reference: reference.to_string(),
+        store_id: reference.store_id.clone(),
+        remote_issue_id: reference.issue_id.clone(),
+        state: ReceiptState::Verified,
+        receipt: receipt.cloned(),
+        detail: None,
+    };
+    let Some(record) = registry
+        .list()
+        .iter()
+        .find(|record| record.store_id == reference.store_id)
+    else {
+        audit.state = ReceiptState::AbsentStore;
+        audit.detail = Some(format!(
+            "store {:?} is not pinned; no key can verify this reference offline",
+            reference.store_id
+        ));
+        return audit;
+    };
+    let Some(receipt) = receipt else {
+        audit.state = ReceiptState::MissingReceipt;
+        audit.detail = Some("no audit receipt accompanies this remote reference".to_string());
+        return audit;
+    };
+    // A signature over another issue id is valid evidence for that issue, not for this ref.
+    if receipt.remote_issue_id != reference.issue_id {
+        audit.state = ReceiptState::DifferentIssue;
+        audit.detail = Some(format!(
+            "receipt is for remote issue {:?}, but this reference names {:?}",
+            receipt.remote_issue_id, reference.issue_id
+        ));
+        return audit;
+    }
+    if receipt.store_id != reference.store_id || receipt.store_id != record.store_id {
+        audit.state = ReceiptState::WrongStore;
+        audit.detail = Some(format!(
+            "receipt claims store {:?}, but the pinned record for this reference is {:?}",
+            receipt.store_id, record.store_id
+        ));
+        return audit;
+    }
+    let Some(pin) = record
+        .pins()
+        .into_iter()
+        .find(|pin| pin.key_id == receipt.key_id)
+    else {
+        audit.state = ReceiptState::WrongKey;
+        audit.detail = Some(format!(
+            "receipt key {:?} is not pinned for store {:?} (active key {:?})",
+            receipt.key_id, record.store_id, record.key_id
+        ));
+        return audit;
+    };
+    if let Err(error) = verify_issue_assertion(&receipt.to_assertion(), &pin, now) {
+        audit.state = match error {
+            AssertionError::WrongStore { .. } => ReceiptState::WrongStore,
+            AssertionError::WrongKeyId { .. } | AssertionError::KeyRetired(..) => {
+                ReceiptState::WrongKey
+            }
+            _ => ReceiptState::ForgedSignature,
+        };
+        audit.detail = Some(error.to_string());
+        return audit;
+    }
+    let observed_at = observed_at.unwrap_or(receipt.asserted_at);
+    if now.saturating_sub(observed_at) > freshness_window_seconds.max(0) {
+        audit.state = ReceiptState::Stale;
+        audit.detail = Some(format!(
+            "observation at {observed_at} is {}s old, past the {freshness_window_seconds}s window",
+            now.saturating_sub(observed_at)
+        ));
+        return audit;
+    }
+    audit
+}
+
+/// Audit a stored remote dependency against the current pin, entirely offline.
+///
+pub fn audit_remote_dependency(
+    dependency: &RemoteDependency,
+    registry: &RemoteRegistry,
+    now: i64,
+    freshness_window_seconds: i64,
+) -> ReferenceAudit {
+    let receipt = AuditReceipt::from_dependency(dependency);
+    match CanonicalRef::parse(&dependency.canonical_ref) {
+        Ok(reference) => audit_receipt(
+            &reference,
+            Some(&receipt),
+            registry,
+            Some(dependency.observed_at),
+            now,
+            freshness_window_seconds,
+        ),
+        Err(error) => ReferenceAudit {
+            reference: dependency.canonical_ref.clone(),
+            store_id: dependency.store_id.clone(),
+            remote_issue_id: dependency.remote_issue_id.clone(),
+            state: ReceiptState::MalformedReference,
+            receipt: Some(receipt),
+            detail: Some(error.to_string()),
+        },
     }
 }
 
