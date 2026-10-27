@@ -45,6 +45,9 @@ alloc(len: i32) -> ptr: i32
 render_block(ptr: i32, len: i32) -> ptr: i32
 ```
 
+Native wasmtime 34 matches the consolidated Canvas/Soil runtime in
+`canvas-model-host`; there is no separate Marbles runtime version.
+
 Input is `marbles.view.dashboard.v1` JSON plus a host-supplied `view_revision`.
 The result is a length-prefixed block (`u32 LE length + UTF-8 JSON`) containing
 the Canvas workspace document, or `{"error":"..."}`. The native host uses
