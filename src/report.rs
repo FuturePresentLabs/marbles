@@ -600,6 +600,64 @@ fn remote_entry(
     }
 }
 
+/// A row in `mb ready`: the local issue, plus named reasons it cannot be claimed yet.
+///
+/// Remote issues never appear as rows. A local issue whose remote blocker cannot be satisfied
+/// still appears — the edge is local state and removing it would hide real work — with the reason
+/// named in [`Self::blocking_reasons`] instead of a silent omission.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReadinessRow {
+    #[serde(flatten)]
+    pub issue: Issue,
+    /// Named reasons this local issue is not claimable (`remote: stale`, `remote: open`, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocking_reasons: Vec<String>,
+}
+
+impl ReadinessRow {
+    pub fn is_ready(&self) -> bool {
+        self.blocking_reasons.is_empty()
+    }
+}
+
+/// The strict verdict for one remote dependency edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteGate {
+    /// A fresh, signature-verified assertion says the remote issue is `closed`.
+    Satisfied,
+    /// Anything else blocks, and the name says why.
+    Blocked { reason: String },
+}
+
+/// Gate one re-verified remote assertion under the strict readiness rule.
+///
+/// Only `fresh` + a verified `closed` assertion satisfies a remote blocker. A `stale` assertion is
+/// not good enough even when it says `closed`: an old claim about a remote issue cannot make local
+/// work claimable. `unknown` (never observed, or an unreachable remote) and `unverifiable` (bad
+/// signature, retired key, wrong store/issue) both block, as does a fresh non-`closed` state.
+pub fn remote_gate(view: &AssertionView) -> RemoteGate {
+    match view.freshness {
+        AssertionFreshness::Fresh => match view.asserted_state() {
+            Some("closed") => RemoteGate::Satisfied,
+            Some(state) => RemoteGate::Blocked {
+                reason: format!("remote: {state}"),
+            },
+            None => RemoteGate::Blocked {
+                reason: "remote: unverifiable".to_string(),
+            },
+        },
+        AssertionFreshness::Stale => RemoteGate::Blocked {
+            reason: "remote: stale".to_string(),
+        },
+        AssertionFreshness::Unknown => RemoteGate::Blocked {
+            reason: "remote: unknown".to_string(),
+        },
+        AssertionFreshness::Unverifiable => RemoteGate::Blocked {
+            reason: "remote: unverifiable".to_string(),
+        },
+    }
+}
+
 /// Build the Remotes workspace from the registry and assertion cache.
 ///
 /// A missing registry is an empty workspace (`registry_present = false`), not an error. A corrupt
@@ -626,8 +684,61 @@ pub fn remotes_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assertion_cache::{CachedAssertion, MissingReason};
     use crate::db::{Db, now};
     use crate::types::{Dependency, Folder, Issue, NewIssue};
+
+    fn view(freshness: AssertionFreshness, state: Option<&str>) -> AssertionView {
+        AssertionView {
+            store_id: "store_a".into(),
+            remote_issue_id: "issue-1".into(),
+            freshness,
+            assertion: state.map(|state| CachedAssertion {
+                schema: "marbles.issue_assertion/1".into(),
+                store_id: "store_a".into(),
+                remote_issue_id: "issue-1".into(),
+                state: state.into(),
+                asserted_at: 1_000,
+                signature: "sig".into(),
+                key_id: "key-1".into(),
+                observed_at: 1_000,
+            }),
+            missing: (freshness == AssertionFreshness::Unknown)
+                .then_some(MissingReason::NeverObserved),
+            problem: (freshness == AssertionFreshness::Unverifiable)
+                .then(|| "bad signature".to_string()),
+        }
+    }
+
+    #[test]
+    fn remote_gate_accepts_only_fresh_closed() {
+        assert_eq!(
+            remote_gate(&view(AssertionFreshness::Fresh, Some("closed"))),
+            RemoteGate::Satisfied
+        );
+        for (freshness, state, expected) in [
+            (AssertionFreshness::Fresh, Some("open"), "remote: open"),
+            (
+                AssertionFreshness::Fresh,
+                Some("blocked"),
+                "remote: blocked",
+            ),
+            (AssertionFreshness::Stale, Some("closed"), "remote: stale"),
+            (AssertionFreshness::Unknown, None, "remote: unknown"),
+            (
+                AssertionFreshness::Unverifiable,
+                None,
+                "remote: unverifiable",
+            ),
+        ] {
+            assert_eq!(
+                remote_gate(&view(freshness, state)),
+                RemoteGate::Blocked {
+                    reason: expected.to_string()
+                }
+            );
+        }
+    }
 
     fn issue(
         id: &str,

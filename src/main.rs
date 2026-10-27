@@ -1411,13 +1411,29 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
         Command::Ready { project } => {
             let project = project.clone().or(project_for(cli).ok());
             let body = serde_json::json!({"project": project});
-            let rows: Vec<Issue> = mode
-                .call("issues.ready", &body, |db| {
-                    db.ready(project.as_deref(), now())
-                        .map_err(|e| e.to_string())
-                })
-                .await?;
-            print_issues(cli, &rows);
+            // Local readiness rules are unchanged; remote edges are re-verified offline below and
+            // become named reasons instead of silently dropping the local issue.
+            let rows: Vec<(Issue, Vec<RemoteDependency>)> = match &mode {
+                Mode::Local(db) => db
+                    .ready_with_remote_edges(project.as_deref(), now())
+                    .map_err(|e| e.to_string())?,
+                Mode::Http(client) => {
+                    let issues: Vec<Issue> = client.call("issues.ready", &body).await?;
+                    // Remote edges are local client state; attach them to the server's rows.
+                    let local = Db::open(config::db_path()).ok();
+                    issues
+                        .into_iter()
+                        .map(|issue| {
+                            let edges = local
+                                .as_ref()
+                                .and_then(|db| db.remote_dependencies(&issue.id).ok())
+                                .unwrap_or_default();
+                            (issue, edges)
+                        })
+                        .collect()
+                }
+            };
+            print_readiness(cli, &readiness_rows(rows));
             Ok(())
         }
         Command::Show { id } => {
@@ -2629,6 +2645,49 @@ fn run_store(action: &StoreAction, json: bool) -> Result<(), String> {
     }
 }
 
+/// Re-verify every remote edge on locally-ready work and name anything that blocks it.
+///
+/// This reads the assertion cache (offline) against the current pinned keys: only a fresh,
+/// signature-verified `closed` observation satisfies the edge. Every failure mode — stale,
+/// unknown/absent, unreachable, forged, wrong key/store/issue, or a fresh non-closed state —
+/// becomes a named reason and keeps the edge and the local row visible. Failures never degrade to
+/// "ready".
+fn readiness_rows(rows: Vec<(Issue, Vec<RemoteDependency>)>) -> Vec<report::ReadinessRow> {
+    let registry = RemoteRegistry::load(&config::remotes_path()).unwrap_or_default();
+    let cache = AssertionCache::at(config::assertion_cache_dir());
+    let at = now();
+    rows.into_iter()
+        .map(|(issue, edges)| {
+            let mut blocking_reasons = Vec::new();
+            for edge in &edges {
+                let gate = match CanonicalRef::parse(&edge.canonical_ref) {
+                    Ok(reference) if reference.names(&edge.store_id, &edge.remote_issue_id) => {
+                        report::remote_gate(&cache.read(
+                            &registry,
+                            &edge.store_id,
+                            &edge.remote_issue_id,
+                            at,
+                        ))
+                    }
+                    // A ref that does not name the edge's own store/issue cannot verify.
+                    _ => report::RemoteGate::Blocked {
+                        reason: "remote: unverifiable".to_string(),
+                    },
+                };
+                if let report::RemoteGate::Blocked { reason } = gate
+                    && !blocking_reasons.contains(&reason)
+                {
+                    blocking_reasons.push(reason);
+                }
+            }
+            report::ReadinessRow {
+                issue,
+                blocking_reasons,
+            }
+        })
+        .collect()
+}
+
 /// Fill each remote edge's named freshness by re-verifying its stored assertion against the
 /// current pin. A missing/corrupt registry makes every remote edge `unverifiable`, never fresh.
 fn annotate_remote_dependencies(dependencies: &mut [RemoteDependency]) -> Result<(), String> {
@@ -3077,23 +3136,62 @@ fn print_issues(cli: &Cli, rows: &[Issue]) {
         return;
     }
     for row in rows {
-        let claim = row
-            .assignee
-            .as_ref()
-            .map(|a| {
-                format!(
-                    " [{a}{}] ",
-                    row.actor_kind
-                        .as_deref()
-                        .map(|k| format!(":{k}"))
-                        .unwrap_or_default()
-                )
-            })
-            .unwrap_or_else(|| " ".into());
         println!(
             "{}{}{} — {} — {} blocker(s)",
-            row.id, claim, row.status, row.title, row.dependency_count
+            row.id,
+            claim_suffix(row),
+            row.status,
+            row.title,
+            row.dependency_count
         );
+    }
+}
+
+/// The rendered claim marker shared by `list`, `ready`, and friends.
+fn claim_suffix(row: &Issue) -> String {
+    row.assignee
+        .as_ref()
+        .map(|a| {
+            format!(
+                " [{a}{}] ",
+                row.actor_kind
+                    .as_deref()
+                    .map(|k| format!(":{k}"))
+                    .unwrap_or_default()
+            )
+        })
+        .unwrap_or_else(|| " ".into())
+}
+
+/// `mb ready` is a readiness report, not just a claimable list: a local issue blocked by an
+/// unsatisfied remote edge is still shown, with the named reason (`remote: stale`, `remote: open`,
+/// …). Remote issues themselves are never rows.
+fn print_readiness(cli: &Cli, rows: &[report::ReadinessRow]) {
+    if cli.json {
+        println!("{}", serde_json::to_string(rows).unwrap_or_default());
+        return;
+    }
+    for row in rows {
+        let issue = &row.issue;
+        if row.is_ready() {
+            println!(
+                "{}{}{} — {} — {} blocker(s)",
+                issue.id,
+                claim_suffix(issue),
+                issue.status,
+                issue.title,
+                issue.dependency_count
+            );
+        } else {
+            println!(
+                "{}{}{} — {} — blocked: {}",
+                issue.id,
+                claim_suffix(issue),
+                issue.status,
+                issue.title,
+                row.blocking_reasons.join(", ")
+            );
+        }
     }
 }
 
