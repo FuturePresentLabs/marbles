@@ -491,3 +491,53 @@ async fn view_apis_are_read_only_and_share_the_issue_scope() {
     assert_eq!(value["nodes"][0]["estimate_source"], "metadata");
     assert_eq!(value["scope"]["project"], "demo");
 }
+
+async fn get(app: &Router, path: &str) -> (StatusCode, String, String) {
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+        .await
+        .unwrap();
+    (
+        status,
+        content_type,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
+}
+
+#[tokio::test]
+async fn the_viewer_shell_is_public_but_data_apis_are_not() {
+    let (app, _dir) = app();
+
+    let (status, content_type, body) = get(&app, "/view").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(content_type.starts_with("text/html"), "{content_type}");
+    assert!(body.contains("Marbles"), "{body}");
+    assert!(body.contains("/view/app.js"), "{body}");
+
+    let (status, content_type, body) = get(&app, "/view/app.js").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        content_type.starts_with("text/javascript"),
+        "{content_type}"
+    );
+    assert!(body.contains("views.dashboard"), "{body}");
+
+    let (status, content_type, _) = get(&app, "/view/style.css").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(content_type.starts_with("text/css"), "{content_type}");
+
+    let (status, body) = call(&app, "issues.list", serde_json::json!({}), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(body.contains("credential"), "{body}");
+}
