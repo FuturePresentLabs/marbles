@@ -168,7 +168,6 @@ impl Fixture {
             .record(record, &assertion, at)
             .unwrap();
     }
-
 }
 
 fn reference() -> CanonicalRef {
@@ -401,7 +400,14 @@ fn federation_failure_never_reports_ready() {
     let empty = RemoteRegistry::default();
 
     let outcomes = [
-        audit_receipt(&reference(), Some(&wrong_key), &fx.registry(), Some(at), at, 300),
+        audit_receipt(
+            &reference(),
+            Some(&wrong_key),
+            &fx.registry(),
+            Some(at),
+            at,
+            300,
+        ),
         audit_receipt(
             &reference(),
             Some(&wrong_store),
@@ -426,7 +432,14 @@ fn federation_failure_never_reports_ready() {
             at,
             300,
         ),
-        audit_receipt(&reference(), Some(&forged), &fx.registry(), Some(at), at, 300),
+        audit_receipt(
+            &reference(),
+            Some(&forged),
+            &fx.registry(),
+            Some(at),
+            at,
+            300,
+        ),
         audit_receipt(&reference(), Some(&good), &empty, Some(at), at, 300),
     ];
     for audit in &outcomes {
