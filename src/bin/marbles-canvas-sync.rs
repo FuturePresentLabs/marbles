@@ -506,3 +506,72 @@ async fn refresh(args: &Args) -> Result<()> {
     }
     apply_document(args, &document, runtime_revision).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revision_fields_are_read_from_canvasctl_surfaces() {
+        let text = "Canvas 1408x881 at 0,0 · 4 surfaces · document rev 17 · runtime rev 19";
+        assert_eq!(revision_after(text, "document rev "), Some(17));
+        assert_eq!(revision_after(text, "runtime rev "), Some(19));
+        assert_eq!(revision_after(text, "missing "), None);
+    }
+
+    #[test]
+    fn document_projects_ready_flow_and_critical_path() {
+        let dashboard = json!({
+            "generated_at": 0,
+            "totals": {
+                "total": 3,
+                "ready": 1,
+                "in_progress": 1,
+                "review": 0,
+                "blocked": 1,
+                "stale": 0,
+                "percent_done": 33.3
+            },
+            "scrum": {"columns": [
+                {"status": "open", "cards": [
+                    {"id": "ready", "project": "demo", "title": "Ready", "blocked_by": 0},
+                    {"id": "blocked", "project": "demo", "title": "Blocked", "blocked_by": 2}
+                ]},
+                {"status": "in_progress", "cards": [
+                    {"id": "running", "project": "demo", "title": "Running", "blocked_by": 0}
+                ]}
+            ]},
+            "gantt": {
+                "critical_path": ["ready"],
+                "nodes": [{
+                    "id": "ready",
+                    "key": "ready",
+                    "title": "Ready",
+                    "status": "open",
+                    "start_min": 0,
+                    "finish_min": 30,
+                    "estimate": 30
+                }]
+            }
+        });
+        let document = build_document(&dashboard, 9);
+        assert_eq!(document["revision"], 9);
+        assert_eq!(
+            document["surfaces"][0]["content"]["spec"]["id"],
+            "marbles-summary-9"
+        );
+        assert_eq!(
+            document["surfaces"][0]["content"]["spec"]["data"]["observed_at"],
+            "1970-01-01T00:00:00+00:00"
+        );
+        let ready = &document["surfaces"][1]["content"]["spec"]["rows"];
+        assert_eq!(ready.as_array().map(Vec::len), Some(1));
+        assert_eq!(ready[0][1], "ready");
+        let flow = &document["surfaces"][2]["content"]["spec"]["rows"];
+        assert_eq!(flow.as_array().map(Vec::len), Some(1));
+        assert_eq!(flow[0][1], "running");
+        let gantt = &document["surfaces"][3]["content"]["spec"]["rows"];
+        assert_eq!(gantt[0][0], "0m");
+        assert_eq!(gantt[0][2], "critical");
+    }
+}
