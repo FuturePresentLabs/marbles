@@ -1,8 +1,18 @@
 # Marbles views and Canvas viewer
 
-Status: proposed. This note splits the UI work into two parallel workstreams with a shared
-contract. It does not change the work model: every view is a read-only projection over the same
+Status: workstreams A and B0/B1 are implemented; B2 (Canvas adapter) and B3 (Soil) remain. This
+note records the shared contract and the staged plan. It does not change the work model: every view is a read-only projection over the same
 issue graph. No view owns state, invents values, or creates a second source of truth.
+
+## Implemented now
+
+- `POST /v1/views.dashboard`, `/v1/views.scrum`, and `/v1/views.gantt` are read-only, share the
+  `ViewScope` filters, and are in `client::READ_OPS`.
+- `GET /view` serves an embedded, same-origin viewer shell. The shell is public static HTML/JS/CSS;
+  every `/v1` data call still requires a bearer token. It includes a clearly labelled Demo-data
+  mode so the layout can be reviewed without a tracker.
+- The Gantt view reuses the plan scheduler, reports `estimate_source: "metadata" | "default"`,
+  excludes goals and closed work by default, and fails closed on a cycle.
 
 ## What exists today
 
