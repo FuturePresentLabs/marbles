@@ -19,7 +19,9 @@ Defaults:
 - token: `MARBLES_TOKEN`, else `MARBLES_TOKEN_FILE`, else
   `~/.marbles/tokens/human-avery`
 - Canvas CLI: `canvasctl` on `PATH` (`--canvasctl` / `CANVASCTL`)
-- rendered document: `~/.cache/marbles/canvas-doc.json` (`--state`)
+- rendered document: the platform cache directory, e.g.
+  `~/Library/Caches/marbles/canvas-doc.json` on macOS or
+  `${XDG_CACHE_HOME:-~/.cache}/marbles/canvas-doc.json` on Linux (`--state`)
 
 The token is read afresh on every cycle and is never written to the Canvas
 document or logs. A fetch or apply failure leaves the last good workspace on
