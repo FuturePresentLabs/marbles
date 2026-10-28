@@ -64,6 +64,8 @@ struct Args {
     days: i64,
     #[arg(long, default_value_t = 7)]
     stale_days: i64,
+    #[arg(long, default_value = "dashboard", value_parser = ["dashboard", "burndown"])]
+    mode: String,
 }
 
 type Result<T> = std::result::Result<T, String>;
@@ -376,6 +378,7 @@ async fn refresh(args: &Args, view: &ViewModule) -> Result<()> {
     };
     let revision = state_revision.max(canvas_revision) + 1;
     dashboard["view_revision"] = json!(revision);
+    dashboard["view_mode"] = json!(args.mode);
     let mut document = view.render(&dashboard)?;
     if document["revision"].as_u64() != Some(revision) {
         return Err(format!(
