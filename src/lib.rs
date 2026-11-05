@@ -11,6 +11,7 @@
 //! design made this shape worth copying. Attribution lives in the README, not the comments, but
 //! the debt is real.
 
+pub mod adapter;
 pub mod api;
 pub mod assertion_cache;
 pub mod auth;
@@ -25,6 +26,7 @@ pub mod oidc;
 pub mod plan;
 pub mod postgres_migration;
 pub mod postgres_store;
+pub mod records;
 pub mod refs;
 pub mod setup;
 pub mod time;
