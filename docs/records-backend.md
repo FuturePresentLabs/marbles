@@ -6,19 +6,26 @@ migration and does not replace production SQLite behaviour.
 
 The working code is in:
 
-- `src/records.rs` — a small in-memory **append-only records engine** (schemas, revisions,
-  tombstones, live index).
-- `src/adapter.rs` — an `Adapter` that implements the existing `Store` trait on top of the engine.
+- `src/records.rs` — a small **append-only records engine** (schemas, revisions,
+  tombstones, live index) that can also write every revision through to a JSONL trail file and
+  replay it on open, standing in for a records host's durable store.
+- `src/adapter.rs` — an `Adapter` that implements the existing `Store` trait on the engine. It can
+  be opened in memory (`open`/`in_memory`) or durable (`open_file(path)`), the latter replaying the
+  trail so a store survives a drop/reopen — the records analogue of `CompanyStores` reopening a
+  company DB file.
 - `tests/adapter_contract.rs` — a contract test that drives the adapter through the same `Store`
   API the SQLite `Db` exposes and asserts the Marbles invariants survive.
+- `tests/records_persistence.rs` — proves the durable adapter round-trips issues, labels, history,
+  and the outbox across a drop/reopen.
 
-Run it with:
+Run them with:
 
 ```
 cargo test --test adapter_contract
+cargo test --test records_persistence
 ```
 
-All 12 contract tests pass and the existing SQLite suite is unaffected.
+All tests pass and the existing SQLite suite is unaffected.
 
 ## Why an in-memory engine, not a live `soil:records` client
 
@@ -165,11 +172,14 @@ records backend, the same invariants the SQLite `tests/storage.rs` protects:
 1. **Real host wiring.** Replace the in-memory `Engine` storage inside `Adapter` with a
    `soil:records`/`fungos-records` client once a confirmed host API exists; keep the `Store`
    delegation unchanged.
-2. **Persistence.** The engine is in-memory only. A records host provides the durable, append-only
-   store; locally this means persisting the revision trail.
+2. **Persistence.** The engine now writes every revision through to a JSONL trail and replays it on
+   `open_file`, so a store survives a drop/reopen locally (`tests/records_persistence.rs`). A real
+   records host provides the durable, append-only store directly; the follow-up is re-pointing the
+   trail at that host rather than a local file.
 3. **Import/replay.** Build the SQLite → records replay (see §"SQLite import") and a `Db`→`Adapter`
    swap behind a feature flag, without removing the SQLite path.
 4. **Query push-down.** Where a host offers indexed predicates, push `ready`/`list`/`stats` filters
    down instead of scanning, for large stores.
-5. **`CompanyStores` parity.** Wire per-company `Adapter`/`Engine` instances to separate storage
+5. **`CompanyStores` parity.** The durable `open_file` + reopen mechanism is now in place; the
+   follow-up is wiring per-company `Adapter`/`Engine` instances to separate storage
    roots and add reopen/persistence tests mirroring the SQLite company-store tests.

@@ -108,18 +108,49 @@ impl Adapter {
         Self::open("store".to_string())
     }
 
-    /// Open a fresh adapter with a fixed store id.
+    /// Open a fresh adapter with a fixed store id (in-memory storage).
     pub fn open(store_id: String) -> Result<Self> {
-        let mut inner = Inner {
+        Self::with_engine(Inner {
             engine: Engine::new(),
             seq: 0,
             policy: Policy::default(),
             store_id,
             week: crate::time::WorkWeek::default(),
-        };
+        })
+    }
+
+    /// Open a durable adapter rooted at `path`. The append-only trail is replayed on open, so a
+    /// store survives a drop/reopen exactly as a records host would persist it. This is the
+    /// records-model analogue of `CompanyStores` reopening a company's DB file. The parent
+    /// directory is created if needed; a missing trail means a fresh store.
+    pub fn open_file(path: std::path::PathBuf) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Error::Bad(e.to_string()))?;
+        }
+        let store_id = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("records")
+            .to_string();
+        let engine = Engine::load(&path).map_err(Error::Bad)?;
+        Self::with_engine(Inner {
+            engine,
+            seq: 0,
+            policy: Policy::default(),
+            store_id,
+            week: crate::time::WorkWeek::default(),
+        })
+    }
+
+    /// Define the record types over an engine, seed the store id, and wrap it. Shared by the
+    /// in-memory and durable constructors so both expose the identical schema.
+    fn with_engine(mut inner: Inner) -> Result<Self> {
         for schema in schemas() {
             inner.engine.define(schema).map_err(Error::Bad)?;
         }
+        // The durable engine's `seq` was restored from the trail; keep the audit counter aligned
+        // with it so a reopened store does not reuse sequence numbers.
+        inner.seq = inner.engine.seq();
         inner.seed_meta();
         Ok(Adapter {
             inner: Mutex::new(inner),

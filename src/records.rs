@@ -27,6 +27,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
 
 /// The declared type of a column. Mirrors the typed columns a host would enforce.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +87,17 @@ impl fmt::Display for Key {
     }
 }
 
+/// A revision as it is written to the durable trail file. The record-type name is carried here
+/// because the trail is a single append-only log shared by every record type.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedRevision {
+    r#type: String,
+    seq: i64,
+    key: Vec<String>,
+    data: serde_json::Value,
+    deleted: bool,
+}
+
 /// An append-only, append-only-backed, single-writer record store.
 ///
 /// Synchronous per call, like the Marbles `Store` protocol: a read observes every write that
@@ -93,6 +108,10 @@ pub struct Engine {
     history: BTreeMap<String, VecDeque<Revision>>,
     live: BTreeMap<String, BTreeSet<Key>>,
     seq: i64,
+    /// When set, every appended revision is also written (as one JSON line) to this trail file,
+    /// and `load` replays the same file. This is the local stand-in for a records host's durable,
+    /// append-only store: nothing is ever rewritten, only appended.
+    path: Option<PathBuf>,
 }
 
 impl Default for Engine {
@@ -102,6 +121,7 @@ impl Default for Engine {
             history: BTreeMap::new(),
             live: BTreeMap::new(),
             seq: 0,
+            path: None,
         }
     }
 }
@@ -171,7 +191,7 @@ impl Engine {
         self.history
             .entry(name.to_string())
             .or_default()
-            .push_back(rev);
+            .push_back(rev.clone());
         if deleted {
             self.live
                 .entry(name.to_string())
@@ -182,6 +202,28 @@ impl Engine {
                 .entry(name.to_string())
                 .or_default()
                 .insert(Key(key.0.clone()));
+        }
+        // Write-through: append the revision to the durable trail so a reopen replays it. The
+        // file is only ever appended to, never rewritten — the on-disk shape is the model.
+        if let Some(path) = &self.path {
+            let line = serde_json::to_string(&PersistedRevision {
+                r#type: name.to_string(),
+                seq,
+                key: rev.key.clone(),
+                data: rev.data.clone(),
+                deleted: rev.deleted,
+            })
+            .expect("revision is serializable");
+            let mut file = io::BufWriter::new(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .expect("trail open"),
+            );
+            file.write_all(line.as_bytes()).expect("trail write");
+            file.write_all(b"\n").expect("trail write");
+            file.flush().expect("trail flush");
         }
         seq
     }
@@ -217,6 +259,60 @@ impl Engine {
 
     pub fn seq(&self) -> i64 {
         self.seq
+    }
+
+    /// A durable, append-only engine rooted at `path`. Revisions are written through to
+    /// `path` on every append; schemas are re-asserted by the caller after loading (see
+    /// [`Adapter::open_file`](crate::adapter::Adapter::open_file)).
+    pub fn durable(path: PathBuf) -> Self {
+        Engine {
+            path: Some(path),
+            ..Default::default()
+        }
+    }
+
+    /// Reopen a trail previously written by a durable engine. Missing file means an empty store.
+    /// Replays the append-only log in order, rebuilding history, the live index, and `seq`.
+    pub fn load(path: &PathBuf) -> Result<Self, String> {
+        let mut engine = Engine::durable(path.clone());
+        if !path.exists() {
+            return Ok(engine);
+        }
+        let file = std::fs::File::open(path).map_err(|e| format!("open trail: {e}"))?;
+        for line in io::BufReader::new(file).lines() {
+            let line = line.map_err(|e| format!("read trail: {e}"))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let rev: PersistedRevision =
+                serde_json::from_str(&line).map_err(|e| format!("parse trail line: {e}"))?;
+            engine.seq = engine.seq.max(rev.seq);
+            let revision = Revision {
+                seq: rev.seq,
+                key: rev.key.clone(),
+                data: rev.data,
+                deleted: rev.deleted,
+            };
+            engine
+                .history
+                .entry(rev.r#type.clone())
+                .or_default()
+                .push_back(revision);
+            if rev.deleted {
+                engine
+                    .live
+                    .entry(rev.r#type)
+                    .or_default()
+                    .remove(&Key(rev.key.clone()));
+            } else {
+                engine
+                    .live
+                    .entry(rev.r#type)
+                    .or_default()
+                    .insert(Key(rev.key));
+            }
+        }
+        Ok(engine)
     }
 }
 
