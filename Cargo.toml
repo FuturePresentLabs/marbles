@@ -21,9 +21,7 @@ getrandom   = "0.3"
 soil-sdk-records = { git = "https://github.com/fungOS-linux/soil.git", rev = "a5b7721abf48739b18cee3e9292bdbfeb9940915", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-anyhow      = "1"
 axum        = "0.8"
-fungos-records = { git = "https://github.com/fungOS-linux/records.git", rev = "46450ede02588e533984378bc979cb4010f9867b" }
 base64      = "0.22"
 clap        = { version = "4.6", features = ["derive", "env"] }
 dirs        = "6"
@@ -34,7 +32,7 @@ openssl      = { version = "0.10", features = ["vendored"] }
 postgres     = "0.19"
 postgres-openssl = "0.5"
 reqwest     = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-rusqlite    = { version = "0.41", features = ["bundled", "functions"] }
+rusqlite    = { version = "0.37", features = ["bundled", "functions"] }
 sha2        = "0.10"
 tokio       = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "signal"] }
 toml        = "0.9"
@@ -44,11 +42,6 @@ wasmtime    = { version = "34", default-features = false, features = ["cranelift
 name = "mb"
 path = "src/bin/mb.rs"
 required-features = ["soil"]
-
-[[bin]]
-name = "mb-records-import"
-path = "src/bin/mb-records-import.rs"
-required-features = ["native"]
 
 [dev-dependencies]
 tempfile = "3"
