@@ -23,8 +23,8 @@ use std::sync::Mutex;
 
 use serde_json::{Value, json};
 
-use crate::db::{Error, Result};
-use crate::records::{Engine, Key, RecordSchema};
+use crate::records::{Engine, Key, RecordSchema, Version};
+use crate::store::{Error, Result};
 use crate::types::*;
 
 const ISSUE: &str = "issue";
@@ -183,7 +183,7 @@ impl Adapter {
 
     /// Remove a project and cascade-tombstone every row that touches it. Mirrors `Db::drop_project`;
     /// not part of the `Store` trait, so it is exposed as an inherent method.
-    pub fn drop_project(&self, slug: &str) -> Result<crate::db::ProjectRemoval> {
+    pub fn drop_project(&self, slug: &str) -> Result<crate::store::ProjectRemoval> {
         let mut g = self.lock();
         Inner::drop_project(&mut g, slug)
     }
@@ -331,6 +331,28 @@ impl Inner {
         Ok(())
     }
 
+    /// Current issue revision for a conditional write.
+    fn issue_version(&self, id: &str) -> Result<Version> {
+        self.engine
+            .version(ISSUE, &Self::issue_key(id))
+            .ok_or_else(|| Error::NotFound(id.to_string()))
+    }
+
+    /// Save an issue only if the caller still holds the revision it read.
+    fn save_issue_cas(&mut self, issue: &Issue, expected: Version) -> Result<bool> {
+        let result = self
+            .engine
+            .compare_and_swap(
+                ISSUE,
+                &Self::issue_key(&issue.id),
+                Some(expected),
+                issue_to_json(issue),
+                false,
+            )
+            .map_err(Error::Bad)?;
+        Ok(result.applied)
+    }
+
     /// Append one audit event and its outbound event, mirroring `Db::log_event`.
     fn log_event(
         &mut self,
@@ -466,7 +488,7 @@ fn issue_to_json(issue: &Issue) -> Value {
 
 impl Inner {
     fn ensure_project(&mut self, slug: &str, root: &str, prefix: &str) -> Result<()> {
-        let ts = crate::db::now();
+        let ts = crate::store::now();
         let mut data = self
             .load_project(slug)
             .unwrap_or_else(|| json!({"slug": slug, "prefix": prefix, "created_at": ts}));
@@ -614,8 +636,8 @@ impl Inner {
         Ok(FolderView { folders, projects })
     }
 
-    fn pending_events(&self, at: i64, limit: usize) -> Result<Vec<crate::db::OutboundEvent>> {
-        let mut events: Vec<(i64, crate::db::OutboundEvent)> = self
+    fn pending_events(&self, at: i64, limit: usize) -> Result<Vec<crate::store::OutboundEvent>> {
+        let mut events: Vec<(i64, crate::store::OutboundEvent)> = self
             .keys(OUTBOUND_EVENT)
             .iter()
             .filter_map(|k| {
@@ -630,7 +652,7 @@ impl Inner {
                 }
                 Some((
                     seq,
-                    crate::db::OutboundEvent {
+                    crate::store::OutboundEvent {
                         seq,
                         store_id: data["store_id"].as_str().unwrap_or_default().to_string(),
                         issue_id: data["issue_id"].as_str().unwrap_or_default().to_string(),
@@ -677,8 +699,8 @@ impl Inner {
         Ok(())
     }
 
-    fn drop_project(&mut self, slug: &str) -> Result<crate::db::ProjectRemoval> {
-        let mut out = crate::db::ProjectRemoval::default();
+    fn drop_project(&mut self, slug: &str) -> Result<crate::store::ProjectRemoval> {
+        let mut out = crate::store::ProjectRemoval::default();
         if self.load_project(slug).is_none() {
             return Err(Error::NoProject(slug.to_string()));
         }
@@ -1179,6 +1201,7 @@ impl Inner {
         };
         let project = self.project_of(&req.id)?;
         let current = self.get(&req.id)?;
+        let expected = self.issue_version(&req.id)?;
         let held = current.assignee.is_some() && current.expires_at.is_some_and(|e| e > at);
         if held && current.assignee.as_deref() != Some(req.assignee.as_str()) {
             return Err(Error::AlreadyClaimed(
@@ -1191,7 +1214,18 @@ impl Inner {
         issue.actor_kind = Some(req.actor_kind.as_str().to_string());
         issue.expires_at = Some(at + ttl);
         issue.updated_at = at;
-        self.save_issue(&issue)?;
+        if !self.save_issue_cas(&issue, expected)? {
+            let latest = self.get(&req.id)?;
+            if latest.assignee.as_deref() != Some(req.assignee.as_str())
+                && let Some(holder) = latest.assignee
+            {
+                return Err(Error::AlreadyClaimed(req.id.clone(), holder));
+            }
+            return Err(Error::Bad(format!(
+                "claim for {} lost a race; retry",
+                req.id
+            )));
+        }
         self.log_event(
             &req.id,
             at,
@@ -1235,8 +1269,8 @@ impl Inner {
         self.log_event(id, at, actor, "released", "")
     }
 
-    fn sweep(&mut self, at: i64) -> Result<crate::db::SweepReport> {
-        let mut report = crate::db::SweepReport::default();
+    fn sweep(&mut self, at: i64) -> Result<crate::store::SweepReport> {
+        let mut report = crate::store::SweepReport::default();
         // Snapshot the eligible ids first so the append-only writes during the loop do not shift
         // the iteration (SQLite iterated a prepared statement over a fixed snapshot).
         let mut eligible: Vec<(String, String, String)> = self
@@ -1691,7 +1725,7 @@ fn prometheus_label(s: &str) -> String {
 // The Store trait
 // ---------------------------------------------------------------------------
 
-impl crate::db::Store for Adapter {
+impl crate::store::Store for Adapter {
     // Mutations lock mutably; reads lock immutably. Both serialize against the one store.
     fn ensure_project(&self, slug: &str, root: &str, prefix: &str) -> Result<()> {
         let mut g = self.lock();
@@ -1713,7 +1747,7 @@ impl crate::db::Store for Adapter {
         let mut g = self.lock();
         Inner::folder_view(&mut g)
     }
-    fn pending_events(&self, at: i64, limit: usize) -> Result<Vec<crate::db::OutboundEvent>> {
+    fn pending_events(&self, at: i64, limit: usize) -> Result<Vec<crate::store::OutboundEvent>> {
         let g = self.lock();
         Inner::pending_events(&g, at, limit)
     }
@@ -1773,7 +1807,7 @@ impl crate::db::Store for Adapter {
         let mut g = self.lock();
         Inner::release(&mut g, id, actor, at)
     }
-    fn sweep(&self, at: i64) -> Result<crate::db::SweepReport> {
+    fn sweep(&self, at: i64) -> Result<crate::store::SweepReport> {
         let mut g = self.lock();
         Inner::sweep(&mut g, at)
     }
