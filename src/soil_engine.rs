@@ -10,7 +10,7 @@
 //! the existing Marbles JSON state. One collection means one records book can
 //! hold the whole task store.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use serde_json::Value;
 use soil_sdk_records::{Book, CasResult as SoilCasResult, Version as SoilVersion};
@@ -24,6 +24,10 @@ const MAX_KEYS: usize = 100_000;
 pub struct SoilEngine {
     schemas: std::collections::BTreeMap<Name, RecordSchema>,
     seq: Cell<i64>,
+    /// One full collection scan populates every record type. Marbles reads
+    /// dependencies repeatedly while projecting issues; without this cache the
+    /// wasm backend becomes O(records x issues).
+    keys_cache: RefCell<std::collections::BTreeMap<Name, Vec<Key>>>,
 }
 
 impl SoilEngine {
@@ -31,6 +35,7 @@ impl SoilEngine {
         Self {
             schemas: Default::default(),
             seq: Cell::new(Self::max_event_seq()),
+            keys_cache: RefCell::new(Default::default()),
         }
     }
 
@@ -116,6 +121,7 @@ impl SoilEngine {
         }
         let seq = self.seq.get() + 1;
         self.seq.set(seq);
+        self.keys_cache.borrow_mut().clear();
         seq
     }
 
@@ -141,9 +147,13 @@ impl SoilEngine {
     }
 
     pub fn keys(&self, name: &str) -> Vec<Key> {
+        if let Some(cached) = self.keys_cache.borrow().get(name) {
+            return cached.clone();
+        }
         let book = Self::book();
         let mut cursor = None;
-        let mut keys = Vec::new();
+        let mut grouped: std::collections::BTreeMap<Name, Vec<Key>> = Default::default();
+        let mut total = 0usize;
         loop {
             let page = book
                 .scan(cursor.clone(), MAX_PAGE)
@@ -152,23 +162,31 @@ impl SoilEngine {
                 if entry.deleted {
                     continue;
                 }
-                if let Some((record_type, key)) = Self::parse_id(&entry.key.id)
-                    && record_type == name
-                {
-                    keys.push(key);
+                if let Some((record_type, key)) = Self::parse_id(&entry.key.id) {
+                    grouped
+                        .entry(record_type.to_string())
+                        .or_default()
+                        .push(key);
+                    total += 1;
                 }
-                if keys.len() >= MAX_KEYS {
-                    keys.sort();
-                    return keys;
+                if total >= MAX_KEYS {
+                    break;
                 }
+            }
+            if total >= MAX_KEYS {
+                break;
             }
             match page.next {
                 Some(next) if Some(next.as_str()) != cursor.as_deref() => cursor = Some(next),
                 _ => break,
             }
         }
-        keys.sort();
-        keys
+        for keys in grouped.values_mut() {
+            keys.sort();
+        }
+        let result = grouped.get(name).cloned().unwrap_or_default();
+        *self.keys_cache.borrow_mut() = grouped;
+        result
     }
 
     pub fn key_of(&self, name: &str, key: &Key) -> Option<Key> {
@@ -212,6 +230,9 @@ impl SoilEngine {
                 deleted,
             )
             .map_err(|error| error.to_string())?;
+        if result.applied {
+            self.keys_cache.borrow_mut().clear();
+        }
         let current = if result.entry.deleted {
             None
         } else {
