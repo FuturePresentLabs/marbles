@@ -1,4 +1,3 @@
-#![cfg(all(target_arch = "wasm32", feature = "soil"))]
 //! Minimal wasm `mb` CLI over `soil:records`.
 
 use std::process::ExitCode;
