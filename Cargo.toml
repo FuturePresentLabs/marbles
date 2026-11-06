@@ -38,6 +38,11 @@ tokio       = { version = "1", features = ["rt-multi-thread", "macros", "process
 toml        = "0.9"
 wasmtime    = { version = "34", default-features = false, features = ["cranelift", "runtime", "std"] }
 
+[[bin]]
+name = "mb"
+path = "src/bin/mb.rs"
+required-features = ["soil"]
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }

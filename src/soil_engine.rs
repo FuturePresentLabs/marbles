@@ -5,9 +5,10 @@
 //! and read is a guest call. Claims use `compare-and-swap`, so two invocations
 //! cannot both win a claim through last-writer-wins.
 //!
-//! One Marbles record type maps to one `soil:records` collection
-//! (`issue` -> `marbles.issue`). The composite key is the record id as a JSON
-//! array and the record body is the existing Marbles JSON state.
+//! All Marbles record types live in one `soil:records` collection named
+//! `marbles`. The entity id is `<type>/<json-key-array>`; the record body is
+//! the existing Marbles JSON state. One collection means one records book can
+//! hold the whole task store.
 
 use std::cell::Cell;
 
@@ -16,6 +17,7 @@ use soil_sdk_records::{Book, CasResult as SoilCasResult, Version as SoilVersion}
 
 use crate::records::{CasResult, Key, Name, RecordSchema, Revision, Version};
 
+const COLLECTION: &str = "marbles";
 const MAX_PAGE: u32 = 512;
 const MAX_KEYS: usize = 100_000;
 
@@ -35,7 +37,7 @@ impl SoilEngine {
     /// Event ids are the shared Marbles audit sequence. Re-seed from the
     /// `marbles_event` collection so a new wasm invocation cannot reuse an id.
     fn max_event_seq() -> i64 {
-        let book = Self::book("marbles_event");
+        let book = Self::book();
         let mut cursor = None;
         let mut max = 0;
         loop {
@@ -43,7 +45,8 @@ impl SoilEngine {
                 .scan(cursor.clone(), MAX_PAGE)
                 .expect("soil:records scan");
             for entry in page.entries {
-                if let Some(Key(parts)) = Self::key(&entry.key.id)
+                if let Some((name, Key(parts))) = Self::parse_id(&entry.key.id)
+                    && name == "marbles_event"
                     && let Some(first) = parts.first()
                     && let Ok(seq) = first.parse::<i64>()
                 {
@@ -58,28 +61,29 @@ impl SoilEngine {
         max
     }
 
-    fn collection(name: &str) -> String {
-        format!("marbles.{name}")
-    }
-
     fn schema_id(name: &str) -> String {
         format!("marbles.{name}@1")
     }
 
-    fn id(key: &Key) -> String {
-        serde_json::to_string(&key.0).expect("key serializes")
+    fn id(name: &str, key: &Key) -> String {
+        format!(
+            "{name}/{}",
+            serde_json::to_string(&key.0).expect("key serializes")
+        )
     }
 
-    fn key(id: &str) -> Option<Key> {
-        serde_json::from_str::<Vec<String>>(id).ok().map(Key::new)
+    fn parse_id(id: &str) -> Option<(&str, Key)> {
+        let (name, encoded) = id.split_once('/')?;
+        let key = serde_json::from_str::<Vec<String>>(encoded).ok()?;
+        Some((name, Key::new(key)))
     }
 
-    fn book(name: &str) -> Book {
-        Book::new(Self::collection(name))
+    fn book() -> Book {
+        Book::new(COLLECTION)
     }
 
     fn entry_current(name: &str, key: &Key) -> Option<soil_sdk_records::Entry> {
-        Self::book(name).get(Self::id(key)).ok().flatten()
+        Self::book().get(Self::id(name, key)).ok().flatten()
     }
 
     pub fn define(&mut self, schema: RecordSchema) -> Result<(), String> {
@@ -101,8 +105,8 @@ impl SoilEngine {
     /// Append a revision. The soil backend keeps the current state and the
     /// explicit `marbles_event` records; it does not retain per-key history.
     pub fn append(&mut self, name: &str, key: &Key, data: Value, deleted: bool, _at: i64) -> i64 {
-        let book = Self::book(name);
-        let id = Self::id(key);
+        let book = Self::book();
+        let id = Self::id(name, key);
         if deleted {
             book.delete(id).expect("soil:records delete");
         } else {
@@ -137,7 +141,7 @@ impl SoilEngine {
     }
 
     pub fn keys(&self, name: &str) -> Vec<Key> {
-        let book = Self::book(name);
+        let book = Self::book();
         let mut cursor = None;
         let mut keys = Vec::new();
         loop {
@@ -148,7 +152,9 @@ impl SoilEngine {
                 if entry.deleted {
                     continue;
                 }
-                if let Some(key) = Self::key(&entry.key.id) {
+                if let Some((record_type, key)) = Self::parse_id(&entry.key.id)
+                    && record_type == name
+                {
                     keys.push(key);
                 }
                 if keys.len() >= MAX_KEYS {
@@ -187,7 +193,7 @@ impl SoilEngine {
         data: Value,
         deleted: bool,
     ) -> Result<CasResult, String> {
-        let book = Self::book(name);
+        let book = Self::book();
         let body = if deleted {
             Vec::new()
         } else {
@@ -199,7 +205,7 @@ impl SoilEngine {
         });
         let result: SoilCasResult = book
             .compare_and_swap(
-                Self::id(key),
+                Self::id(name, key),
                 expected,
                 Self::schema_id(name),
                 body,
