@@ -58,10 +58,17 @@ fn run() -> Result<(), String> {
     let project = project.unwrap_or_else(|| "default".into());
     let prefix = prefix.unwrap_or_else(|| project.clone());
     let store = Adapter::open("wasm".into()).map_err(|error| error.to_string())?;
-    store
-        .ensure_project(&project, "", &prefix)
-        .map_err(|error| error.to_string())?;
     let now = store::now();
+    let known = store
+        .projects()
+        .map_err(err)?
+        .iter()
+        .any(|(slug, _, _)| slug == &project);
+    if !known {
+        store
+            .ensure_project(&project, "", &prefix)
+            .map_err(|error| error.to_string())?;
+    }
     match rest[0].as_str() {
         "list" => print_json(&store.list(Some(&project), false, None).map_err(err)?)?,
         "ready" => print_json(&store.ready(Some(&project), now).map_err(err)?)?,
