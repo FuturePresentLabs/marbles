@@ -167,6 +167,23 @@ records backend, the same invariants the SQLite `tests/storage.rs` protects:
 - append-only history + outbox delivery
 - Prometheus metrics derive latency/capacity ages **without ever labelling by issue id**
 
+## Live `soil:records` feature
+
+The `soil` Cargo feature is optional and wasm-only:
+
+```sh
+cargo check --target wasm32-wasip2 --no-default-features --features soil --lib
+```
+
+It adds `soil-sdk-records` from the `fungOS-linux/soil` repository and switches
+`records::Engine` to `SoilEngine`, which maps one Marbles record type to one
+`soil:records` collection (`issue` -> `marbles.issue`) and uses
+`compare-and-swap` for claims. Native/default builds are unchanged.
+
+The current wasm library surface is `adapter`, `records`, `store`, `time`,
+`types` and `soil_engine`. The native CLI and server modules remain behind
+`cfg(not(target_arch = "wasm32"))`.
+
 ## Follow-ups (not done in this spike)
 
 1. **Real host wiring.** Replace the in-memory `Engine` storage inside `Adapter` with a

@@ -25,11 +25,15 @@
 //! table. That is the price of the model, and it is exactly what makes a tombstone, a history
 //! event, and the current state the same three words.
 
+#[cfg(not(all(feature = "soil", target_arch = "wasm32")))]
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+#[cfg(not(all(feature = "soil", target_arch = "wasm32")))]
 use std::io::{self, BufRead, Write};
+#[cfg(not(all(feature = "soil", target_arch = "wasm32")))]
 use std::path::PathBuf;
 
+#[cfg(not(all(feature = "soil", target_arch = "wasm32")))]
 use serde::{Deserialize, Serialize};
 
 /// The declared type of a column. Mirrors the typed columns a host would enforce.
@@ -89,6 +93,7 @@ impl fmt::Display for Key {
 
 /// A revision as it is written to the durable trail file. The record-type name is carried here
 /// because the trail is a single append-only log shared by every record type.
+#[cfg(not(all(feature = "soil", target_arch = "wasm32")))]
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedRevision {
     r#type: String,
@@ -98,11 +103,32 @@ struct PersistedRevision {
     deleted: bool,
 }
 
+/// The exact revision/origin tuple used by a conditional write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Version {
+    pub revision: u64,
+    pub origin: String,
+}
+
+/// The result of a conditional write. On conflict the current live state is
+/// returned so the caller can re-read or report the holder.
+#[derive(Debug, Clone)]
+pub struct CasResult {
+    pub applied: bool,
+    pub version: Option<Version>,
+    pub data: Option<serde_json::Value>,
+    pub deleted: bool,
+}
+
+#[cfg(all(feature = "soil", target_arch = "wasm32"))]
+pub use crate::soil_engine::SoilEngine as Engine;
+
 /// An append-only, append-only-backed, single-writer record store.
 ///
 /// Synchronous per call, like the Marbles `Store` protocol: a read observes every write that
 /// preceded it. There is no concurrency model to reason about — the single-writer guarantee of
 /// `claim` comes from the `Store` protocol serializing calls, not from row locks.
+#[cfg(not(all(feature = "soil", target_arch = "wasm32")))]
 pub struct Engine {
     schemas: BTreeMap<String, RecordSchema>,
     history: BTreeMap<String, VecDeque<Revision>>,
@@ -114,6 +140,7 @@ pub struct Engine {
     path: Option<PathBuf>,
 }
 
+#[cfg(not(all(feature = "soil", target_arch = "wasm32")))]
 impl Default for Engine {
     fn default() -> Self {
         Engine {
@@ -126,6 +153,7 @@ impl Default for Engine {
     }
 }
 
+#[cfg(not(all(feature = "soil", target_arch = "wasm32")))]
 fn current_of(deque: &VecDeque<Revision>, key: &Key) -> Option<serde_json::Value> {
     // The current state of *this* key: its most recent revision. A tombstone as the latest
     // revision means the row is gone (the older revisions are retained history, not live state).
@@ -136,10 +164,12 @@ fn current_of(deque: &VecDeque<Revision>, key: &Key) -> Option<serde_json::Value
         .and_then(|r| (!r.deleted).then(|| r.data.clone()))
 }
 
+#[cfg(not(all(feature = "soil", target_arch = "wasm32")))]
 fn history_for(deque: &VecDeque<Revision>, key: &Key) -> Vec<Revision> {
     deque.iter().filter(|r| r.key == key.0).cloned().collect()
 }
 
+#[cfg(not(all(feature = "soil", target_arch = "wasm32")))]
 impl Engine {
     pub fn new() -> Self {
         Self::default()
@@ -257,6 +287,65 @@ impl Engine {
             .map(|s| s.get(key).cloned().unwrap())
     }
 
+    /// The latest revision for a key, including tombstones.
+    pub fn version(&self, name: &str, key: &Key) -> Option<Version> {
+        let latest = self
+            .history
+            .get(name)?
+            .iter()
+            .rev()
+            .find(|revision| revision.key == key.0)?;
+        Some(Version {
+            revision: latest.seq as u64,
+            origin: "memory".into(),
+        })
+    }
+
+    /// Conditional create/replace/delete against the latest revision.
+    pub fn compare_and_swap(
+        &mut self,
+        name: &str,
+        key: &Key,
+        expected: Option<Version>,
+        data: serde_json::Value,
+        deleted: bool,
+    ) -> Result<CasResult, String> {
+        let latest = self
+            .history
+            .get(name)
+            .and_then(|history| history.iter().rev().find(|revision| revision.key == key.0));
+        let matches = match (&expected, latest) {
+            (None, None) => true,
+            (None, Some(revision)) => revision.deleted,
+            (Some(_), None) => return Err("not-found".into()),
+            (Some(version), Some(revision)) => {
+                revision.seq as u64 == version.revision && version.origin == "memory"
+            }
+        };
+        let current = latest.map(|revision| CasResult {
+            applied: false,
+            version: Some(Version {
+                revision: revision.seq as u64,
+                origin: "memory".into(),
+            }),
+            data: (!revision.deleted).then(|| revision.data.clone()),
+            deleted: revision.deleted,
+        });
+        if !matches {
+            return Ok(current.expect("conflict has a current revision"));
+        }
+        let seq = self.append(name, key, data.clone(), deleted, 0);
+        Ok(CasResult {
+            applied: true,
+            version: Some(Version {
+                revision: seq as u64,
+                origin: "memory".into(),
+            }),
+            data: (!deleted).then_some(data),
+            deleted,
+        })
+    }
+
     pub fn seq(&self) -> i64 {
         self.seq
     }
@@ -318,3 +407,50 @@ impl Engine {
 
 /// A convenience alias used throughout the adapter for record-type names.
 pub type Name = String;
+
+#[cfg(all(test, not(all(feature = "soil", target_arch = "wasm32"))))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_compare_and_swap_rejects_stale_versions() {
+        let mut engine = Engine::new();
+        let key = Key::new(["issue-1".to_string()]);
+        let create = engine
+            .compare_and_swap("issue", &key, None, serde_json::json!({"v": 1}), false)
+            .unwrap();
+        assert!(create.applied);
+        let version = create.version.unwrap();
+
+        let duplicate = engine
+            .compare_and_swap("issue", &key, None, serde_json::json!({"v": 2}), false)
+            .unwrap();
+        assert!(!duplicate.applied);
+
+        let stale = engine
+            .compare_and_swap(
+                "issue",
+                &key,
+                Some(Version {
+                    revision: version.revision.saturating_sub(1),
+                    origin: version.origin.clone(),
+                }),
+                serde_json::json!({"v": 3}),
+                false,
+            )
+            .unwrap();
+        assert!(!stale.applied);
+
+        let update = engine
+            .compare_and_swap(
+                "issue",
+                &key,
+                Some(version),
+                serde_json::json!({"v": 4}),
+                false,
+            )
+            .unwrap();
+        assert!(update.applied);
+        assert_eq!(engine.current("issue", &key).unwrap()["v"], 4);
+    }
+}
