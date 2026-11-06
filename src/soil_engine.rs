@@ -28,8 +28,34 @@ impl SoilEngine {
     pub fn new() -> Self {
         Self {
             schemas: Default::default(),
-            seq: Cell::new(0),
+            seq: Cell::new(Self::max_event_seq()),
         }
+    }
+
+    /// Event ids are the shared Marbles audit sequence. Re-seed from the
+    /// `marbles_event` collection so a new wasm invocation cannot reuse an id.
+    fn max_event_seq() -> i64 {
+        let book = Self::book("marbles_event");
+        let mut cursor = None;
+        let mut max = 0;
+        loop {
+            let page = book
+                .scan(cursor.clone(), MAX_PAGE)
+                .expect("soil:records scan");
+            for entry in page.entries {
+                if let Some(Key(parts)) = Self::key(&entry.key.id)
+                    && let Some(first) = parts.first()
+                    && let Ok(seq) = first.parse::<i64>()
+                {
+                    max = max.max(seq);
+                }
+            }
+            match page.next {
+                Some(next) if Some(next.as_str()) != cursor.as_deref() => cursor = Some(next),
+                _ => break,
+            }
+        }
+        max
     }
 
     fn collection(name: &str) -> String {
