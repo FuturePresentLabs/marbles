@@ -18,7 +18,7 @@ serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 thiserror   = "2"
 getrandom   = "0.3"
-soil-sdk-records = { git = "https://github.com/fungOS-linux/soil.git", rev = "27acd1e108a5f1b373137c06e8f373d46e564316", optional = true }
+soil-sdk-records = { git = "https://github.com/fungOS-linux/soil.git", rev = "a5b7721abf48739b18cee3e9292bdbfeb9940915", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 axum        = "0.8"

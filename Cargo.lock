@@ -2492,7 +2492,7 @@ dependencies = [
 [[package]]
 name = "soil-sdk-codec"
 version = "0.1.0"
-source = "git+https://github.com/fungOS-linux/soil.git?rev=27acd1e108a5f1b373137c06e8f373d46e564316#27acd1e108a5f1b373137c06e8f373d46e564316"
+source = "git+https://github.com/fungOS-linux/soil.git?rev=a5b7721abf48739b18cee3e9292bdbfeb9940915#a5b7721abf48739b18cee3e9292bdbfeb9940915"
 dependencies = [
  "serde",
  "serde_json",
@@ -2502,7 +2502,7 @@ dependencies = [
 [[package]]
 name = "soil-sdk-records"
 version = "0.1.0"
-source = "git+https://github.com/fungOS-linux/soil.git?rev=27acd1e108a5f1b373137c06e8f373d46e564316#27acd1e108a5f1b373137c06e8f373d46e564316"
+source = "git+https://github.com/fungOS-linux/soil.git?rev=a5b7721abf48739b18cee3e9292bdbfeb9940915#a5b7721abf48739b18cee3e9292bdbfeb9940915"
 dependencies = [
  "serde",
  "serde_json",
