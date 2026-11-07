@@ -84,7 +84,10 @@ impl SoilEngine {
             return None;
         }
         let value: Value = serde_json::from_slice(&entry.body).ok()?;
-        value.get("seq").and_then(Value::as_i64)
+        value
+            .get("seq")
+            .and_then(Value::as_i64)
+            .or_else(|| value.get("fields")?.get("seq")?.as_i64())
     }
 
     fn write_event_seq(seq: i64) {
