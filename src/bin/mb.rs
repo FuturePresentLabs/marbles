@@ -57,6 +57,14 @@ fn run() -> Result<(), String> {
     let project = project.unwrap_or_else(|| "default".into());
     let prefix = prefix.unwrap_or_else(|| project.clone());
     let store = Adapter::open("wasm".into()).map_err(|error| error.to_string())?;
+    if rest[0] == "reindex" {
+        let (projects, dependencies) = store.reindex().map_err(err)?;
+        print_json(&serde_json::json!({
+            "projects": projects,
+            "dependencies": dependencies
+        }))?;
+        return Ok(());
+    }
     let now = store::now();
     let known = store
         .projects()

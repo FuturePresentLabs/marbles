@@ -20,6 +20,8 @@ use crate::records::{CasResult, Key, Name, RecordSchema, Revision, Version};
 const COLLECTION: &str = "marbles";
 const MAX_PAGE: u32 = 512;
 const MAX_KEYS: usize = 100_000;
+const EVENT_SEQ_TYPE: &str = "store_meta";
+const EVENT_SEQ_KEY: &str = "event_seq";
 
 pub struct SoilEngine {
     schemas: std::collections::BTreeMap<Name, RecordSchema>,
@@ -39,9 +41,14 @@ impl SoilEngine {
         }
     }
 
-    /// Event ids are the shared Marbles audit sequence. Re-seed from the
-    /// `marbles_event` collection so a new wasm invocation cannot reuse an id.
+    /// Event ids are the shared Marbles audit sequence. The durable high-water
+    /// mark lives in one `store_meta` record so a new wasm invocation does not
+    /// scan the whole collection. Missing metadata is repaired once from the
+    /// existing event records.
     fn max_event_seq() -> i64 {
+        if let Some(seq) = Self::stored_event_seq() {
+            return seq;
+        }
         let book = Self::book();
         let mut cursor = None;
         let mut max = 0;
@@ -63,7 +70,33 @@ impl SoilEngine {
                 _ => break,
             }
         }
+        Self::write_event_seq(max);
         max
+    }
+
+    fn event_seq_key() -> Key {
+        Key::new([EVENT_SEQ_KEY.to_string()])
+    }
+
+    fn stored_event_seq() -> Option<i64> {
+        let entry = Self::entry_current(EVENT_SEQ_TYPE, &Self::event_seq_key())?;
+        if entry.deleted {
+            return None;
+        }
+        let value: Value = serde_json::from_slice(&entry.body).ok()?;
+        value.get("seq").and_then(Value::as_i64)
+    }
+
+    fn write_event_seq(seq: i64) {
+        let body = serde_json::to_vec(&serde_json::json!({"seq": seq}))
+            .expect("event seq body serializes");
+        Self::book()
+            .upsert(
+                Self::id(EVENT_SEQ_TYPE, &Self::event_seq_key()),
+                Self::schema_id(EVENT_SEQ_TYPE),
+                body,
+            )
+            .expect("soil:records event seq upsert");
     }
 
     fn schema_id(name: &str) -> String {
@@ -121,6 +154,7 @@ impl SoilEngine {
         }
         let seq = self.seq.get() + 1;
         self.seq.set(seq);
+        Self::write_event_seq(seq);
         self.keys_cache.borrow_mut().clear();
         seq
     }
@@ -187,6 +221,36 @@ impl SoilEngine {
         let result = grouped.get(name).cloned().unwrap_or_default();
         *self.keys_cache.borrow_mut() = grouped;
         result
+    }
+
+    /// Unbounded key scan for explicit index rebuilds. Normal reads use the
+    /// cached, budgeted `keys` path; rebuilding an index must see every record
+    /// even when older event types dominate the collection.
+    pub fn keys_all(&self, name: &str) -> Vec<Key> {
+        let book = Self::book();
+        let mut cursor = None;
+        let mut keys = Vec::new();
+        loop {
+            let page = book
+                .scan(cursor.clone(), MAX_PAGE)
+                .expect("soil:records scan");
+            for entry in page.entries {
+                if entry.deleted {
+                    continue;
+                }
+                if let Some((record_type, key)) = Self::parse_id(&entry.key.id)
+                    && record_type == name
+                {
+                    keys.push(key);
+                }
+            }
+            match page.next {
+                Some(next) if Some(next.as_str()) != cursor.as_deref() => cursor = Some(next),
+                _ => break,
+            }
+        }
+        keys.sort();
+        keys
     }
 
     pub fn key_of(&self, name: &str, key: &Key) -> Option<Key> {

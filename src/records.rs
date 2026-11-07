@@ -279,6 +279,12 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// Unbounded key scan. The in-memory engine has no cap, so this is the
+    /// same as `keys`; the wasm records engine uses it for index rebuilds.
+    pub fn keys_all(&self, name: &str) -> Vec<Key> {
+        self.keys(name)
+    }
+
     /// The current key, if live.
     pub fn key_of(&self, name: &str, key: &Key) -> Option<Key> {
         self.live
