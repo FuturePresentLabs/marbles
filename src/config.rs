@@ -20,12 +20,45 @@ fn default_webhook_timeout_seconds() -> u64 {
     5
 }
 
+/// Where the outbox goes when the mesh is the sink.
+///
+/// One sink at a time, deliberately: an `outbound_event` row carries a single
+/// delivery state, so two sinks would mark each other's work done. `webhook` and
+/// `unibus` are therefore alternatives, not a pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnibusConfig {
+    /// `ip:port` of the hub, e.g. `127.0.0.1:18790`.
+    pub hub_endpoint: String,
+    /// The token file holding this producer's hub credential.
+    pub token_file: PathBuf,
+    #[serde(default = "default_installation_id")]
+    pub installation_id: String,
+    #[serde(default = "default_producer_id")]
+    pub producer_id: String,
+    #[serde(default = "default_unibus_zones")]
+    pub zones: Vec<String>,
+}
+
+fn default_installation_id() -> String {
+    "fpl-cloud".to_string()
+}
+
+fn default_producer_id() -> String {
+    "marbles".to_string()
+}
+
+fn default_unibus_zones() -> Vec<String> {
+    vec!["agents".to_string()]
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen: default_listen(),
             company_store_root: None,
             webhook: None,
+            unibus: None,
             auth: AuthConfig::default(),
         }
     }
@@ -43,6 +76,9 @@ pub struct ServerConfig {
     /// Optional signed event sink. Delivery is backed by each store's transactional outbox.
     #[serde(default)]
     pub webhook: Option<WebhookConfig>,
+    /// Optional Unibus sink, same outbox. Mutually exclusive with `webhook`.
+    #[serde(default)]
+    pub unibus: Option<UnibusConfig>,
     #[serde(default)]
     pub auth: AuthConfig,
 }

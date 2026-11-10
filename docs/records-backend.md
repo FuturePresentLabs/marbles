@@ -4,6 +4,13 @@ This document records a **spike**: an investigation of whether Marbles (`mb`) ca
 `fungos-records` / `soil:records` backend instead of (or alongside) the SQLite `Db`. It is not a
 migration and does not replace production SQLite behaviour.
 
+> **Status note (2026-11).** The "no confirmed host API" premise below is now stale: Soil ships
+> `wit/soil-records.wit` (package `soil:records@0.1.0`) plus a host in `crates/soil-records-host`,
+> wired through `soil-wasi-host`, and this crate's `soil` feature already calls that ABI through
+> `soil-sdk-records`. What remains is the port, not the missing host — see the follow-ups at the
+> end. Nothing here is a statement about event publication: notifications travel over
+> `soil:unibus` (see `docs/unibus-producer.md`), which is a transport, not a store.
+
 The working code is in:
 
 - `src/records.rs` — a small **append-only records engine** (schemas, revisions,

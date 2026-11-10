@@ -48,6 +48,11 @@ pub fn event_id(store_id: &str, seq: i64) -> String {
 
 /// The private webhook envelope. `id` is store-scoped even though the channel is private, so a
 /// consumer may share its deduplication namespace with federation without ambiguity.
+///
+/// The last three fields are the readable half: `actor` and `detail` come from the audit row
+/// that produced the event (`detail` is that row's own words — `→ in_review`, or a claim's
+/// actor kind), and `title` names the marble. A consumer that only needs routing can ignore
+/// them; one that formats a message cannot get them anywhere else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventEnvelope {
     pub schema: String,
@@ -58,9 +63,17 @@ pub struct EventEnvelope {
     pub issue_id: String,
     pub event: String,
     pub occurred_at: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub actor: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
 }
 
 impl EventEnvelope {
+    /// The machine facts only; `actor`, `detail`, and `title` are filled by the
+    /// dispatcher, which is the layer that can read the audit row.
     pub fn from_event(company: &str, event: &OutboundEvent) -> Self {
         Self {
             schema: EVENT_SCHEMA.to_string(),
@@ -71,6 +84,9 @@ impl EventEnvelope {
             issue_id: event.issue_id.clone(),
             event: event.event.clone(),
             occurred_at: event.occurred_at,
+            actor: String::new(),
+            detail: String::new(),
+            title: String::new(),
         }
     }
 }
@@ -378,7 +394,12 @@ impl Publisher {
 
     async fn deliver(&self, company: &str, event: &OutboundEvent) -> Result<(), String> {
         let envelope = EventEnvelope::from_event(company, event);
-        let body = serde_json::to_vec(&envelope).map_err(|e| e.to_string())?;
+        self.post(&envelope).await
+    }
+
+    /// POST one envelope to the receiver, HMAC-signed over the exact bytes sent.
+    pub async fn post(&self, envelope: &EventEnvelope) -> Result<(), String> {
+        let body = serde_json::to_vec(envelope).map_err(|e| e.to_string())?;
         let signature = hmac_signature(&self.secret, &body)?;
         let response = self
             .client

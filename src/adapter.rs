@@ -24,7 +24,7 @@ use std::sync::Mutex;
 use serde_json::{Value, json};
 
 use crate::records::{Engine, Key, RecordSchema, Version};
-use crate::store::{Error, Result};
+use crate::store::{Error, EventContext, Result};
 use crate::types::*;
 
 const ISSUE: &str = "issue";
@@ -1419,6 +1419,18 @@ impl Inner {
         Ok(out.into_iter().map(|(_, e)| e).collect())
     }
 
+    /// The audit record behind an outbox event, keyed by the shared `seq`.
+    fn event_context(&self, seq: i64) -> Result<Option<EventContext>> {
+        let key = Key::new([seq.to_string()]);
+        let Some(data) = self.current(MARBLES_EVENT, &key) else {
+            return Ok(None);
+        };
+        Ok(Some(EventContext {
+            actor: data["actor"].as_str().unwrap_or_default().to_string(),
+            detail: data["detail"].as_str().unwrap_or_default().to_string(),
+        }))
+    }
+
     fn stats(&self) -> Result<Value> {
         let mut counts: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
         for k in self.keys(ISSUE) {
@@ -1754,6 +1766,10 @@ impl crate::store::Store for Adapter {
     fn mark_event_delivered(&self, seq: i64, at: i64) -> Result<()> {
         let mut g = self.lock();
         Inner::mark_event_delivered(&mut g, seq, at)
+    }
+    fn event_context(&self, seq: i64) -> Result<Option<EventContext>> {
+        let g = self.lock();
+        Inner::event_context(&g, seq)
     }
     fn mark_event_failed(&self, seq: i64, next_attempt_at: i64, error: &str) -> Result<()> {
         let mut g = self.lock();
