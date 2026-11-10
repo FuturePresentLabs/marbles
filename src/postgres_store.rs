@@ -10,7 +10,7 @@ use postgres::{Client, GenericClient, Transaction};
 use postgres_openssl::MakeTlsConnector;
 
 use crate::db::{
-    CompanyStoreRegistry, Error, OutboundEvent, Result, Store, SweepReport, now,
+    CompanyStoreRegistry, Error, EventContext, OutboundEvent, Result, Store, SweepReport, now,
     validate_company_id,
 };
 use crate::time::WorkWeek;
@@ -506,6 +506,22 @@ impl Store for PostgresStore {
         self.transaction(|tx| {
             tx.execute("UPDATE marbles_outbound_event SET delivered_at=$3,attempts=attempts+1,last_error=NULL WHERE company_id=$1 AND seq=$2 AND delivered_at IS NULL", &[&self.company_id,&seq,&at])?;
             Ok(())
+        })
+    }
+
+    /// The audit row behind an outbox event; `(company_id, seq)` keys both tables.
+    fn event_context(&self, seq: i64) -> Result<Option<EventContext>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "SELECT actor,detail FROM marbles_history WHERE company_id=$1 AND seq=$2",
+                    &[&self.company_id, &seq],
+                )?
+                .map(|r| EventContext {
+                    actor: r.get(0),
+                    detail: r.get(1),
+                });
+            Ok(row)
         })
     }
 

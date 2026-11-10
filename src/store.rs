@@ -50,6 +50,8 @@ pub trait Store: Send + Sync {
     fn set_project_folder(&self, project: &str, folder: Option<&str>, at: i64) -> Result<()>;
     fn folder_view(&self) -> Result<FolderView>;
     fn pending_events(&self, at: i64, limit: usize) -> Result<Vec<OutboundEvent>>;
+    /// The audit row that produced outbox event `seq` (one `seq` feeds both).
+    fn event_context(&self, seq: i64) -> Result<Option<EventContext>>;
     fn mark_event_delivered(&self, seq: i64, at: i64) -> Result<()>;
     fn mark_event_failed(&self, seq: i64, next_attempt_at: i64, error: &str) -> Result<()>;
     fn create(&self, spec: &NewIssue, at: i64) -> Result<String>;
@@ -102,6 +104,18 @@ pub struct OutboundEvent {
     pub occurred_at: i64,
     pub event: String,
     pub attempts: i64,
+}
+
+/// The human-readable half of an audit row: who did it, and what it says.
+///
+/// The outbox carries the machine facts (`event`, `issue_id`, …); the sentence a
+/// notification wants (`claimed by …`, `→ in_review`) is already in `history`,
+/// written by the same `log_event` under the same `seq`. Reading it back beats
+/// denormalizing two more columns into every outbound row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventContext {
+    pub actor: String,
+    pub detail: String,
 }
 
 pub fn now() -> i64 {

@@ -37,6 +37,9 @@ sha2        = "0.10"
 tokio       = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "signal"] }
 toml        = "0.9"
 wasmtime    = { version = "34", default-features = false, features = ["cranelift", "runtime", "std"] }
+# The mesh client: framing, registration, and the envelope type. Marbles publishes
+# as a producer, so it needs the hub's wire protocol and nothing else from Unibus.
+unibus      = { git = "https://github.com/fungOS-linux/unibus", rev = "727fce91a4612a30eb1cf3acd802da6633619cc3" }
 
 [[bin]]
 name = "mb"

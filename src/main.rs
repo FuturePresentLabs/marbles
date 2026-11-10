@@ -1178,6 +1178,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
         Command::Serve { addr } => {
             let cfg = config::server_config();
             let webhook = cfg.webhook.clone();
+            let unibus = cfg.unibus.clone();
             let listen = addr.clone().unwrap_or(cfg.listen);
             let database_url = std::env::var("DATABASE_URL")
                 .ok()
@@ -1210,13 +1211,36 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                 company_stores: company_stores.clone(),
                 auth,
             });
-            if let Some(webhook) = webhook {
-                let publisher = marbles::webhook::Publisher::new(
-                    webhook,
-                    Arc::clone(&db),
-                    company_stores.clone(),
-                )?;
-                tokio::spawn(publisher.run());
+            if webhook.is_some() && unibus.is_some() {
+                return Err(
+                    "server.toml configures both [server.webhook] and [server.unibus]; the outbox \
+                     records one delivery state per event, so pick one sink"
+                        .to_string(),
+                );
+            }
+            let sink = match (webhook, unibus) {
+                (Some(webhook), None) => Some(marbles::outbox::Sink::Webhook(
+                    marbles::webhook::Publisher::new(
+                        webhook,
+                        Arc::clone(&db),
+                        company_stores.clone(),
+                    )?,
+                )),
+                (None, Some(unibus)) => Some(marbles::outbox::Sink::Unibus(Arc::new(
+                    marbles::unibus::UnibusSink::new(&unibus)?,
+                ))),
+                _ => None,
+            };
+            if let Some(sink) = sink {
+                let name = match &sink {
+                    marbles::outbox::Sink::Webhook(_) => "webhook",
+                    marbles::outbox::Sink::Unibus(_) => "unibus",
+                };
+                println!("outbox: delivering to {name}");
+                tokio::spawn(
+                    marbles::outbox::Dispatcher::new(sink, Arc::clone(&db), company_stores.clone())
+                        .run(),
+                );
             }
             let listener = tokio::net::TcpListener::bind(&listen)
                 .await

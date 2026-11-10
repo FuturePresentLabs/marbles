@@ -113,7 +113,8 @@ CREATE TABLE IF NOT EXISTS store_meta(
 "#;
 
 pub use crate::store::{
-    CompanyStoreRegistry, Error, OutboundEvent, ProjectRemoval, Result, Store, SweepReport, now,
+    CompanyStoreRegistry, Error, EventContext, OutboundEvent, ProjectRemoval, Result, Store,
+    SweepReport, now,
 };
 
 pub struct Db {
@@ -688,6 +689,25 @@ impl Db {
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// The audit row behind an outbox event. `history.seq` and `outbound_event.seq`
+    /// are the same number: one `log_event` writes both.
+    pub fn event_context(&self, seq: i64) -> Result<Option<EventContext>> {
+        let mut out = None;
+        self.query(|conn| {
+            let mut stmt = conn.prepare("SELECT actor, detail FROM history WHERE seq=?1")?;
+            out = stmt
+                .query_row(params![seq], |row| {
+                    Ok(EventContext {
+                        actor: row.get(0)?,
+                        detail: row.get(1)?,
+                    })
+                })
+                .optional()?;
             Ok(())
         })?;
         Ok(out)
@@ -1662,6 +1682,9 @@ impl Store for Db {
     }
     fn pending_events(&self, at: i64, limit: usize) -> Result<Vec<OutboundEvent>> {
         Db::pending_events(self, at, limit)
+    }
+    fn event_context(&self, seq: i64) -> Result<Option<EventContext>> {
+        Db::event_context(self, seq)
     }
     fn mark_event_delivered(&self, seq: i64, at: i64) -> Result<()> {
         Db::mark_event_delivered(self, seq, at)
