@@ -10,19 +10,13 @@
 //! `updated` stay in the audit trail — publishing them would train the reader to
 //! ignore the channel.
 
-#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Mutex;
 
-#[cfg(not(target_arch = "wasm32"))]
 use serde_json::json;
-#[cfg(not(target_arch = "wasm32"))]
 use unibus::Message;
-#[cfg(not(target_arch = "wasm32"))]
 use unibus::client::{Client, ClientConfig};
 
-#[cfg(not(target_arch = "wasm32"))]
 use crate::config::UnibusConfig;
-#[cfg(not(target_arch = "wasm32"))]
 use crate::webhook::EventEnvelope;
 
 // The kinds the hub must grant this producer. They are versioned: a consumer
@@ -49,13 +43,11 @@ pub fn kind_for(event: &str) -> Option<&'static str> {
 }
 
 /// A registered hub session, reconnecting on demand.
-#[cfg(not(target_arch = "wasm32"))]
 pub struct UnibusSink {
     config: ClientConfig,
     client: Mutex<Option<Client>>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl UnibusSink {
     /// Validates everything that can be checked without the hub being up: the
     /// endpoint parses, a zone is served, and the token is readable. The hub's

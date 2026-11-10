@@ -37,7 +37,9 @@ impl Sink {
         }
     }
 
-    fn name(&self) -> &'static str {
+    /// Which sink this is, for the startup line and error messages.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
         match self {
             Sink::Webhook(_) => "webhook",
             Sink::Unibus(_) => "unibus",
@@ -70,7 +72,7 @@ impl Dispatcher {
         loop {
             tick.tick().await;
             if let Err(error) = self.deliver_once().await {
-                eprintln!("marbles {} dispatcher: {error}", self.sink.name());
+                eprintln!("marbles {} dispatcher: {error}", self.sink.label());
             }
         }
     }

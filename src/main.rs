@@ -1232,11 +1232,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                 _ => None,
             };
             if let Some(sink) = sink {
-                let name = match &sink {
-                    marbles::outbox::Sink::Webhook(_) => "webhook",
-                    marbles::outbox::Sink::Unibus(_) => "unibus",
-                };
-                println!("outbox: delivering to {name}");
+                println!("outbox: delivering to {}", sink.label());
                 tokio::spawn(
                     marbles::outbox::Dispatcher::new(sink, Arc::clone(&db), company_stores.clone())
                         .run(),
