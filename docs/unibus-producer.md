@@ -76,10 +76,20 @@ duplicate a frame but never drop one.
 * The credential never appears in a frame body; it is read from the token file by the client and
   lives only in the registration envelope.
 
-## Known deployment gap
+## Reaching the hub from a deployment
 
-The hub listens on `127.0.0.1:18790` on the host that runs it, and Marbles is deployed as a hosted
-service (`marbles.fpl.dev`) through Shroud/Fab rather than on that host. Until the hub either
-binds a mesh-reachable address or a forward exists from the Marbles deployment to it, the
-producer has no route and every delivery fails with `connect hub at 127.0.0.1:18790`. That is a
-network fact, not a code one — the sink is exercised against a fake hub in `tests/unibus.rs`.
+The hub binds `0.0.0.0:18790` with `allow_insecure_lan`, so `127.0.0.1` is only correct
+when Marbles and the hub share a host. Marbles is deployed as a hosted service
+(`marbles.fpl.dev`) through Shroud/Fab, where the hub is reachable at the Shroud bridge address
+(`172.16.0.1:18790` from the `172.16.0.0/16` VM network) rather than loopback. Point
+`hub_endpoint` at whatever address the container can actually reach, and confirm the path at
+deploy time: the failure mode is a plain `connect hub at …` error on every delivery, visible in
+`last_error` on the outbox rows.
+
+## Verification
+
+* `tests/unibus.rs` drives the sink against a fake hub: registration handshake, the published
+  kind and body, a credential that never reaches the payload, and an unroutable endpoint for the
+  skip rule.
+* One live end-to-end check was run on 2026-11-09: a `marbles.issue.claimed.v1` frame published
+  as producer `marbles` was consumed by Elmers and delivered to Telegram.
