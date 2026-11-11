@@ -111,6 +111,17 @@ fn run() -> Result<(), String> {
                         issue.parent = Some(rest.get(i + 1).cloned().ok_or("--parent")?);
                         i += 2;
                     }
+                    "--labels" => {
+                        issue.labels = rest
+                            .get(i + 1)
+                            .ok_or("--labels a,b")?
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|label| !label.is_empty())
+                            .map(str::to_owned)
+                            .collect();
+                        i += 2;
+                    }
                     other => return Err(format!("unknown create option {other}")),
                 }
             }
