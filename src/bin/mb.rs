@@ -69,7 +69,12 @@ fn run() -> Result<(), String> {
             .map_err(|error| error.to_string())?;
     }
     match rest[0].as_str() {
-        "list" => print_json(&store.list(Some(&project), false, None).map_err(err)?)?,
+        // `--all` is what a report needs: without it the list is the open set, and
+        // "what landed yesterday" cannot be asked of a tracker that hides it.
+        "list" => {
+            let all = rest.iter().any(|arg| arg == "--all");
+            print_json(&store.list(Some(&project), all, None).map_err(err)?)?
+        }
         "ready" => print_json(&store.ready(Some(&project), now).map_err(err)?)?,
         "show" => {
             let id = rest.get(1).ok_or("show ID")?;
@@ -104,6 +109,17 @@ fn run() -> Result<(), String> {
                     }
                     "--parent" => {
                         issue.parent = Some(rest.get(i + 1).cloned().ok_or("--parent")?);
+                        i += 2;
+                    }
+                    "--labels" => {
+                        issue.labels = rest
+                            .get(i + 1)
+                            .ok_or("--labels a,b")?
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|label| !label.is_empty())
+                            .map(str::to_owned)
+                            .collect();
                         i += 2;
                     }
                     other => return Err(format!("unknown create option {other}")),
