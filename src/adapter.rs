@@ -29,6 +29,10 @@ use crate::types::*;
 
 const ISSUE: &str = "issue";
 const PROJECT: &str = "project";
+const PROJECT_INDEX: &str = "project_index";
+const PROJECT_INDEX_KEY: &str = "projects";
+const DEPENDENCY_INDEX: &str = "dependency_index";
+const DEPENDENCY_INDEX_KEY: &str = "edges";
 const FOLDER: &str = "folder";
 const PROJECT_FOLDER: &str = "project_folder";
 const DEPENDENCY: &str = "dependency";
@@ -73,6 +77,8 @@ pub fn schemas() -> Vec<RecordSchema> {
     vec![
         cols(ISSUE, &["id"], &[]),
         cols(PROJECT, &["slug"], &[]),
+        cols(PROJECT_INDEX, &["name"], &[]),
+        cols(DEPENDENCY_INDEX, &["name"], &[]),
         cols(FOLDER, &["slug"], &[]),
         cols(PROJECT_FOLDER, &["project"], &[]),
         cols(DEPENDENCY, &["child", "parent"], &[]),
@@ -174,6 +180,20 @@ impl Adapter {
         g.store_id.clone()
     }
 
+    /// Rebuild the single records-backed project index from the project records.
+    pub fn reindex_projects(&self) -> Result<usize> {
+        let mut g = self.lock();
+        g.rebuild_project_index()
+    }
+
+    /// Rebuild all derived indexes in one pass over the records book.
+    pub fn reindex(&self) -> Result<(usize, usize)> {
+        let mut g = self.lock();
+        let projects = g.rebuild_project_index()?;
+        let dependencies = g.rebuild_dependency_index()?;
+        Ok((projects, dependencies))
+    }
+
     /// Lock the store for the duration of one operation. Every mutation and read goes through
     /// here, so calls are serialized the way `Db.tx` / `Db.query` serialize against the one
     /// SQLite connection.
@@ -252,40 +272,36 @@ impl Inner {
         let evidence: Vec<Evidence> =
             serde_json::from_value(data["evidence"].clone()).unwrap_or_default();
 
-        // Dependencies: rows whose child == id, ordered by parent.
+        let edges = self.dependency_edges();
+
+        // Dependencies: edges whose child == id, ordered by parent.
         let mut dependencies = Vec::new();
         let mut open_parents = 0i64;
-        for key in self.keys(DEPENDENCY) {
-            let comps = key.as_vec();
-            if comps.get(0).map(String::as_str) == Some(id) {
-                if let Some(parent) = comps.get(1) {
-                    dependencies.push(Dependency {
-                        depends_on_id: Some(parent.clone()),
-                    });
-                    let status = self
-                        .load_issue(parent)
-                        .and_then(|d| d["status"].as_str().map(str::to_string));
-                    if status.as_deref().is_some_and(|s| !is_terminal(s)) {
-                        open_parents += 1;
-                    }
+        for (child, parent) in &edges {
+            if child == id {
+                dependencies.push(Dependency {
+                    depends_on_id: Some(parent.clone()),
+                });
+                let status = self
+                    .load_issue(parent)
+                    .and_then(|d| d["status"].as_str().map(str::to_string));
+                if status.as_deref().is_some_and(|s| !is_terminal(s)) {
+                    open_parents += 1;
                 }
             }
         }
         dependencies.sort_by(|a, b| a.depends_on_id.cmp(&b.depends_on_id));
         let dependency_count = open_parents;
 
-        // Dependents: rows whose parent == id.
+        // Dependents: edges whose parent == id.
         let mut dependent_count = 0i64;
-        for key in self.keys(DEPENDENCY) {
-            let comps = key.as_vec();
-            if comps.get(1).map(String::as_str) == Some(id) {
-                if let Some(child) = comps.get(0) {
-                    let status = self
-                        .load_issue(child)
-                        .and_then(|d| d["status"].as_str().map(str::to_string));
-                    if status.as_deref().is_some_and(|s| !is_terminal(s)) {
-                        dependent_count += 1;
-                    }
+        for (child, parent) in &edges {
+            if parent == id {
+                let status = self
+                    .load_issue(child)
+                    .and_then(|d| d["status"].as_str().map(str::to_string));
+                if status.as_deref().is_some_and(|s| !is_terminal(s)) {
+                    dependent_count += 1;
                 }
             }
         }
@@ -502,26 +518,182 @@ impl Inner {
             data["created_at"] = json!(ts);
         }
         self.append(PROJECT, &Key::new([slug.to_string()]), data);
+        self.refresh_project_index(slug)?;
         Ok(())
     }
 
-    fn projects(&self) -> Result<Vec<(String, String, String)>> {
-        let mut out: Vec<(String, String, String)> = self
-            .keys(PROJECT)
+    fn project_index_key() -> Key {
+        Key::new([PROJECT_INDEX_KEY.to_string()])
+    }
+
+    fn project_row(&self, slug: &str) -> Option<(String, String, String)> {
+        self.load_project(slug).map(|data| {
+            (
+                slug.to_string(),
+                data["root"].as_str().unwrap_or_default().to_string(),
+                data["prefix"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+    }
+
+    fn project_rows_from_scan(&self) -> Vec<(String, String, String)> {
+        let mut rows = self
+            .engine
+            .keys_all(PROJECT)
             .iter()
-            .filter_map(|k| {
-                let slug = k.as_vec().first()?.clone();
-                self.load_project(&slug).map(|d| {
-                    (
-                        slug,
-                        d["root"].as_str().unwrap_or_default().to_string(),
-                        d["prefix"].as_str().unwrap_or_default().to_string(),
-                    )
-                })
+            .filter_map(|key| {
+                let slug = key.as_vec().first()?;
+                self.project_row(slug)
             })
-            .collect();
-        out.sort();
-        Ok(out)
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+
+    fn load_project_index(&self) -> Option<Vec<(String, String, String)>> {
+        let data = self.current(PROJECT_INDEX, &Self::project_index_key())?;
+        let projects = data.get("projects")?.as_array()?;
+        let mut rows = projects
+            .iter()
+            .filter_map(|entry| {
+                let parts = entry.as_array()?;
+                Some((
+                    parts.first()?.as_str()?.to_string(),
+                    parts.get(1)?.as_str()?.to_string(),
+                    parts.get(2)?.as_str()?.to_string(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        Some(rows)
+    }
+
+    fn store_project_index(&mut self, rows: &[(String, String, String)]) {
+        let projects = rows
+            .iter()
+            .map(|(slug, root, prefix)| json!([slug, root, prefix]))
+            .collect::<Vec<_>>();
+        self.append(
+            PROJECT_INDEX,
+            &Self::project_index_key(),
+            json!({"projects": projects}),
+        );
+    }
+
+    fn rebuild_project_index(&mut self) -> Result<usize> {
+        let rows = self.project_rows_from_scan();
+        let count = rows.len();
+        self.store_project_index(&rows);
+        Ok(count)
+    }
+
+    fn refresh_project_index(&mut self, slug: &str) -> Result<()> {
+        let mut rows = match self.load_project_index() {
+            Some(rows) => rows,
+            None => {
+                self.rebuild_project_index()?;
+                return Ok(());
+            }
+        };
+        rows.retain(|(existing, _, _)| existing != slug);
+        if let Some(row) = self.project_row(slug) {
+            rows.push(row);
+        }
+        rows.sort();
+        self.store_project_index(&rows);
+        Ok(())
+    }
+
+    fn projects(&mut self) -> Result<Vec<(String, String, String)>> {
+        if let Some(rows) = self.load_project_index() {
+            return Ok(rows);
+        }
+        self.rebuild_project_index()?;
+        Ok(self.load_project_index().unwrap_or_default())
+    }
+
+    fn dependency_index_key() -> Key {
+        Key::new([DEPENDENCY_INDEX_KEY.to_string()])
+    }
+
+    fn dependency_rows_from_scan(&self) -> Vec<(String, String)> {
+        let mut edges = self
+            .engine
+            .keys_all(DEPENDENCY)
+            .iter()
+            .filter_map(|key| {
+                let parts = key.as_vec();
+                if let (Some(child), Some(parent)) = (parts.first(), parts.get(1)) {
+                    return Some((child.clone(), parent.clone()));
+                }
+                // Older import wrote the pair as one unit-separated component.
+                let (child, parent) = parts.first()?.split_once('\u{1f}')?;
+                Some((child.to_string(), parent.to_string()))
+            })
+            .collect::<Vec<_>>();
+        edges.sort();
+        edges
+    }
+
+    fn load_dependency_index(&self) -> Option<Vec<(String, String)>> {
+        let data = self.current(DEPENDENCY_INDEX, &Self::dependency_index_key())?;
+        let edges = data.get("edges")?.as_array()?;
+        let mut rows = edges
+            .iter()
+            .filter_map(|entry| {
+                let parts = entry.as_array()?;
+                Some((
+                    parts.first()?.as_str()?.to_string(),
+                    parts.get(1)?.as_str()?.to_string(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        Some(rows)
+    }
+
+    fn store_dependency_index(&mut self, edges: &[(String, String)]) {
+        let edges = edges
+            .iter()
+            .map(|(child, parent)| json!([child, parent]))
+            .collect::<Vec<_>>();
+        self.append(
+            DEPENDENCY_INDEX,
+            &Self::dependency_index_key(),
+            json!({"edges": edges}),
+        );
+    }
+
+    fn rebuild_dependency_index(&mut self) -> Result<usize> {
+        let edges = self.dependency_rows_from_scan();
+        let count = edges.len();
+        self.store_dependency_index(&edges);
+        Ok(count)
+    }
+
+    fn update_dependency_index(&mut self, child: &str, parent: &str, add: bool) -> Result<()> {
+        let mut edges = match self.load_dependency_index() {
+            Some(edges) => edges,
+            None => {
+                self.rebuild_dependency_index()?;
+                return Ok(());
+            }
+        };
+        if add {
+            if !edges.iter().any(|(c, p)| c == child && p == parent) {
+                edges.push((child.to_string(), parent.to_string()));
+            }
+        } else {
+            edges.retain(|(c, p)| !(c == child && p == parent));
+        }
+        edges.sort();
+        self.store_dependency_index(&edges);
+        Ok(())
+    }
+
+    fn dependency_edges(&self) -> Vec<(String, String)> {
+        self.load_dependency_index()
+            .unwrap_or_else(|| self.dependency_rows_from_scan())
     }
 
     fn ensure_folder(&mut self, folder: &Folder, at: i64) -> Result<()> {
@@ -767,11 +939,13 @@ impl Inner {
                 self.tombstone(REMOTE_DEP, &key);
             }
         }
+        self.rebuild_dependency_index()?;
         // Tombstone the issues and the project itself.
         for id in &mine {
             self.tombstone(ISSUE, &Self::issue_key(id));
         }
         self.tombstone(PROJECT, &Key::new([slug.to_string()]));
+        self.refresh_project_index(slug)?;
         Ok(out)
     }
 }
@@ -1071,6 +1245,7 @@ impl Inner {
         // INSERT OR IGNORE: a duplicate edge appends nothing.
         if self.current(DEPENDENCY, &key).is_none() {
             self.append(DEPENDENCY, &key, json!({"child": child, "parent": parent}));
+            self.update_dependency_index(child, parent, true)?;
             let mut issue = self.get(child)?;
             issue.updated_at = at;
             self.save_issue(&issue)?;
@@ -1083,6 +1258,7 @@ impl Inner {
         let key = Key::new([child.to_string(), parent.to_string()]);
         if self.current(DEPENDENCY, &key).is_some() {
             self.tombstone(DEPENDENCY, &key);
+            self.update_dependency_index(child, parent, false)?;
             self.log_event(child, at, actor, "unblocked_from", parent)?;
         }
         Ok(())
@@ -1744,8 +1920,8 @@ impl crate::store::Store for Adapter {
         Inner::ensure_project(&mut g, slug, root, prefix)
     }
     fn projects(&self) -> Result<Vec<(String, String, String)>> {
-        let g = self.lock();
-        Inner::projects(&g)
+        let mut g = self.lock();
+        Inner::projects(&mut g)
     }
     fn ensure_folder(&self, folder: &Folder, at: i64) -> Result<()> {
         let mut g = self.lock();
