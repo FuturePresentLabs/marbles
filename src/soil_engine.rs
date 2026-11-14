@@ -67,7 +67,7 @@ impl SoilEngine {
         loop {
             let page = book
                 .scan(cursor.clone(), MAX_PAGE)
-                .expect("soil:records scan");
+                .unwrap_or_else(|error| panic!("soil:records event scan: {error}"));
             for entry in page.entries {
                 if let Some((name, Key(parts))) = Self::parse_id(&entry.key.id)
                     && name == "marbles_event"
@@ -131,12 +131,16 @@ impl SoilEngine {
     pub fn append(&mut self, name: &str, key: &Key, data: Value, deleted: bool, _at: i64) -> i64 {
         let book = Self::book();
         let id = Self::id(name, key);
+        // Name the record and the store's own reason. These were bare
+        // `.expect`s, so a contended store aborted the guest with a wasm
+        // backtrace and no indication of which write had failed.
         if deleted {
-            book.delete(id).expect("soil:records delete");
+            book.delete(id.clone())
+                .unwrap_or_else(|error| panic!("soil:records delete {id}: {error}"));
         } else {
             let body = serde_json::to_vec(&data).expect("record body serializes");
-            book.upsert(id, Self::schema_id(name), body)
-                .expect("soil:records upsert");
+            book.upsert(id.clone(), Self::schema_id(name), body)
+                .unwrap_or_else(|error| panic!("soil:records upsert {id}: {error}"));
         }
         let seq = self.next_seq();
         self.invalidate();
@@ -170,7 +174,7 @@ impl SoilEngine {
         while records.len() < MAX_KEYS {
             let page = book
                 .scan(cursor.clone(), MAX_PAGE)
-                .expect("soil:records scan");
+                .unwrap_or_else(|error| panic!("soil:records scan {name}: {error}"));
             let mut reached_end = false;
             for entry in page.entries {
                 if !entry.key.id.starts_with(&prefix) {

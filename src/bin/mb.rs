@@ -15,6 +15,16 @@ use marbles::store::{self, Store};
 use marbles::types::{ClaimRequest, Evidence, IssuePatch, NewIssue};
 
 fn main() -> ExitCode {
+    // The release wasm is built with `panic = "abort"`, and a trap carries no
+    // cause of its own. Write the reason and flush it by hand before the abort,
+    // so a failure inside the guest is readable at the shell instead of being a
+    // bare wasm backtrace.
+    std::panic::set_hook(Box::new(|info| {
+        use std::io::Write;
+        let mut stderr = std::io::stderr();
+        let _ = writeln!(stderr, "mb: {info}");
+        let _ = stderr.flush();
+    }));
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
