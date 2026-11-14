@@ -30,7 +30,9 @@ use soil_sdk_records::{Book, CasResult as SoilCasResult, Version as SoilVersion}
 use crate::records::{CasResult, Key, Name, RecordSchema, Revision, Version};
 
 const COLLECTION: &str = "marbles";
-const MAX_PAGE: u32 = 512;
+/// Records per `scan` call. Matches the host's cap, so a page is one call; the
+/// limit is not the speed lever — copying bodies is.
+const MAX_PAGE: u32 = 4096;
 const MAX_KEYS: usize = 100_000;
 
 pub struct SoilEngine {
