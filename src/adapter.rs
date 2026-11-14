@@ -97,6 +97,15 @@ struct Inner {
     week: crate::time::WorkWeek,
 }
 
+/// The dependency edges, indexed both ways, built once per query.
+#[derive(Default)]
+struct DependencyIndex {
+    /// child → the issues it depends on.
+    parents: std::collections::BTreeMap<String, Vec<String>>,
+    /// parent → the issues waiting on it.
+    children: std::collections::BTreeMap<String, Vec<String>>,
+}
+
 /// A `Store` backed by the in-memory [`Engine`].
 pub struct Adapter {
     inner: Mutex<Inner>,
@@ -149,8 +158,10 @@ impl Adapter {
             inner.engine.define(schema).map_err(Error::Bad)?;
         }
         // The durable engine's `seq` was restored from the trail; keep the audit counter aligned
-        // with it so a reopened store does not reuse sequence numbers.
-        inner.seq = inner.engine.seq();
+        // with it so a reopened store does not reuse sequence numbers. Resolving it here would
+        // make a read-only invocation pay for it, so the engine keeps 0 meaning "look it up on
+        // the first write" — see `next_seq`.
+        inner.seq = 0;
         inner.seed_meta();
         Ok(Adapter {
             inner: Mutex::new(inner),
@@ -217,7 +228,14 @@ impl Inner {
     }
 
     /// The next audit sequence number, shared by the history event and its outbound event.
+    ///
+    /// A read-only invocation never asks, which is why this resolves the engine's counter
+    /// lazily: on the wasm backend the answer is the highest id in the book, and finding it
+    /// means reading the whole collection.
     fn next_seq(&mut self) -> i64 {
+        if self.seq == 0 {
+            self.seq = self.engine.seq();
+        }
         self.seq += 1;
         self.seq
     }
@@ -242,9 +260,51 @@ impl Inner {
 
     /// Read the `Issue` view of a stored record, or `None` if absent.
     fn row_to_issue(&self, id: &str) -> Option<Issue> {
-        let Some(data) = self.load_issue(id) else {
-            return None;
-        };
+        let deps = self.dependency_index();
+        self.project_issue(id, &deps)
+    }
+
+    /// One pass over the dependency edges, shared by every issue a query projects.
+    ///
+    /// `row_to_issue` used to walk `keys(DEPENDENCY)` twice per issue, which is
+    /// O(issues × edges): a single-project query over 5,959 issues with 1,638
+    /// edges meant 19 million key clones and took 1.6s. The edges do not change
+    /// while a query runs, so the adjacency is built once and borrowed.
+    fn dependency_index(&self) -> DependencyIndex {
+        let mut index = DependencyIndex::default();
+        for key in self.keys(DEPENDENCY) {
+            let comps = key.as_vec();
+            let (Some(child), Some(parent)) = (comps.first(), comps.get(1)) else {
+                continue;
+            };
+            index
+                .parents
+                .entry(child.clone())
+                .or_default()
+                .push(parent.clone());
+            index
+                .children
+                .entry(parent.clone())
+                .or_default()
+                .push(child.clone());
+        }
+        index
+    }
+
+    /// The project and status of a stored issue, without projecting the whole row.
+    ///
+    /// `list` and `ready` filter on both, and projection is the expensive half, so
+    /// a query that scopes to one project should not project the other 5,950.
+    fn issue_summary(&self, id: &str) -> Option<(String, String)> {
+        let data = self.load_issue(id)?;
+        Some((
+            data["project"].as_str().unwrap_or_default().to_string(),
+            data["status"].as_str().unwrap_or_default().to_string(),
+        ))
+    }
+
+    fn project_issue(&self, id: &str, deps: &DependencyIndex) -> Option<Issue> {
+        let data = self.load_issue(id)?;
         let project = data["project"].as_str().unwrap_or_default().to_string();
         let labels: Vec<String> =
             serde_json::from_value(data["labels"].clone()).unwrap_or_default();
@@ -252,41 +312,31 @@ impl Inner {
         let evidence: Vec<Evidence> =
             serde_json::from_value(data["evidence"].clone()).unwrap_or_default();
 
-        // Dependencies: rows whose child == id, ordered by parent.
+        // Dependencies: the edges whose child is this issue, ordered by parent.
         let mut dependencies = Vec::new();
         let mut open_parents = 0i64;
-        for key in self.keys(DEPENDENCY) {
-            let comps = key.as_vec();
-            if comps.get(0).map(String::as_str) == Some(id) {
-                if let Some(parent) = comps.get(1) {
-                    dependencies.push(Dependency {
-                        depends_on_id: Some(parent.clone()),
-                    });
-                    let status = self
-                        .load_issue(parent)
-                        .and_then(|d| d["status"].as_str().map(str::to_string));
-                    if status.as_deref().is_some_and(|s| !is_terminal(s)) {
-                        open_parents += 1;
-                    }
-                }
+        for parent in deps.parents.get(id).map(Vec::as_slice).unwrap_or_default() {
+            dependencies.push(Dependency {
+                depends_on_id: Some(parent.clone()),
+            });
+            let status = self
+                .load_issue(parent)
+                .and_then(|d| d["status"].as_str().map(str::to_string));
+            if status.as_deref().is_some_and(|s| !is_terminal(s)) {
+                open_parents += 1;
             }
         }
         dependencies.sort_by(|a, b| a.depends_on_id.cmp(&b.depends_on_id));
         let dependency_count = open_parents;
 
-        // Dependents: rows whose parent == id.
+        // Dependents: the edges whose parent is this issue.
         let mut dependent_count = 0i64;
-        for key in self.keys(DEPENDENCY) {
-            let comps = key.as_vec();
-            if comps.get(1).map(String::as_str) == Some(id) {
-                if let Some(child) = comps.get(0) {
-                    let status = self
-                        .load_issue(child)
-                        .and_then(|d| d["status"].as_str().map(str::to_string));
-                    if status.as_deref().is_some_and(|s| !is_terminal(s)) {
-                        dependent_count += 1;
-                    }
-                }
+        for child in deps.children.get(id).map(Vec::as_slice).unwrap_or_default() {
+            let status = self
+                .load_issue(child)
+                .and_then(|d| d["status"].as_str().map(str::to_string));
+            if status.as_deref().is_some_and(|s| !is_terminal(s)) {
+                dependent_count += 1;
             }
         }
 
@@ -866,29 +916,29 @@ impl Inner {
     }
 
     fn list(&self, project: Option<&str>, all: bool, only_id: Option<&str>) -> Result<Vec<Issue>> {
-        let mut issues: Vec<Issue> = self
+        // Filter on the stored project and status before projecting: a query for
+        // one project should not build 5,950 Issues to throw 5,949 away.
+        let ids: Vec<String> = self
             .keys(ISSUE)
             .iter()
-            .filter_map(|k| {
-                let id = k.as_vec().first()?.clone();
-                self.row_to_issue(&id)
-            })
-            .filter(|issue| {
-                if !all && issue.status == "closed" {
+            .filter_map(|k| k.as_vec().first().cloned())
+            .filter(|id| {
+                let Some((issue_project, status)) = self.issue_summary(id) else {
+                    return false;
+                };
+                if !all && status == "closed" {
                     return false;
                 }
-                if let Some(p) = project {
-                    if issue.project != p {
-                        return false;
-                    }
+                if project.is_some_and(|wanted| issue_project != wanted) {
+                    return false;
                 }
-                if let Some(id) = only_id {
-                    if issue.id != id {
-                        return false;
-                    }
-                }
-                true
+                only_id.is_none_or(|only| id == only)
             })
+            .collect();
+        let deps = self.dependency_index();
+        let mut issues: Vec<Issue> = ids
+            .iter()
+            .filter_map(|id| self.project_issue(id, &deps))
             .collect();
         issues.sort_by(|a, b| {
             a.priority
@@ -900,48 +950,53 @@ impl Inner {
     }
 
     fn ready(&self, project: Option<&str>, at: i64) -> Result<Vec<Issue>> {
-        let mut issues: Vec<Issue> = self
+        let deps = self.dependency_index();
+        // The eligibility predicate is evaluated over the stored record first:
+        // status, project and the dependency gate all read one field each, and a
+        // candidate that fails here never becomes an `Issue` at all.
+        let ids: Vec<String> = self
             .keys(ISSUE)
             .iter()
-            .filter_map(|k| {
-                let id = k.as_vec().first()?.clone();
-                self.row_to_issue(&id)
-            })
-            .filter(|issue| {
-                if issue.status != "open" {
+            .filter_map(|k| k.as_vec().first().cloned())
+            .filter(|id| {
+                let Some((issue_project, status)) = self.issue_summary(id) else {
+                    return false;
+                };
+                if status != "open" {
                     return false;
                 }
-                if let Some(p) = project {
-                    if issue.project != p {
+                if project.is_some_and(|wanted| issue_project != wanted) {
+                    return false;
+                }
+                // Every parent has to be terminal.
+                for parent in deps.parents.get(id).map(Vec::as_slice).unwrap_or_default() {
+                    let parent_status = self
+                        .load_issue(parent)
+                        .and_then(|d| d["status"].as_str().map(str::to_string));
+                    if parent_status.as_deref().is_none_or(|s| !is_terminal(s)) {
                         return false;
                     }
                 }
+                let data = self.load_issue(id).expect("summary read succeeded");
                 // Past the availability gate.
-                if let Some(avail) = issue.available_at {
-                    if avail > at {
-                        return false;
-                    }
-                }
-                // No open dependency: every parent must be terminal.
-                for key in self.keys(DEPENDENCY) {
-                    let comps = key.as_vec();
-                    if comps.get(0).map(String::as_str) == Some(issue.id.as_str()) {
-                        if let Some(parent) = comps.get(1) {
-                            let status = self
-                                .load_issue(parent)
-                                .and_then(|d| d["status"].as_str().map(str::to_string));
-                            if status.as_deref().is_none_or(|s| !is_terminal(s)) {
-                                return false;
-                            }
-                        }
-                    }
+                if data["available_at"]
+                    .as_i64()
+                    .is_some_and(|avail| avail > at)
+                {
+                    return false;
                 }
                 // Unclaimed, or its own expired lease is still up for grabs.
-                match (&issue.assignee, issue.expires_at) {
+                let assignee = data["assignee"].as_str();
+                let expires = data["expires_at"].as_i64();
+                match (assignee, expires) {
                     (Some(_), Some(exp)) if exp > at => false,
                     _ => true,
                 }
             })
+            .collect();
+        let mut issues: Vec<Issue> = ids
+            .iter()
+            .filter_map(|id| self.project_issue(id, &deps))
             .collect();
         issues.sort_by(|a, b| {
             a.priority

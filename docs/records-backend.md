@@ -283,14 +283,15 @@ on one machine, then look for `issue/["probe-..."]` in the other machine's
 4. **`outbound_event`, `remote_dep`, `folder` import.** The importer covers
    projects, issues, dependencies and (opt-in) history. The rest of the SQLite
    tables are unported.
-5. **One scan, not one round trip per issue.** `mb` costs ~1.6 s against a
-   7,800-record book, and it is the same 1.6 s for `mb ready` and
-   `mb list --all`: startup is 0.09 s, so the cost is work that does not depend
-   on the answer. `keys()` already scans the whole collection in one pass, then
-   `row_to_issue` goes back through the host once per key — so a single-project
-   query over 5,956 issues pays 5,956 calls. Caching the bodies from the scan
-   `keys()` already performs would remove them; the native CLI does the same
-   query in ~20 ms.
+5. **Fetch a record type in one call.** Measured medians against a
+   5,959-issue / 1,638-edge book: `show` 0.08 s, `list --project` 0.20 s,
+   `list --all` 0.25 s, `ready` 0.20 s — where the native SQLite path does the
+   same `list --all` in 0.04 s. The round trips are gone; what is left is the
+   pages. A scan is capped at 512 records per call (`MAX_PAGE` in the host), so
+   reading a type costs `ceil(n/512)` boundary crossings and `list --all` makes
+   19 of them. Raising the cap, or keeping an index collection so a
+   project-scoped query reads only its own issues, is the next order of
+   magnitude.
 6. **Query push-down.** `ready`/`list`/`stats` filter in Rust over that full key
    scan; a host that offers indexed predicates would make a fleet-sized book
    cheaper.

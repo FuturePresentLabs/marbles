@@ -9,6 +9,18 @@
 //! `marbles`. The entity id is `<type>/<json-key-array>`; the record body is
 //! the existing Marbles JSON state. One collection means one records book can
 //! hold the whole task store.
+//!
+//! # One scan, then answer from it
+//!
+//! The host's `scan` returns whole entries — key *and* body — so a full pass is
+//! already a read of the entire store. `keys()` used to keep only the keys and
+//! drop the bodies, which made every projection go back over the boundary once
+//! per record: listing a project of one issue from a 6,000-issue book cost
+//! 6,000 guest calls and took 1.6s. The scan result is now kept whole and
+//! `current()` answers from it.
+//!
+//! The cache lives for one invocation and is dropped on the first write, so a
+//! command reads a consistent snapshot and never sees its own half-applied edit.
 
 use std::cell::{Cell, RefCell};
 
@@ -23,24 +35,31 @@ const MAX_KEYS: usize = 100_000;
 
 pub struct SoilEngine {
     schemas: std::collections::BTreeMap<Name, RecordSchema>,
+    /// The highest audit id already in the book. Zero means "not looked up":
+    /// real event ids start at 1, and a read-only invocation should not scan the
+    /// collection to learn a number it will never use.
     seq: Cell<i64>,
-    /// One full collection scan populates every record type. Marbles reads
-    /// dependencies repeatedly while projecting issues; without this cache the
-    /// wasm backend becomes O(records x issues).
-    keys_cache: RefCell<std::collections::BTreeMap<Name, Vec<Key>>>,
+    /// Record types read in this invocation, each sorted by key. Entity ids are
+    /// `<type>/<json>`, so a type occupies one contiguous range of the
+    /// collection: reading it is a bounded scan, not a read of the whole store.
+    /// `show` touches dependencies and nothing else; it should not pay for
+    /// 5,959 issue bodies.
+    types: RefCell<std::collections::BTreeMap<Name, Vec<(Key, Value)>>>,
 }
 
 impl SoilEngine {
     pub fn new() -> Self {
         Self {
             schemas: Default::default(),
-            seq: Cell::new(Self::max_event_seq()),
-            keys_cache: RefCell::new(Default::default()),
+            seq: Cell::new(0),
+            types: RefCell::new(Default::default()),
         }
     }
 
     /// Event ids are the shared Marbles audit sequence. Re-seed from the
-    /// `marbles_event` collection so a new wasm invocation cannot reuse an id.
+    /// `marbles_event` records so a new wasm invocation cannot reuse an id.
+    ///
+    /// Called from the first write, never from a read.
     fn max_event_seq() -> i64 {
         let book = Self::book();
         let mut cursor = None;
@@ -119,18 +138,83 @@ impl SoilEngine {
             book.upsert(id, Self::schema_id(name), body)
                 .expect("soil:records upsert");
         }
-        let seq = self.seq.get() + 1;
-        self.seq.set(seq);
-        self.keys_cache.borrow_mut().clear();
+        let seq = self.next_seq();
+        self.invalidate();
         seq
     }
 
-    pub fn current(&self, name: &str, key: &Key) -> Option<Value> {
-        let entry = Self::entry_current(name, key)?;
-        if entry.deleted {
-            return None;
+    /// The invocation's audit sequence, resolved from the book on first use.
+    fn next_seq(&self) -> i64 {
+        let current = match self.seq.get() {
+            0 => Self::max_event_seq(),
+            known => known,
+        };
+        let seq = current + 1;
+        self.seq.set(seq);
+        seq
+    }
+
+    fn invalidate(&self) {
+        self.types.borrow_mut().clear();
+    }
+
+    /// Read one record type, once per invocation.
+    fn ensure_loaded(&self, name: &str) {
+        if self.types.borrow().contains_key(name) {
+            return;
         }
-        serde_json::from_slice(&entry.body).ok()
+        let book = Self::book();
+        let prefix = format!("{name}/");
+        let mut cursor = Some(prefix.clone());
+        let mut records: Vec<(Key, Value)> = Vec::new();
+        while records.len() < MAX_KEYS {
+            let page = book
+                .scan(cursor.clone(), MAX_PAGE)
+                .expect("soil:records scan");
+            let mut reached_end = false;
+            for entry in page.entries {
+                if !entry.key.id.starts_with(&prefix) {
+                    // The next type's range began: this type is fully read.
+                    reached_end = true;
+                    break;
+                }
+                if entry.deleted {
+                    continue;
+                }
+                if let Some((_, key)) = Self::parse_id(&entry.key.id)
+                    && let Ok(value) = serde_json::from_slice::<Value>(&entry.body)
+                {
+                    records.push((key, value));
+                }
+            }
+            if reached_end {
+                break;
+            }
+            match page.next {
+                Some(next) if Some(next.as_str()) != cursor.as_deref() => cursor = Some(next),
+                _ => break,
+            }
+        }
+        records.sort_by(|left, right| left.0.cmp(&right.0));
+        self.types.borrow_mut().insert(name.to_string(), records);
+    }
+
+    pub fn current(&self, name: &str, key: &Key) -> Option<Value> {
+        if !self.types.borrow().contains_key(name) {
+            // This type has not been read yet. One host call answers one record;
+            // reading the type's whole range to serve it is what `keys` is for.
+            let entry = Self::entry_current(name, key)?;
+            if entry.deleted {
+                return None;
+            }
+            return serde_json::from_slice(&entry.body).ok();
+        }
+        let types = self.types.borrow();
+        let records = types.get(name)?;
+        let index = records
+            .binary_search_by(|(candidate, _)| candidate.cmp(key))
+            .ok()?;
+        Some(records[index].1.clone())
     }
 
     pub fn history_of(&self, name: &str, key: &Key) -> Vec<Revision> {
@@ -147,46 +231,12 @@ impl SoilEngine {
     }
 
     pub fn keys(&self, name: &str) -> Vec<Key> {
-        if let Some(cached) = self.keys_cache.borrow().get(name) {
-            return cached.clone();
-        }
-        let book = Self::book();
-        let mut cursor = None;
-        let mut grouped: std::collections::BTreeMap<Name, Vec<Key>> = Default::default();
-        let mut total = 0usize;
-        loop {
-            let page = book
-                .scan(cursor.clone(), MAX_PAGE)
-                .expect("soil:records scan");
-            for entry in page.entries {
-                if entry.deleted {
-                    continue;
-                }
-                if let Some((record_type, key)) = Self::parse_id(&entry.key.id) {
-                    grouped
-                        .entry(record_type.to_string())
-                        .or_default()
-                        .push(key);
-                    total += 1;
-                }
-                if total >= MAX_KEYS {
-                    break;
-                }
-            }
-            if total >= MAX_KEYS {
-                break;
-            }
-            match page.next {
-                Some(next) if Some(next.as_str()) != cursor.as_deref() => cursor = Some(next),
-                _ => break,
-            }
-        }
-        for keys in grouped.values_mut() {
-            keys.sort();
-        }
-        let result = grouped.get(name).cloned().unwrap_or_default();
-        *self.keys_cache.borrow_mut() = grouped;
-        result
+        self.ensure_loaded(name);
+        let types = self.types.borrow();
+        types
+            .get(name)
+            .map(|records| records.iter().map(|(key, _)| key.clone()).collect())
+            .unwrap_or_default()
     }
 
     pub fn key_of(&self, name: &str, key: &Key) -> Option<Key> {
@@ -231,7 +281,7 @@ impl SoilEngine {
             )
             .map_err(|error| error.to_string())?;
         if result.applied {
-            self.keys_cache.borrow_mut().clear();
+            self.invalidate();
         }
         let current = if result.entry.deleted {
             None
@@ -250,7 +300,10 @@ impl SoilEngine {
     }
 
     pub fn seq(&self) -> i64 {
-        self.seq.get()
+        match self.seq.get() {
+            0 => Self::max_event_seq(),
+            known => known,
+        }
     }
 
     pub fn durable(_path: std::path::PathBuf) -> Self {
