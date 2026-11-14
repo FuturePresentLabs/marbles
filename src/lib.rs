@@ -43,6 +43,7 @@ pub mod postgres_migration;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod postgres_store;
 pub mod records;
+pub mod records_cli;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod refs;
 #[cfg(not(target_arch = "wasm32"))]

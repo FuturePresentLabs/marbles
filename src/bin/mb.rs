@@ -1,10 +1,18 @@
-//! Minimal wasm `mb` CLI over `soil:records`.
+//! `mb`: the Marbles CLI over `soil:records`.
+//!
+//! The host decides which records book and collection this runs against; this
+//! binary names only the `marbles` collection and the record schemas, exactly as
+//! `docs/peer-sync.md` requires of a Spore. Everything that selects an endpoint,
+//! a token or a filesystem path belongs to the host that launched it.
 
+use std::collections::BTreeMap;
+use std::io::Write;
 use std::process::ExitCode;
 
 use marbles::adapter::Adapter;
+use marbles::records_cli::{self, CreateArgs, Invocation, Request};
 use marbles::store::{self, Store};
-use marbles::types::{ActorKind, ClaimRequest, Evidence, NewIssue};
+use marbles::types::{ClaimRequest, Evidence, IssuePatch, NewIssue};
 
 fn main() -> ExitCode {
     match run() {
@@ -17,192 +25,209 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut project = std::env::var("MARBLES_PROJECT").ok();
-    let mut prefix = std::env::var("MARBLES_PREFIX").ok();
-    let mut actor = std::env::var("MARBLES_ACTOR")
-        .ok()
-        .unwrap_or_else(|| "agent".into());
-    let mut rest = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--project" => {
-                project = args.get(index + 1).cloned();
-                index += 2;
-            }
-            "--prefix" => {
-                prefix = args.get(index + 1).cloned();
-                index += 2;
-            }
-            "--actor" => {
-                actor = args
-                    .get(index + 1)
-                    .cloned()
-                    .ok_or("--actor needs a value")?;
-                index += 2;
-            }
-            other if other.starts_with('-') => {
-                return Err(format!("unknown option {other}"));
-            }
-            _ => {
-                rest.extend_from_slice(&args[index..]);
-                break;
-            }
-        }
-    }
-    if rest.is_empty() {
-        return Err("usage: mb --project SLUG [command]".into());
-    }
-    let project = project.unwrap_or_else(|| "default".into());
-    let prefix = prefix.unwrap_or_else(|| project.clone());
-    let store = Adapter::open("wasm".into()).map_err(|error| error.to_string())?;
-    let now = store::now();
-    let known = store
-        .projects()
-        .map_err(err)?
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let env = MARBLES_ENV
         .iter()
-        .any(|(slug, _, _)| slug == &project);
-    if !known {
-        store
-            .ensure_project(&project, "", &prefix)
-            .map_err(|error| error.to_string())?;
-    }
-    match rest[0].as_str() {
-        // `--all` is what a report needs: without it the list is the open set, and
-        // "what landed yesterday" cannot be asked of a tracker that hides it.
-        "list" => {
-            let all = rest.iter().any(|arg| arg == "--all");
-            print_json(&store.list(Some(&project), all, None).map_err(err)?)?
-        }
-        "ready" => print_json(&store.ready(Some(&project), now).map_err(err)?)?,
-        "show" => {
-            let id = rest.get(1).ok_or("show ID")?;
-            print_json(&store.get(id).map_err(err)?)?
-        }
-        "create" => {
-            let title = rest.get(1).ok_or("create TITLE")?;
-            let mut issue = NewIssue {
-                title: title.clone(),
-                project: Some(project.clone()),
-                created_by: Some(actor.clone()),
-                ..Default::default()
-            };
-            let mut i = 2;
-            while i < rest.len() {
-                match rest[i].as_str() {
-                    "--description" => {
-                        issue.description = rest.get(i + 1).cloned().ok_or("--description")?;
-                        i += 2;
-                    }
-                    "--priority" => {
-                        issue.priority = rest
-                            .get(i + 1)
-                            .ok_or("--priority")?
-                            .parse()
-                            .map_err(|_| "invalid priority")?;
-                        i += 2;
-                    }
-                    "--type" => {
-                        issue.issue_type = rest.get(i + 1).cloned().ok_or("--type")?;
-                        i += 2;
-                    }
-                    "--parent" => {
-                        issue.parent = Some(rest.get(i + 1).cloned().ok_or("--parent")?);
-                        i += 2;
-                    }
-                    "--labels" => {
-                        issue.labels = rest
-                            .get(i + 1)
-                            .ok_or("--labels a,b")?
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|label| !label.is_empty())
-                            .map(str::to_owned)
-                            .collect();
-                        i += 2;
-                    }
-                    other => return Err(format!("unknown create option {other}")),
-                }
+        .filter_map(|key| std::env::var(key).ok().map(|value| (*key, value)))
+        .map(|(key, value)| (key.to_string(), value))
+        .collect::<BTreeMap<_, _>>();
+    let invocation = records_cli::parse(&argv, &env)?;
+    let store = Adapter::open("marbles".into()).map_err(|error| error.to_string())?;
+    let now = store::now();
+    execute(&store, &invocation, now)
+}
+
+/// The only environment a caller can use to scope an invocation. A Spore has no
+/// ambient environment; these three are the documented `mb` contract, and the
+/// host is what puts them there.
+const MARBLES_ENV: &[&str] = &["MARBLES_PROJECT", "MARBLES_PREFIX", "MARBLES_ACTOR"];
+
+fn execute(store: &Adapter, invocation: &Invocation, now: i64) -> Result<(), String> {
+    let actor = &invocation.actor;
+    let project = invocation.project.as_deref();
+    match &invocation.request {
+        Request::List { all, id, limit } => {
+            let mut issues = store
+                .list(project, *all, id.as_deref())
+                .map_err(err)?;
+            if *limit > 0 {
+                issues.truncate(*limit as usize);
             }
-            let id = store.create(&issue, now).map_err(err)?;
-            print_json(&serde_json::json!({"id": id}))?
+            print_json(&issues)
         }
-        "claim" => {
-            let id = rest.get(1).ok_or("claim ID")?;
-            let kind = if rest.iter().any(|arg| arg == "--human") {
-                ActorKind::Human
-            } else {
-                ActorKind::Agent
-            };
+        Request::Ready => print_json(&store.ready(project, now).map_err(err)?),
+        // A one-element array: the native CLI prints this shape because Beads
+        // clients parse `show --json` as a list, and `soil-marbles` reads it that
+        // way too. The records backend answers the same contract.
+        Request::Show { id } => print_json(&[store.get(id).map_err(err)?]),
+        Request::Create(args) => {
+            let slug = project.ok_or_else(|| {
+                "create needs a project: pass --project SLUG or set MARBLES_PROJECT".to_string()
+            })?;
+            ensure_project(store, slug, invocation.prefix.as_deref())?;
+            let id = store
+                .create(&new_issue(args, slug, actor), now)
+                .map_err(err)?;
+            print_json(&serde_json::json!({ "id": id }))
+        }
+        Request::Claim {
+            id,
+            kind,
+            ttl_seconds,
+            assignee,
+        } => {
             let receipt = store
                 .claim(
                     &ClaimRequest {
                         id: id.clone(),
-                        assignee: actor.clone(),
-                        actor_kind: kind,
-                        ttl_seconds: None,
+                        assignee: assignee.clone().unwrap_or_else(|| actor.clone()),
+                        actor_kind: *kind,
+                        ttl_seconds: *ttl_seconds,
                     },
                     now,
                 )
                 .map_err(err)?;
-            print_json(&receipt)?
+            print_json(&receipt)
         }
-        "release" => {
-            let id = rest.get(1).ok_or("release ID")?;
-            store.release(id, &actor, now).map_err(err)?;
-            print_json(&serde_json::json!({"released": id}))?
+        Request::Touch { id, holder } => {
+            let expires_at = store
+                .touch(id, holder.as_deref().unwrap_or(actor), now)
+                .map_err(err)?;
+            print_json(&serde_json::json!({ "expires_at": expires_at }))
         }
-        "close" => {
-            let id = rest.get(1).ok_or("close ID")?;
-            let mut reason = None;
-            let mut evidence = Vec::new();
-            let mut i = 2;
-            while i < rest.len() {
-                match rest[i].as_str() {
-                    "--reason" => {
-                        reason = Some(rest.get(i + 1).cloned().ok_or("--reason")?);
-                        i += 2;
-                    }
-                    "--pr" => {
-                        evidence.push(Evidence::pr(rest.get(i + 1).cloned().ok_or("--pr")?));
-                        i += 2;
-                    }
-                    "--commit" => {
-                        evidence.push(Evidence::commit(
-                            rest.get(i + 1).cloned().ok_or("--commit")?,
-                        ));
-                        i += 2;
-                    }
-                    "--ack" => {
-                        evidence.push(Evidence::ack(rest.get(i + 1).cloned().ok_or("--ack")?));
-                        i += 2;
-                    }
-                    other => return Err(format!("unknown close option {other}")),
-                }
+        Request::Release { id, holder } => {
+            store
+                .release(id, holder.as_deref().unwrap_or(actor), now)
+                .map_err(err)?;
+            print_json(&serde_json::json!({ "released": id }))
+        }
+        Request::Review { id, pr, commit } => {
+            // Review is a state, not a note: keep the evidence already recorded
+            // and replace only the same kind, so re-running `review --pr`
+            // corrects the URL instead of stacking two.
+            let existing = store.get(id).map_err(err)?;
+            let mut evidence = existing.evidence.clone();
+            if let Some(pr) = pr {
+                evidence.retain(|entry| entry.kind != "pr");
+                evidence.push(Evidence::pr(pr.clone()));
+            }
+            if let Some(commit) = commit {
+                evidence.retain(|entry| entry.kind != "commit");
+                evidence.push(Evidence::commit(commit.clone()));
             }
             let issue = store
-                .close(id, reason.as_deref(), &evidence, &actor, now)
+                .update(
+                    id,
+                    &IssuePatch {
+                        status: Some("review".into()),
+                        evidence: Some(evidence),
+                        ..Default::default()
+                    },
+                    actor,
+                    now,
+                )
                 .map_err(err)?;
-            print_json(&issue)?
+            print_json(&issue)
         }
-        "history" => {
-            let id = rest.get(1).ok_or("history ID")?;
-            print_json(&store.history(id).map_err(err)?)?
+        Request::Close {
+            id,
+            reason,
+            evidence,
+        } => {
+            let issue = store
+                .close(id, reason.as_deref(), evidence, actor, now)
+                .map_err(err)?;
+            print_json(&issue)
         }
-        other => return Err(format!("unknown command {other}")),
+        Request::Supersede { id, with } => {
+            store.supersede(id, with, actor, now).map_err(err)?;
+            print_json(&serde_json::json!({ "superseded": id, "by": with }))
+        }
+        Request::Dep { add, child, parent } => {
+            if *add {
+                store.add_dep(child, parent, actor, now).map_err(err)?;
+            } else {
+                store.remove_dep(child, parent, actor, now).map_err(err)?;
+            }
+            print_json(&serde_json::json!({ "child": child, "parent": parent, "present": add }))
+        }
+        Request::Label { add, id, label } => {
+            if *add {
+                store.add_label(id, label, actor, now).map_err(err)?;
+            } else {
+                store.remove_label(id, label, actor, now).map_err(err)?;
+            }
+            print_json(&serde_json::json!({ "id": id, "label": label, "present": add }))
+        }
+        Request::History { id } => print_json(&store.history(id).map_err(err)?),
+        Request::Sweep => print_json(&store.sweep(now).map_err(err)?),
+        Request::Stats => print_json(&store.stats().map_err(err)?),
+        Request::Projects => print_json(
+            &store
+                .projects()
+                .map_err(err)?
+                .into_iter()
+                .map(|(slug, root, prefix)| {
+                    serde_json::json!({ "slug": slug, "root": root, "prefix": prefix })
+                })
+                .collect::<Vec<_>>(),
+        ),
+    }
+}
+
+/// Register the project on first write.
+///
+/// A records store is shared by every project a machine has ever tracked, so the
+/// project row cannot be created by `mb init` alone: an import or a first
+/// `create` from a fresh checkout has to be able to establish it. The prefix
+/// defaults to the slug, which is the same rule the native CLI applies.
+fn ensure_project(store: &Adapter, slug: &str, prefix: Option<&str>) -> Result<(), String> {
+    let known = store
+        .projects()
+        .map_err(err)?
+        .iter()
+        .any(|(existing, _, _)| existing == slug);
+    if !known {
+        store
+            .ensure_project(slug, "", prefix.unwrap_or(slug))
+            .map_err(err)?;
     }
     Ok(())
+}
+
+fn new_issue(args: &CreateArgs, project: &str, actor: &str) -> NewIssue {
+    NewIssue {
+        title: args.title.clone(),
+        description: args.description.clone(),
+        issue_type: args.issue_type.clone(),
+        priority: args.priority,
+        labels: args.labels.clone(),
+        parent: args.parent.clone(),
+        project: Some(project.to_string()),
+        created_by: Some(actor.to_string()),
+        ..Default::default()
+    }
 }
 
 fn err(error: marbles::store::Error) -> String {
     error.to_string()
 }
 
-fn print_json<T: serde::Serialize>(value: &T) -> Result<(), String> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value).map_err(|error| error.to_string())?
-    );
-    Ok(())
+fn print_json<T: serde::Serialize + ?Sized>(value: &T) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
+    // `println!` panics when the write fails, and a host caps a command's stdout
+    // with a pipe: `mb list --all` over a fleet-sized store hits that cap, and a
+    // panic turns a size limit into a wasm trap with a backtrace for an error
+    // message. Report the cap and what narrows the answer instead.
+    let mut stdout = std::io::stdout();
+    stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.write_all(b"\n"))
+        .and_then(|()| stdout.flush())
+        .map_err(|error| {
+            format!(
+                "could not write the answer ({error}); the host caps a command's stdout, so \
+                 narrow the query with --project or --limit"
+            )
+        })
 }
