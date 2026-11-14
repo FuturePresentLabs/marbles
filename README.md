@@ -50,6 +50,21 @@ x86-64 and ARM64. On an FPL workstation, `fpl install marbles` selects and
 verifies the right archive and exposes both `marbles` and `mb` in
 `~/.local/bin`.
 
+### `mb` over `soil:records` (wasm)
+
+`mb` can instead run as a Soil spore against a `soil:records` book, which is how
+it syncs between machines:
+
+```bash
+scripts/install-records-cli.sh --records-book personal/<you>/marbles
+```
+
+That installs the wasm command package, a `mb` shim that binds it to the store,
+and a small config file — see [`docs/records-backend.md`](docs/records-backend.md).
+It needs `soil-command` from a Soil checkout on `PATH`. The native binary stays
+installed as `marbles`: `init`, `import`, `plan`, `portfolio` and `serve` still
+live there, and mixing the two stores for one project is the one thing to avoid.
+
 Container builds work without a remote cache or AWS credentials. To opt into
 the DigitalOcean/mycelium `sccache`, see [`docs/build-cache.md`](docs/build-cache.md).
 
