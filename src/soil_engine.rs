@@ -30,9 +30,16 @@ use soil_sdk_records::{Book, CasResult as SoilCasResult, Version as SoilVersion}
 use crate::records::{CasResult, Key, Name, RecordSchema, Revision, Version};
 
 const COLLECTION: &str = "marbles";
-/// Records per `scan` call. Matches the host's cap, so a page is one call; the
-/// limit is not the speed lever — copying bodies is.
-const MAX_PAGE: u32 = 4096;
+/// Records per `scan` call while reading one type.
+///
+/// A scan is ordered by entity id and a type is a key prefix, so the page that
+/// crosses a type's last record is mostly *other* types. The guest stops at that
+/// boundary, but by then the host has copied the whole page in. At the host's
+/// 4096 cap a single dependency load pulled ~4000 issue bodies it discarded,
+/// which is where `mb show` spent its 80 ms: it reads the dependency edges and
+/// nothing else. 512 bounds the over-fetch and a large type still crosses in a
+/// handful of calls.
+const LOAD_PAGE: u32 = 512;
 const MAX_KEYS: usize = 100_000;
 
 pub struct SoilEngine {
@@ -68,7 +75,7 @@ impl SoilEngine {
         let mut max = 0;
         loop {
             let page = book
-                .scan(cursor.clone(), MAX_PAGE)
+                .scan(cursor.clone(), LOAD_PAGE)
                 .unwrap_or_else(|error| panic!("soil:records event scan: {error}"));
             for entry in page.entries {
                 if let Some((name, Key(parts))) = Self::parse_id(&entry.key.id)
@@ -175,7 +182,7 @@ impl SoilEngine {
         let mut records: Vec<(Key, Value)> = Vec::new();
         while records.len() < MAX_KEYS {
             let page = book
-                .scan(cursor.clone(), MAX_PAGE)
+                .scan(cursor.clone(), LOAD_PAGE)
                 .unwrap_or_else(|error| panic!("soil:records scan {name}: {error}"));
             let mut reached_end = false;
             for entry in page.entries {
