@@ -64,7 +64,14 @@ brew install futurepresentlabs/marbles/marbles
 ```
 
 The formula installs the published archive for the platform, so it tracks
-tagged releases rather than `main`.
+tagged releases rather than `main` — v0.1.0 today, which predates the
+`soil:records` backend.
+
+**Homebrew's `bin` sits ahead of `~/.local/bin` on most machines.** So
+`brew install` shadows the records-backed `mb` with the native one, and you
+are silently back on the local store — nothing errors. If `mb` is meant to run
+over `soil:records` here, skip the formula or put `~/.local/bin` first on
+`PATH`.
 
 On an FPL workstation, `fpl install marbles` selects and verifies the right
 archive and exposes both names in `~/.local/bin`.
