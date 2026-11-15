@@ -18,7 +18,7 @@ serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 thiserror   = "2"
 getrandom   = "0.3"
-soil-sdk-records = { git = "https://github.com/fungOS-linux/soil.git", rev = "a5b7721abf48739b18cee3e9292bdbfeb9940915", optional = true }
+soil-sdk-records = { git = "https://github.com/mycelium-linux/soil.git", rev = "fc010d45218826b6cf980a352b526c48e0691d45", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 axum        = "0.8"
@@ -39,7 +39,7 @@ toml        = "0.9"
 wasmtime    = { version = "34", default-features = false, features = ["cranelift", "runtime", "std"] }
 # The mesh client: framing, registration, and the envelope type. Marbles publishes
 # as a producer, so it needs the hub's wire protocol and nothing else from Unibus.
-unibus      = { git = "https://github.com/fungOS-linux/unibus", rev = "727fce91a4612a30eb1cf3acd802da6633619cc3" }
+unibus      = { git = "https://github.com/mycelium-linux/unibus", rev = "727fce91a4612a30eb1cf3acd802da6633619cc3" }
 
 [[bin]]
 name = "mb"
