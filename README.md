@@ -38,17 +38,36 @@ replicated, so there is nothing to merge.
 
 ## Install
 
-From source (Rust 1.88+):
+From a tagged release (Linux x86-64 and ARM64, macOS ARM64):
 
 ```bash
-cargo install --path .      # installs `marbles` and `mb`
-marbles --version
+# check it against the .sha256 beside it first
+tar -xzf marbles-<version>-<target>.tar.gz -C ~/.local/bin marbles mb
 ```
 
-Tagged releases publish checksum-addressed archives for Linux and macOS on
-x86-64 and ARM64. On an FPL workstation, `fpl install marbles` selects and
-verifies the right archive and exposes both `marbles` and `mb` in
-`~/.local/bin`.
+`mb` in that archive is the same binary under a second name; the native CLI
+answers to both.
+
+From source (Rust 1.88+), which installs **only `marbles`** — `mb` is a separate
+target behind the `soil` feature, so `cargo install` skips it:
+
+```bash
+cargo install --path .
+ln -sf "$(command -v marbles)" ~/.local/bin/mb
+```
+
+With Homebrew, from a tap over this repository:
+
+```bash
+brew tap futurepresentlabs/marbles https://github.com/FuturePresentLabs/marbles
+brew install futurepresentlabs/marbles/marbles
+```
+
+The formula installs the published archive for the platform, so it tracks
+tagged releases rather than `main`.
+
+On an FPL workstation, `fpl install marbles` selects and verifies the right
+archive and exposes both names in `~/.local/bin`.
 
 ### `mb` over `soil:records` (wasm)
 
@@ -60,10 +79,11 @@ scripts/install-records-cli.sh --records-book personal/<you>/marbles
 ```
 
 That installs the wasm command package, a `mb` shim that binds it to the store,
-and a small config file — see [`docs/records-backend.md`](docs/records-backend.md).
-It needs `soil-command` from a Soil checkout on `PATH`. The native binary stays
-installed as `marbles`: `init`, `import`, `plan`, `portfolio` and `serve` still
-live there, and mixing the two stores for one project is the one thing to avoid.
+and the policy file the shim reads — see
+[`docs/records-backend.md`](docs/records-backend.md). It needs a `soil-command`
+from a Soil checkout on `PATH`. The native binary stays installed as `marbles`:
+`init`, `import`, `plan`, `portfolio` and `serve` still live there, and mixing
+the two stores for one project is the one thing to avoid.
 
 Container builds work without a remote cache or AWS credentials. To opt into
 the DigitalOcean/mycelium `sccache`, see [`docs/build-cache.md`](docs/build-cache.md).

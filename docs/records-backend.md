@@ -30,11 +30,11 @@ scripts/install-records-cli.sh --records-book personal/avery/marbles
 ```
 
 That builds `mb.wasm` for `wasm32-wasip2`, installs it as the `mb` command
-package under `~/.local/share/fungos/commands/mb`, installs
-`scripts/mb-records.sh` as `mb`, and writes the binding to
-`~/.config/fungos/marbles/records.env`. It needs `soil-command` on PATH (or
-`--soil-command`), because that is the native runner that instantiates the
-component; it does not build Soil.
+package under `~/.local/share/fungos/commands/mb`, writes the command policy to
+`~/.config/fungos/commands/mb.env`, and asks `soil-command shims` to generate
+`mb`. It needs a `soil-command` on `PATH` (or `--soil-command`) that has
+`shims` — Soil `c540c27` or later — because the shim is Soil's: the policy says
+which book and collection to bind, and which variables the command may see.
 
 Reverting is one line: `ln -sf marbles ~/.local/bin/mb`.
 
