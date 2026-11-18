@@ -20,6 +20,32 @@ fn default_webhook_timeout_seconds() -> u64 {
     5
 }
 
+/// Mattermost slash commands are an HTTP integration, not a second store.
+///
+/// Mattermost authenticates the request with one shared command token. Because
+/// that token is only held by the Mattermost server, the form's `user_name` is
+/// trusted as the Marbles principal: a `/marbles claim` is a real human hold by
+/// the person who typed it, not a shared bot hold.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MattermostConfig {
+    /// File holding the slash-command token Mattermost sends in the form body.
+    /// A file keeps the secret out of `server.toml`; rotate it by replacing the
+    /// file and restarting the server.
+    pub token_file: PathBuf,
+    /// Company store every slash command acts against. Required when the
+    /// server is configured with `company_store_root` or PostgreSQL.
+    #[serde(default)]
+    pub company: Option<String>,
+    /// Project used when a command omits `--project`. The project still has to
+    /// be registered with Marbles; this is a default, not a create-on-demand.
+    #[serde(default)]
+    pub default_project: Option<String>,
+    /// Optional allowlist of Mattermost usernames. Empty means every user the
+    /// Mattermost server forwards is allowed.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+}
+
 /// Where the outbox goes when the mesh is the sink.
 ///
 /// One sink at a time, deliberately: an `outbound_event` row carries a single
@@ -59,6 +85,7 @@ impl Default for ServerConfig {
             company_store_root: None,
             webhook: None,
             unibus: None,
+            mattermost: None,
             auth: AuthConfig::default(),
         }
     }
@@ -79,6 +106,9 @@ pub struct ServerConfig {
     /// Optional Unibus sink, same outbox. Mutually exclusive with `webhook`.
     #[serde(default)]
     pub unibus: Option<UnibusConfig>,
+    /// Optional Mattermost slash-command surface on the same listener.
+    #[serde(default)]
+    pub mattermost: Option<MattermostConfig>,
     #[serde(default)]
     pub auth: AuthConfig,
 }
@@ -182,6 +212,26 @@ mod tests {
     fn slugs_are_lowercase_single_dash() {
         assert_eq!(slugify("Legion of BOM"), "legion-of-bom");
         assert_eq!(slugify("__dolt_remote__"), "dolt-remote");
+    }
+
+    #[test]
+    fn parses_the_mattermost_section() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:7878"
+
+[mattermost]
+token_file = "/run/secrets/mattermost-slash.token"
+company = "fpl"
+default_project = "shared-infra"
+allowed_users = ["avery"]
+"#,
+        )
+        .unwrap();
+        let mattermost = config.mattermost.expect("mattermost section");
+        assert_eq!(mattermost.company.as_deref(), Some("fpl"));
+        assert_eq!(mattermost.default_project.as_deref(), Some("shared-infra"));
+        assert_eq!(mattermost.allowed_users, vec!["avery"]);
     }
 
     #[test]

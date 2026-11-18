@@ -33,6 +33,8 @@ pub mod import;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod jsonl;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod mattermost;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod oidc;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod outbox;

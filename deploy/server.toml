@@ -17,3 +17,13 @@ agent_client_ids = []
 # installation_id = "fpl-cloud"   # default
 # producer_id = "marbles"         # default: must match the hub's node entry
 # zones = ["agents"]              # default
+
+# Mattermost slash commands on the same listener. The token file is the shared
+# command token Mattermost sends; it is read at startup and must be private.
+# `company` is required on a hosted company-store/PostgreSQL deployment.
+#
+# [mattermost]
+# token_file = "/run/secrets/mattermost-slash.token"
+# company = "fpl"
+# default_project = "shared-infra"
+# allowed_users = []

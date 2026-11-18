@@ -29,7 +29,7 @@ pub struct Api {
 }
 
 impl Api {
-    fn db_for(&self, principal: &Principal) -> Result<Arc<dyn Store>, ApiError> {
+    pub(crate) fn db_for(&self, principal: &Principal) -> Result<Arc<dyn Store>, ApiError> {
         let Some(stores) = &self.company_stores else {
             return Ok(Arc::clone(&self.db));
         };
@@ -43,6 +43,30 @@ impl Api {
     }
 
     pub fn router(self: Arc<Self>) -> Router {
+        self.authed_router()
+    }
+
+    /// The same router, plus the optional Mattermost slash-command surface.
+    ///
+    /// The slash endpoint authenticates Mattermost's shared command token
+    /// instead of a Marbles bearer, so it is mounted outside the bearer
+    /// middleware. Everything it does still resolves through the same `Api`
+    /// and the same store, which keeps one writer and one audit trail.
+    pub fn router_with_mattermost(
+        self: Arc<Self>,
+        config: crate::config::MattermostConfig,
+    ) -> Result<Router, String> {
+        if self.company_stores.is_some() && config.company.is_none() {
+            return Err(
+                "[mattermost] needs `company` when the server uses company stores or PostgreSQL"
+                    .to_string(),
+            );
+        }
+        let mattermost = crate::mattermost::router(Arc::clone(&self), config)?;
+        Ok(self.authed_router().merge(mattermost))
+    }
+
+    fn authed_router(self: Arc<Self>) -> Router {
         Router::new()
             .route("/healthz", axum::routing::get(health))
             .route("/metrics", axum::routing::get(metrics))
@@ -491,10 +515,10 @@ async fn require_principal(State(api): State<Arc<Api>>, mut req: Request, next: 
 }
 
 #[derive(Debug)]
-struct ApiError(ApiErrorKind);
+pub(crate) struct ApiError(ApiErrorKind);
 
 #[derive(Debug)]
-enum ApiErrorKind {
+pub(crate) enum ApiErrorKind {
     Status(StatusCode, String),
     Db(DbError),
 }
@@ -502,6 +526,15 @@ enum ApiErrorKind {
 impl From<DbError> for ApiError {
     fn from(err: DbError) -> Self {
         ApiError(ApiErrorKind::Db(err))
+    }
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            ApiErrorKind::Status(_, message) => f.write_str(message),
+            ApiErrorKind::Db(err) => write!(f, "{err}"),
+        }
     }
 }
 
