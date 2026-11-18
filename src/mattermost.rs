@@ -320,6 +320,13 @@ fn execute(
                         .to_string(),
                 );
             }
+            // A label-only edit must not bump `updated_at` and defer the issue
+            // again; the patch is the set of fields that actually changed.
+            let patch_changes = title.is_some()
+                || description.is_some()
+                || status.is_some()
+                || priority.is_some()
+                || note.is_some();
             let patch = IssuePatch {
                 title,
                 description,
@@ -328,9 +335,11 @@ fn execute(
                 append_notes: note,
                 ..IssuePatch::default()
             };
-            store
-                .update(&id, &patch, &principal.name, at)
-                .map_err(|e| e.to_string())?;
+            if patch_changes {
+                store
+                    .update(&id, &patch, &principal.name, at)
+                    .map_err(|e| e.to_string())?;
+            }
             for label in labels_add {
                 store
                     .add_label(&id, &label, &principal.name, at)
