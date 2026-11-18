@@ -1179,6 +1179,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             let cfg = config::server_config();
             let webhook = cfg.webhook.clone();
             let unibus = cfg.unibus.clone();
+            let mattermost = cfg.mattermost.clone();
             let listen = addr.clone().unwrap_or(cfg.listen);
             let database_url = std::env::var("DATABASE_URL")
                 .ok()
@@ -1292,7 +1293,13 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                     }
                 }
             });
-            axum::serve(listener, api.router())
+            let app = match mattermost {
+                Some(mattermost) => api
+                    .router_with_mattermost(mattermost)
+                    .map_err(|e| format!("server: {e}"))?,
+                None => api.router(),
+            };
+            axum::serve(listener, app)
                 .await
                 .map_err(|e| format!("server: {e}"))
         }

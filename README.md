@@ -131,6 +131,16 @@ agent leases and escalates expired human holds.
 Sandboxes get an agent token and zero file access to the database. That is the
 point.
 
+### Mattermost slash commands
+
+`marbles serve` can also expose `/v1/mattermost/slash` on the same listener, so
+Mattermost users can create, edit, claim, and close work with `/marbles` instead
+of switching tools. The slash route authenticates Mattermost's shared command
+token, then treats the Mattermost user as the Marbles principal: a claim in chat
+is a real human hold, and close still requires delivery evidence. The canonical
+API under `/v1/*` is unchanged. See [`docs/mattermost.md`](docs/mattermost.md)
+for the server config, the Mattermost command setup, and the command grammar.
+
 ### Read-only remotes
 
 A remote store is a **pin**, not a project. `mb remote add` verifies another store's signed
