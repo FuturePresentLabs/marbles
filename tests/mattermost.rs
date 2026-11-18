@@ -38,7 +38,8 @@ fn fixture(allowed_users: Vec<String>) -> Fixture {
     });
     let app = api
         .router_with_mattermost(MattermostConfig {
-            token_file: token_path,
+            token_file: Some(token_path),
+            token_env: None,
             company: None,
             default_project: Some("demo".into()),
             allowed_users,
@@ -292,7 +293,8 @@ fn hosted_servers_refuse_mattermost_without_a_company() {
     });
     let error = api
         .router_with_mattermost(MattermostConfig {
-            token_file: dir.path().join("unused-token"),
+            token_file: Some(dir.path().join("unused-token")),
+            token_env: None,
             company: None,
             default_project: None,
             allowed_users: Vec::new(),
@@ -306,7 +308,8 @@ fn the_config_defaults_to_no_default_project() {
     // A missing `default_project` must not silently become a project called
     // `default`: create then fails with a message naming the missing flag.
     let config = MattermostConfig {
-        token_file: "token".into(),
+        token_file: Some("token".into()),
+        token_env: None,
         company: None,
         default_project: None,
         allowed_users: Vec::new(),

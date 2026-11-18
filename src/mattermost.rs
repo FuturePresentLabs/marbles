@@ -41,23 +41,41 @@ struct MattermostState {
 /// Build the slash-command router. The command token is read once at startup;
 /// an empty or unreadable file fails startup rather than accepting every form.
 pub fn router(api: Arc<Api>, config: MattermostConfig) -> Result<Router, String> {
-    let token = std::fs::read_to_string(&config.token_file).map_err(|e| {
-        format!(
-            "read Mattermost slash-command token {}: {e}",
-            config.token_file.display()
-        )
-    })?;
-    let token = token.trim().to_string();
-    if token.is_empty() {
-        return Err(format!(
-            "Mattermost slash-command token {} is empty",
-            config.token_file.display()
-        ));
-    }
+    let token = resolve_token(&config)?;
     let state = Arc::new(MattermostState { api, config, token });
     Ok(Router::new()
         .route(SLASH_PATH, post(slash))
         .with_state(state))
+}
+
+fn resolve_token(config: &MattermostConfig) -> Result<String, String> {
+    let token = match (&config.token_env, &config.token_file) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "[mattermost] configures both token_env and token_file; choose one source"
+                    .to_string(),
+            );
+        }
+        (Some(variable), None) => std::env::var(variable)
+            .map_err(|_| format!("Mattermost token environment variable {variable} is not set"))?,
+        (None, Some(path)) => std::fs::read_to_string(path).map_err(|e| {
+            format!(
+                "read Mattermost slash-command token {}: {e}",
+                path.display()
+            )
+        })?,
+        (None, None) => {
+            return Err(
+                "[mattermost] needs token_env or token_file for the slash-command token"
+                    .to_string(),
+            );
+        }
+    };
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err("[mattermost] slash-command token is empty".to_string());
+    }
+    Ok(token)
 }
 
 #[derive(Debug, Deserialize)]
@@ -827,6 +845,33 @@ fn parse_close(args: &[String]) -> Result<Command, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_source_is_required_and_exclusive() {
+        let base = MattermostConfig {
+            token_file: None,
+            token_env: None,
+            company: None,
+            default_project: None,
+            allowed_users: Vec::new(),
+        };
+        assert!(
+            resolve_token(&base)
+                .unwrap_err()
+                .contains("token_env or token_file")
+        );
+
+        let both = MattermostConfig {
+            token_file: Some("/tmp/unused-token".into()),
+            token_env: Some("UNUSED_MATTERMOST_TOKEN".into()),
+            ..base
+        };
+        assert!(
+            resolve_token(&both)
+                .unwrap_err()
+                .contains("both token_env and token_file")
+        );
+    }
 
     #[test]
     fn tokenizer_keeps_quoted_phrases_and_escapes() {

@@ -24,6 +24,7 @@ agent_client_ids = []
 #
 # [mattermost]
 # token_file = "/run/secrets/mattermost-slash.token"
+# token_env = "MARBLES_MATTERMOST_SLASH_TOKEN"   # alternative to token_file
 # company = "fpl"
 # default_project = "shared-infra"
 # allowed_users = []

@@ -31,7 +31,13 @@ pub struct MattermostConfig {
     /// File holding the slash-command token Mattermost sends in the form body.
     /// A file keeps the secret out of `server.toml`; rotate it by replacing the
     /// file and restarting the server.
-    pub token_file: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_file: Option<PathBuf>,
+    /// Environment variable holding the token instead of a file. This is what
+    /// `geode exec --profile …` sets, so the secret can stay in Geode rather
+    /// than on disk or in the config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_env: Option<String>,
     /// Company store every slash command acts against. Required when the
     /// server is configured with `company_store_root` or PostgreSQL.
     #[serde(default)]

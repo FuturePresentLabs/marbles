@@ -35,7 +35,9 @@ Add a bearer-independent section to `server.toml`:
 
 ```toml
 [mattermost]
+# Exactly one of these two sources:
 token_file = "/run/secrets/mattermost-slash.token"
+# token_env = "MARBLES_MATTERMOST_SLASH_TOKEN"
 # Required when the server uses company stores or PostgreSQL.
 company = "fpl"
 # Optional: used when a command omits --project.
@@ -44,10 +46,37 @@ default_project = "shared-infra"
 allowed_users = ["avery"]
 ```
 
-The token file contains one string: the same token configured in Mattermost's
-slash command. It is read once at startup. A missing or empty file fails server
-startup instead of accepting every form. Rotate by replacing the file and
-restarting Marbles.
+`token_file` contains one string: the same token configured in Mattermost's
+slash command. `token_env` names an environment variable instead, which is what
+`geode exec --profile …` sets. Configuring both is a startup error. The token is
+read once at startup; a missing, empty, or unset source fails startup instead of
+accepting every form. Rotate by replacing the file (or rotating the Geode
+credential) and restarting Marbles.
+
+### Geode
+
+For a local or Geode-equipped host:
+
+```sh
+printf '%s' "$TOKEN" | geoded --store ~/.geode/store.db \
+  --key-file ~/.geode/store.key \
+  --put geode://fungos/mattermost/marbles-slash --purpose mattermost.slash
+
+geode exec --profile marbles-mattermost -- marbles serve
+```
+
+with a profile:
+
+```toml
+[profiles.marbles-mattermost]
+reference = "geode://fungos/mattermost/marbles-slash"
+purpose = "mattermost.slash"
+env = "MARBLES_MATTERMOST_SLASH_TOKEN"
+```
+
+and `token_env = "MARBLES_MATTERMOST_SLASH_TOKEN"` in `[mattermost]`. The
+deployed service still needs whatever secret mechanism its host provides; Geode
+is the owner-local store, not a fleet secret-distribution service.
 
 The route is mounted next to the bearer-auth routes, but outside that
 middleware. The shared token is the only credential on this route. Keep it
