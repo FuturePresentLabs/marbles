@@ -539,8 +539,6 @@ fn restrict_permissions(_path: &Path) -> Result<(), IdentityError> {
 // overlap window. Nothing here can grant a write: the registry is client-side read-only state.
 
 pub const REMOTE_REGISTRY_VERSION: u32 = 1;
-const DESCRIPTOR_FETCH_TIMEOUT_SECONDS: u64 = 10;
-const DESCRIPTOR_FETCH_CONNECT_SECONDS: u64 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteRegistryError {
@@ -586,8 +584,6 @@ pub enum RemoteRegistryError {
         #[source]
         source: std::io::Error,
     },
-    #[error("fetching descriptor {url}: {reason}")]
-    DescriptorFetch { url: String, reason: String },
     #[error("descriptor has an empty store_id; refusing to pin it")]
     EmptyStoreId,
     #[error("descriptor has an empty key_id; refusing to pin it")]
@@ -979,47 +975,12 @@ pub fn read_descriptor_source(target: &str) -> Result<String, RemoteRegistryErro
     })
 }
 
-/// Load a descriptor from a file path, `-` (stdin), or an `http(s)` URL.
+/// Load a descriptor from a file path or `-` (stdin).
 ///
-/// Fetching is transport only: the bytes still have to verify against the pin, so a hostile or
-/// stale endpoint can only produce an error, never a new trusted identity.
-pub async fn descriptor_from_arg(target: &str) -> Result<String, RemoteRegistryError> {
-    let target = target.trim();
-    if target.starts_with("http://") || target.starts_with("https://") {
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(
-                DESCRIPTOR_FETCH_CONNECT_SECONDS,
-            ))
-            .timeout(std::time::Duration::from_secs(
-                DESCRIPTOR_FETCH_TIMEOUT_SECONDS,
-            ))
-            .build()
-            .map_err(|err| RemoteRegistryError::DescriptorFetch {
-                url: target.to_string(),
-                reason: err.to_string(),
-            })?;
-        let response = client.get(target).send().await.map_err(|err| {
-            RemoteRegistryError::DescriptorFetch {
-                url: target.to_string(),
-                reason: err.to_string(),
-            }
-        })?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(RemoteRegistryError::DescriptorFetch {
-                url: target.to_string(),
-                reason: format!("HTTP {status}"),
-            });
-        }
-        return response
-            .text()
-            .await
-            .map_err(|err| RemoteRegistryError::DescriptorFetch {
-                url: target.to_string(),
-                reason: err.to_string(),
-            });
-    }
-    read_descriptor_source(target)
+/// The bytes still have to verify against the pin, so an untrusted file can only produce an
+/// error, never a new trusted identity.
+pub fn descriptor_from_arg(target: &str) -> Result<String, RemoteRegistryError> {
+    read_descriptor_source(target.trim())
 }
 
 #[cfg(test)]

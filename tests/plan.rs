@@ -1,17 +1,9 @@
 //! Plans are DAGs over issues: spec → nodes+edges, and the three views an executor consumes.
-//! These tests exercise the real store (local mode) and the real HTTP router, because the claim
-//! is that both compute the same answer.
+//! These tests exercise the real store.
 
-use std::sync::Arc;
-
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use marbles::api::Api;
-use marbles::auth::{Auth, AuthConfig};
 use marbles::db::{Db, now};
-use marbles::plan::{self, CreateReport, Gantt, NodeSpec, PlanView, ReadyView, ResolvedPlan};
+use marbles::plan::{self, CreateReport, Gantt, NodeSpec, ReadyView, ResolvedPlan};
 use marbles::types::{ActorKind, ClaimRequest, Evidence, IssuePatch};
-use tower::ServiceExt;
 
 fn node(
     key: &str,
@@ -225,93 +217,4 @@ fn ready_respects_dependency_frontier_and_conflict_groups() {
         c.reason, "conflict_group",
         "c is eligible but api is in the frontier"
     );
-}
-
-#[tokio::test]
-async fn plan_views_are_identical_over_the_http_api() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = Arc::new(Db::in_memory().unwrap());
-    db.ensure_project("marbles", "/tmp/marbles", "mb").unwrap();
-    db.ensure_project("checkout", "/tmp/checkout", "co")
-        .unwrap();
-    let (_, token) =
-        marbles::auth::mint_token(&dir.path().join("tokens"), ActorKind::Agent, "planner").unwrap();
-    let app = Arc::new(Api {
-        db: db.clone(),
-        company_stores: None,
-        auth: Arc::new(Auth::new(AuthConfig::default(), dir.path().join("tokens"))),
-    })
-    .router();
-
-    let (status, body) = call(&app, "plans.create", &demo_plan(), &token).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let report: CreateReport = serde_json::from_str(&body).unwrap();
-    assert_eq!(report.nodes.len(), 6);
-
-    let (status, body) = call(
-        &app,
-        "plans.show",
-        &serde_json::json!({"plan": "checkout-v2"}),
-        &token,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let view: PlanView = serde_json::from_str(&body).unwrap();
-    assert_eq!(view.nodes.len(), 6);
-    assert_eq!(view.edges.len(), 3);
-
-    let (status, body) = call(
-        &app,
-        "plans.gantt",
-        &serde_json::json!({"plan": "checkout-v2"}),
-        &token,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let gantt: Gantt = serde_json::from_str(&body).unwrap();
-    assert_eq!(gantt.total_minutes, 90);
-
-    let (status, body) = call(
-        &app,
-        "plans.ready",
-        &serde_json::json!({"plan": "checkout-v2"}),
-        &token,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let frontier: ReadyView = serde_json::from_str(&body).unwrap();
-    assert_eq!(frontier.ready.len(), 2);
-    assert_eq!(frontier.total_nodes, 6);
-
-    // The same DAG computed in local mode agrees with the wire result.
-    let local = plan::ready(&plan::load(&*db, "checkout-v2").unwrap(), now()).unwrap();
-    assert_eq!(
-        local.ready.iter().map(|n| n.id.clone()).collect::<Vec<_>>(),
-        frontier
-            .ready
-            .iter()
-            .map(|n| n.id.clone())
-            .collect::<Vec<_>>()
-    );
-}
-
-async fn call<T: serde::Serialize>(
-    app: &axum::Router,
-    op: &str,
-    body: &T,
-    token: &str,
-) -> (StatusCode, String) {
-    let request = Request::builder()
-        .method("POST")
-        .uri(format!("/v1/{op}"))
-        .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {token}"))
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = app.clone().oneshot(request).await.unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
-        .await
-        .unwrap();
-    (status, String::from_utf8_lossy(&bytes).into_owned())
 }

@@ -88,12 +88,12 @@ acceptance = "legacy issues gain plan metadata without loss"
 
 ```text
 
-$ mb init --prefix mb --no-hooks --quiet
+$ marbles init --prefix mb --no-hooks --quiet
 
-$ mb init --prefix co --no-hooks --quiet
+$ marbles init --prefix co --no-hooks --quiet
 === 1. review the draft (no writes) ===
 
-$ mb plan create /tmp/plan-dag-demo-final/plan.toml --dry-run
+$ marbles plan create /tmp/plan-dag-demo-final/plan.toml --dry-run
 draft plan "checkout-v2" (project marbles, 6 node(s), 3 edge(s)) — not written
   schema  Add plan schema and metadata keys
       repo: marbles
@@ -142,7 +142,7 @@ draft plan "checkout-v2" (project marbles, 6 node(s), 3 edge(s)) — not written
       estimate: 25
 === 2. write the plan (nodes + edges) ===
 
-$ mb plan create /tmp/plan-dag-demo-final/plan.toml
+$ marbles plan create /tmp/plan-dag-demo-final/plan.toml
 plan "checkout-v2" — 6 node(s) in project marbles, 3 edge(s)
   mb-p8g2  schema  Add plan schema and metadata keys
   co-i6pr  scaffold  Scaffold the checkout client
@@ -155,7 +155,7 @@ plan "checkout-v2" — 6 node(s) in project marbles, 3 edge(s)
   mb-mz7y  migration  Backfill metadata on existing issues
 === 3. plan show (DAG, topological order, metadata) ===
 
-$ mb plan show checkout-v2
+$ marbles plan show checkout-v2
 plan "checkout-v2" — 6 node(s), 2 repo(s), 3 conflict group(s)
 repos: checkout, marbles
 groups: api, db, docs
@@ -189,7 +189,7 @@ wiring (co-r77e)  [open]  Wire the client to plan ready
     acceptance: client consumes the frontier without same-group races
 === 4. plan gantt (estimates, critical path, concurrency) ===
 
-$ mb plan gantt checkout-v2
+$ marbles plan gantt checkout-v2
 plan "checkout-v2" — makespan 90m, 6 node(s), peak concurrency 3, running now 0
 critical path (90m): schema → api → docs
 
@@ -202,7 +202,7 @@ schema               open         db            30m      0m     30m     0m yes
 wiring               open         db            40m     20m     60m    30m 
 === 5. plan ready (parallel frontier, conflict groups) ===
 
-$ mb plan ready checkout-v2
+$ marbles plan ready checkout-v2
 plan "checkout-v2" — 2 ready / 6 node(s)
   mb-mz7y [migration]  [db] Backfill metadata on existing issues  — done-means: cargo test -p marbles backfill
   co-i6pr [scaffold]  [api] Scaffold the checkout client  — done-means: cargo test -p checkout scaffold
@@ -216,13 +216,13 @@ waiting:
 schema=mb-p8g2  migration=mb-mz7y
 === 6. a running node blocks its conflict group ===
 
-$ mb update mb-p8g2 --status in_progress
+$ marbles update mb-p8g2 --status in_progress
 mb-p8g2 updated (in_progress)
 
-$ mb claim mb-p8g2 --as worker
+$ marbles claim mb-p8g2 --as worker
 claimed mb-p8g2 by worker (agent) until 1792681389
 
-$ mb plan ready checkout-v2
+$ marbles plan ready checkout-v2
 plan "checkout-v2" — 1 ready / 6 node(s)
 busy conflict groups: db → mb-p8g2
   co-i6pr [scaffold]  [api] Scaffold the checkout client  — done-means: cargo test -p checkout scaffold
@@ -234,10 +234,10 @@ waiting:
   mb-mz7y [migration]  Backfill metadata on existing issues — conflict_group: group "db" busy with running node mb-p8g2
 === 7. closing the blocker advances dependents and frees the group ===
 
-$ mb close mb-p8g2 --commit deadbeef --reason plan schema merged
+$ marbles close mb-p8g2 --commit deadbeef --reason plan schema merged
 mb-p8g2 closed
 
-$ mb plan ready checkout-v2
+$ marbles plan ready checkout-v2
 plan "checkout-v2" — 2 ready / 6 node(s)
   mb-s8u3 [api]  [api] Expose plan endpoints  — done-means: cargo test --test server plans
   mb-mz7y [migration]  [db] Backfill metadata on existing issues  — done-means: cargo test -p marbles backfill
@@ -248,7 +248,7 @@ waiting:
   co-i6pr [scaffold]  Scaffold the checkout client — conflict_group: group "api" already has a node in this frontier
 === 8. machine-readable frontier (json) ===
 
-$ mb plan ready checkout-v2 --json
+$ marbles plan ready checkout-v2 --json
 {
   "plan": "checkout-v2",
   "ready": [
@@ -320,10 +320,10 @@ $ mb plan ready checkout-v2 --json
 }
 === 9. hand-authored node with the same metadata fields ===
 
-$ mb create Fix flaky plan gantt test --plan checkout-v2 --repo marbles --conflict-group docs --risk low --estimate 10 --done-means cargo test plan::gantt --acceptance gantt is deterministic
+$ marbles create Fix flaky plan gantt test --plan checkout-v2 --repo marbles --conflict-group docs --risk low --estimate 10 --done-means cargo test plan::gantt --acceptance gantt is deterministic
 mb-n9zz created
 
-$ mb plan show checkout-v2 --json
+$ marbles plan show checkout-v2 --json
 {
   "plan": "checkout-v2",
   "nodes": [
@@ -465,7 +465,7 @@ $ mb plan show checkout-v2 --json
 }
 === 10. store-level query: plans are just company-scoped metadata ===
 
-$ mb list --all --json
+$ marbles list --all --json
 [{"id":"mb-euvz","title":"Document plans as DAGs","description":"","status":"open","priority":2,"issue_type":"task","labels":[],"metadata":{"acceptance":"README section renders and commands match the CLI","conflict_group":"docs","done_means":"grep -q 'Plans are DAGs' README.md","estimate":15,"plan":"checkout-v2","plan_key":"docs","repo":"marbles","risk":"low"},"dependency_count":1,"dependent_count":0,"dependencies":[{"depends_on_id":"mb-s8u3"}],"evidence":[],"parent":null,"assignee":null,"actor_kind":null,"expires_at":null,"available_at":1792679589,"closed_at":null,"created_at":1792679589,"updated_at":1792679589,"project":"marbles"},{"id":"mb-mz7y","title":"Backfill metadata on existing issues","description":"","status":"open","priority":2,"issue_type":"task","labels":[],"metadata":{"acceptance":"legacy issues gain plan metadata without loss","conflict_group":"db","done_means":"cargo test -p marbles backfill","estimate":25,"plan":"checkout-v2","plan_key":"migration","repo":"marbles","risk":"high"},"dependency_count":0,"dependent_count":0,"dependencies":[],"evidence":[],"parent":null,"assignee":null,"actor_kind":null,"expires_at":null,"available_at":1792679589,"closed_at":null,"created_at":1792679589,"updated_at":1792679589,"project":"marbles"},{"id":"mb-p8g2","title":"Add plan schema and metadata keys","description":"","status":"closed","priority":2,"issue_type":"task","labels":[],"metadata":{"acceptance":"create/show/gantt/ready pass on an empty store","conflict_group":"db","done_means":"cargo test -p marbles plan_schema","estimate":30,"plan":"checkout-v2","plan_key":"schema","repo":"marbles","risk":"high"},"dependency_count":0,"dependent_count":1,"dependencies":[],"evidence":[{"kind":"commit","value":"deadbeef"}],"parent":null,"assignee":null,"actor_kind":null,"expires_at":null,"available_at":1792679709,"closed_at":1792679589,"created_at":1792679589,"updated_at":1792679589,"project":"marbles"},{"id":"mb-s8u3","title":"Expose plan endpoints","description":"","status":"open","priority":2,"issue_type":"task","labels":[],"metadata":{"acceptance":"/v1/plans.* round-trips the same DAG","conflict_group":"api","done_means":"cargo test --test server plans","estimate":45,"plan":"checkout-v2","plan_key":"api","repo":"marbles","risk":"medium"},"dependency_count":0,"dependent_count":1,"dependencies":[{"depends_on_id":"mb-p8g2"}],"evidence":[],"parent":null,"assignee":null,"actor_kind":null,"expires_at":null,"available_at":1792679589,"closed_at":null,"created_at":1792679589,"updated_at":1792679589,"project":"marbles"},{"id":"mb-n9zz","title":"Fix flaky plan gantt test","description":"","status":"open","priority":2,"issue_type":"task","labels":[],"metadata":{"acceptance":"gantt is deterministic","conflict_group":"docs","done_means":"cargo test plan::gantt","estimate":10,"plan":"checkout-v2","repo":"marbles","risk":"low"},"dependency_count":0,"dependent_count":0,"dependencies":[],"evidence":[],"parent":null,"assignee":null,"actor_kind":null,"expires_at":null,"available_at":1792680190,"closed_at":null,"created_at":1792679590,"updated_at":1792679590,"project":"marbles"}]
 
 ```
@@ -474,7 +474,7 @@ $ mb list --all --json
 
 ```bash
 #!/bin/bash
-# Local-mode demo for `mb plan show|gantt|ready|create`.
+# Local-mode demo for `marbles plan show|gantt|ready|create`.
 # Usage: MARBLES_HOME=$(mktemp -d) docs/plan-dag-demo.sh
 # Requires: cargo build; MB=target/debug/marbles (override with MB=...).
 set -euo pipefail

@@ -1,91 +1,11 @@
 //! Config and state locations. Everything marbles owns on a machine lives under one directory
-//! (`$MARBLES_HOME`, default `~/.marbles`): the database, tokens, and the server config. A repo's
-//! `.marbles/project.toml` is the only thing that lives inside a checkout — a pointer, not a store.
+//! (`$MARBLES_HOME`, default `~/.marbles`): the database, tokens, and local client state. A
+//! repo's `.marbles/project.toml` is the only thing that lives inside a checkout — a pointer, not a
+//! store.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-
-use crate::auth::AuthConfig;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WebhookConfig {
-    pub url: String,
-    pub secret_file: PathBuf,
-    #[serde(default = "default_webhook_timeout_seconds")]
-    pub timeout_seconds: u64,
-}
-
-fn default_webhook_timeout_seconds() -> u64 {
-    5
-}
-
-/// Where the outbox goes when the mesh is the sink.
-///
-/// One sink at a time, deliberately: an `outbound_event` row carries a single
-/// delivery state, so two sinks would mark each other's work done. `webhook` and
-/// `unibus` are therefore alternatives, not a pipeline.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UnibusConfig {
-    /// `ip:port` of the hub, e.g. `127.0.0.1:18790`.
-    pub hub_endpoint: String,
-    /// The token file holding this producer's hub credential.
-    pub token_file: PathBuf,
-    #[serde(default = "default_installation_id")]
-    pub installation_id: String,
-    #[serde(default = "default_producer_id")]
-    pub producer_id: String,
-    #[serde(default = "default_unibus_zones")]
-    pub zones: Vec<String>,
-}
-
-fn default_installation_id() -> String {
-    "fpl-cloud".to_string()
-}
-
-fn default_producer_id() -> String {
-    "marbles".to_string()
-}
-
-fn default_unibus_zones() -> Vec<String> {
-    vec!["agents".to_string()]
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            listen: default_listen(),
-            company_store_root: None,
-            webhook: None,
-            unibus: None,
-            auth: AuthConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServerConfig {
-    #[serde(default = "default_listen")]
-    pub listen: String,
-    /// Hosted mode: route every authenticated request to
-    /// `<company_store_root>/<verified-company-id>/marbles.db`.
-    /// When absent, retain the single local database used by workstation mode.
-    #[serde(default)]
-    pub company_store_root: Option<PathBuf>,
-    /// Optional signed event sink. Delivery is backed by each store's transactional outbox.
-    #[serde(default)]
-    pub webhook: Option<WebhookConfig>,
-    /// Optional Unibus sink, same outbox. Mutually exclusive with `webhook`.
-    #[serde(default)]
-    pub unibus: Option<UnibusConfig>,
-    #[serde(default)]
-    pub auth: AuthConfig,
-}
-
-fn default_listen() -> String {
-    "127.0.0.1:7878".to_string()
-}
 
 pub fn state_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("MARBLES_HOME") {
@@ -102,10 +22,6 @@ pub fn db_path() -> PathBuf {
 
 pub fn token_dir() -> PathBuf {
     state_dir().join("tokens")
-}
-
-pub fn server_config_path() -> PathBuf {
-    state_dir().join("server.toml")
 }
 
 /// Ed25519 store identity + `marbles.store/1` descriptor metadata. Contains private keys, so the
@@ -126,20 +42,11 @@ pub fn assertion_cache_dir() -> PathBuf {
     state_dir().join("assertions")
 }
 
-pub fn server_config() -> ServerConfig {
-    match std::fs::read_to_string(server_config_path()) {
-        Ok(text) => toml::from_str(&text).expect("server.toml must parse if present"),
-        Err(_) => ServerConfig::default(),
-    }
-}
-
 /// Per-project file: `<root>/.marbles/project.toml` with `slug` and `prefix`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectFile {
     pub slug: String,
     pub prefix: String,
-    #[serde(default)]
-    pub server_url: Option<String>,
 }
 
 pub const PROJECT_FILE: &str = ".marbles/project.toml";
@@ -193,15 +100,11 @@ mod tests {
         std::fs::create_dir_all(project_root.join(".marbles")).unwrap();
         std::fs::write(
             project_root.join(".marbles/project.toml"),
-            "slug = \"demo\"\nprefix = \"demo\"\nserver_url = \"https://marbles.fpl.dev\"\n",
+            "slug = \"demo\"\nprefix = \"demo\"\n",
         )
         .unwrap();
         let (root, project) = discover_project(&deep).unwrap();
         assert_eq!(project.slug, "demo");
-        assert_eq!(
-            project.server_url.as_deref(),
-            Some("https://marbles.fpl.dev")
-        );
         assert!(root.ends_with("a"));
     }
 }

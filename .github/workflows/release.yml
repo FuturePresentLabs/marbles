@@ -28,15 +28,14 @@ jobs:
           targets: ${{ matrix.target }}
       - run: cargo test --locked --all-targets
       - run: cargo build --locked --release --target ${{ matrix.target }}
-      - name: Package marbles and mb
+      - name: Package marbles
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
           archive="marbles-${version}-${{ matrix.target }}.tar.gz"
           stage="$(mktemp -d)"
           install -m 0755 "target/${{ matrix.target }}/release/marbles" "$stage/marbles"
-          cp "$stage/marbles" "$stage/mb"
-          tar -C "$stage" -czf "$archive" marbles mb
+          tar -C "$stage" -czf "$archive" marbles
           if command -v sha256sum >/dev/null; then
             sha256sum "$archive" > "$archive.sha256"
           else

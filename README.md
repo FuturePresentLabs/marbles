@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <b>One server. One database. One claim race at a time.</b><br>
+  <b>One owner per lineage. One claim race at a time.</b><br>
   A work graph built for agents that actually ship.
 </p>
 
@@ -22,7 +22,8 @@ serialize workers, a CLI you can pipe into an agent — and drops the
 per-checkout replicated database that made fleet-scale bookkeeping the work.
 
 The core idea is deliberately boring: **the work graph has exactly one writer
-per lineage.** Humans and agents are HTTP clients of that writer. Nothing is
+per lineage.** Humans and agents talk to that writer — the `mb` spore over a
+`soil:records` book, or the local CLI over one SQLite file. Nothing is
 replicated, so there is nothing to merge.
 
 ## Why Marbles
@@ -38,22 +39,39 @@ replicated, so there is nothing to merge.
 
 ## Install
 
+There are two interfaces, and they are installed separately.
+
+**`mb` — the tracked-work interface.** A wasm spore over a `soil:records` book. This is the one
+to use; it is how a book syncs between machines and the only interface that will grow.
+
+```bash
+scripts/install-records-cli.sh --records-book personal/<you>/marbles
+```
+
+That builds `mb.wasm` for `wasm32-wasip2`, installs it as a command package, and asks
+`soil-command shims` to generate `mb` — see [`docs/records-backend.md`](docs/records-backend.md).
+It needs a `soil-command` from a Soil checkout on `PATH`.
+
+**`marbles` — the local CLI.** The native binary. It covers the operations the spore does not
+have yet: `init`, `import-bd`, `plan`, `portfolio`, `burndown`, the `folder`/`goal`/`epic`/`task`
+hierarchy, `backup`, `doctor`, and store identity. It reads and writes its own SQLite file at
+`~/.marbles/marbles.db`, so a project must not be split across both.
+
 From a tagged release (Linux x86-64 and ARM64, macOS ARM64):
 
 ```bash
 # check it against the .sha256 beside it first
-tar -xzf marbles-<version>-<target>.tar.gz -C ~/.local/bin marbles mb
+tar -xzf marbles-<version>-<target>.tar.gz -C ~/.local/bin marbles
 ```
 
-`mb` in that archive is the same binary under a second name; the native CLI
-answers to both.
+The archive contains `marbles` only. It used to ship a second copy named `mb`; that alias is
+gone, because `mb` now resolves to the records-backed spore and a native binary under that
+name silently shadowed it.
 
-From source (Rust 1.88+), which installs **only `marbles`** — `mb` is a separate
-target behind the `soil` feature, so `cargo install` skips it:
+From source (Rust 1.88+):
 
 ```bash
-cargo install --path .
-ln -sf "$(command -v marbles)" ~/.local/bin/mb
+cargo install --path .          # installs `marbles`
 ```
 
 With Homebrew, from a tap over this repository:
@@ -63,102 +81,63 @@ brew tap futurepresentlabs/marbles https://github.com/FuturePresentLabs/marbles
 brew install futurepresentlabs/marbles/marbles
 ```
 
-The formula installs the published archive for the platform, so it tracks
-tagged releases rather than `main` — v0.1.0 today, which predates the
-`soil:records` backend.
+The formula installs the published archive for the platform, so it tracks tagged releases
+rather than `main` — v0.1.0 today, which predates the `soil:records` backend.
 
-**Homebrew's `bin` sits ahead of `~/.local/bin` on most machines.** So
-`brew install` shadows the records-backed `mb` with the native one, and you
-are silently back on the local store — nothing errors. If `mb` is meant to run
-over `soil:records` here, skip the formula or put `~/.local/bin` first on
-`PATH`.
-
-On an FPL workstation, `fpl install marbles` selects and verifies the right
-archive and exposes both names in `~/.local/bin`.
-
-### `mb` over `soil:records` (wasm)
-
-`mb` can instead run as a Soil spore against a `soil:records` book, which is how
-it syncs between machines:
-
-```bash
-scripts/install-records-cli.sh --records-book personal/<you>/marbles
-```
-
-That installs the wasm command package, a `mb` shim that binds it to the store,
-and the policy file the shim reads — see
-[`docs/records-backend.md`](docs/records-backend.md). It needs a `soil-command`
-from a Soil checkout on `PATH`. The native binary stays installed as `marbles`:
-`init`, `import`, `plan`, `portfolio` and `serve` still live there, and mixing
-the two stores for one project is the one thing to avoid.
-
-Container builds work without a remote cache or AWS credentials. To opt into
-the DigitalOcean/mycelium `sccache`, see [`docs/build-cache.md`](docs/build-cache.md).
+On an FPL workstation, `fpl install marbles` selects and verifies the right archive.
 
 ## Quickstart
+
+### Over `soil:records` (the fleet interface)
+
+```bash
+cd my-repo
+mb create "Fix the thing" --project my-repo -p 1   # new issue, visible after grace
+mb ready                                          # unblocked, unclaimed, past grace
+mb claim <id>                                     # take it
+mb review <id> --pr <url>                         # PR is open; not done
+mb close <id> --pr <url> --commit <sha>           # merged; done
+```
+
+The book lives under `~/.local/share/fungos/records`; which book and collection the command
+sees is fixed by its policy at `~/.config/fungos/commands/mb.env`, not by a flag. Every answer
+is JSON, and `--url`/`--token` are refused by name: the command talks to the store the host
+opened, not to an endpoint of the caller's choosing.
 
 ### Local, one operator
 
 ```bash
 cd my-repo
-mb init                                  # register this project, install agent instructions
-mb create "Fix the thing" -p 1           # new issue, visible to the fleet after grace
-mb ready                                 # unblocked, unclaimed, past grace
-mb claim <id>                            # take it
-mb review <id> --pr <url>                # PR is open; not done
-mb close  <id> --pr <url> --commit <sha> # merged; done
+marbles init                             # register this project, install agent instructions
+marbles create "Fix the thing" -p 1
+marbles ready
+marbles claim <id>
 ```
 
-With no server URL configured, commands act directly on
-`~/.marbles/marbles.db` — one file, every project on the machine. Cross-repo
-views are just queries.
+Commands act directly on `~/.marbles/marbles.db` — one file, every project on the machine.
+Cross-repo views are just queries.
 
-### Fleet mode
+## Read-only remotes
+
+A remote store is a **pin**, not a project. `marbles remote add` verifies another store's signed
+`marbles.store/1` descriptor and pins its `(store_id, key_id, public_key)` locally; `marbles
+remotes` then shows the separate, read-only **Remotes workspace**:
 
 ```bash
-mkdir -p ~/.marbles
-marbles serve                            # local server on 127.0.0.1:7878
-marbles login --name avery               # prints your human token
-marbles agent-token worker-1             # per-agent/sandbox token
-export MARBLES_URL=http://127.0.0.1:7878
-export MARBLES_TOKEN=<token>
+marbles remote add acme ./acme-descriptor.json
+marbles remotes                       # name, store_id, key_id, endpoint, named freshness
+marbles remote assertions acme        # per-issue verified state + fresh/stale/unknown/unverifiable
 ```
 
-`server.toml` configures the listen address and optional OIDC. The server binds
-loopback by default; put TLS at the edge. A 60-second sweeper requeues expired
-agent leases and escalates expired human holds.
+Descriptors come from a file or stdin. Trust comes from the pinned key, never from where the
+bytes were found.
 
-Sandboxes get an agent token and zero file access to the database. That is the
-point.
-
-### Read-only remotes
-
-A remote store is a **pin**, not a project. `mb remote add` verifies another store's signed
-`marbles.store/1` descriptor and pins its `(store_id, key_id, public_key)` locally; `mb remotes`
-then shows the separate, read-only **Remotes workspace**:
-
-```bash
-mb remote add acme https://marbles.acme.example --descriptor ./acme-descriptor.json
-mb remotes                       # name, store_id, key_id, endpoint, named freshness
-mb remote assertions acme        # per-issue verified state + fresh/stale/unknown/unverifiable
-```
-
-Remote stores never enter the local folder tree, `mb projects`, `mb portfolio`, or `mb ready`, and
-no read/list path creates a local project or issue row for them. `mb claim`, `mb update
---assignee`, and `mb close` on a remote reference fail with a named `remote refs are read-only:
-<store_id>/<issue>` error rather than falling through to local work. A missing registry prints
-`no remotes pinned` and exits 0; a corrupt one fails closed.
-
-## Viewer
-
-The browser `/view` shell has been retired. The viewer is Canvas: `marbles-canvas-sync` reads
-`views.dashboard`, runs the no-import `viewer/marbles-view` wasm projection, and applies the
-resulting workspace through the local Canvas control socket. The same wasm ABI is executable by
-the browser/V8 host in `viewer/marbles-view/web`.
-
-The viewer is read-only. Claims, review, and close stay in the CLI. See
-[`docs/viewer-workstreams.md`](docs/viewer-workstreams.md) for the API contract and the staged
-Canvas and Soil workstreams.
+Remote stores never enter the local folder tree, `marbles projects`, `marbles portfolio`, or
+`marbles ready`, and no read/list path creates a local project or issue row for them.
+`marbles claim`, `marbles update --assignee`, and `marbles close` on a remote reference fail with
+a named `remote refs are read-only: <store_id>/<issue>` error rather than falling through to
+local work. A missing registry prints `no remotes pinned` and exits 0; a corrupt one fails
+closed.
 
 ## The work model
 
@@ -193,9 +172,9 @@ Projects can be grouped into folders (`personal`, `business`, `business/acme`).
 Folders nest; a project belongs to at most one folder, and unfiled is explicit.
 
 ```bash
-mb folder create "Business" --slug business
-mb folder move acme business
-mb folder tree
+marbles folder create "Business" --slug business
+marbles folder move acme business
+marbles folder tree
 mb projects                       # includes each project's folder
 ```
 
@@ -206,12 +185,12 @@ a **task** is an executable unit under an epic. All three are ordinary issues,
 so they inherit claims, history, labels, dependencies, review, and evidence.
 
 ```bash
-mb goal create "Ship v1" -p 1
-mb epic create "Storage" --goal <goal-id>
-mb task create "Write the WAL test" --epic <epic-id>
+marbles goal create "Ship v1" -p 1
+marbles epic create "Storage" --goal <goal-id>
+marbles task create "Write the WAL test" --epic <epic-id>
 
-mb goal list                      # descendant rollups
-mb goal show <goal-id>            # tree + progress bar
+marbles goal list                      # descendant rollups
+marbles goal show <goal-id>            # tree + progress bar
 ```
 
 Hierarchy is project-local; use an ordinary dependency edge for a blocker in
@@ -220,9 +199,9 @@ another project. Dependencies remain cross-project and cross-folder.
 ### Burndown
 
 ```bash
-mb burndown --project acme --days 30
-mb burndown --goal <goal-id> --days 14
-mb burndown --epic <epic-id> --days 7 --json
+marbles burndown --project acme --days 30
+marbles burndown --goal <goal-id> --days 14
+marbles burndown --epic <epic-id> --days 7 --json
 ```
 
 The series reports daily `scope`, `done`, and `remaining`, plus burn rate and a
@@ -230,14 +209,14 @@ projected days-to-zero when there are closes in the window.
 
 ### Portfolio
 
-`mb portfolio` rolls folders → projects → goals into one read-only view: ready
+`marbles portfolio` rolls folders → projects → goals into one read-only view: ready
 work, WIP, review/blocked counts, stale work, oldest-ready age, and per-project
 burn rate.
 
 ```bash
-mb portfolio
-mb portfolio --folder business --days 30 --stale-days 14
-mb portfolio --json
+marbles portfolio
+marbles portfolio --folder business --days 30 --stale-days 14
+marbles portfolio --json
 ```
 
 See [`docs/organizing-work.md`](docs/organizing-work.md) and
@@ -263,11 +242,11 @@ backend (`metadata_json` in SQLite, `metadata` in PostgreSQL):
 | `risk`, `estimate` | `low\|medium\|high\|critical` and minutes (feeds the Gantt) |
 
 ```bash
-mb plan create plan.toml --dry-run     # review the draft; nothing written
-mb plan create plan.toml               # write nodes + dependency edges
-mb plan show checkout-v2               # DAG in topological order, with metadata and edges
-mb plan gantt checkout-v2              # estimates, critical path, current/peak concurrency
-mb plan ready checkout-v2              # the parallel frontier the executor consumes
+marbles plan create plan.toml --dry-run     # review the draft; nothing written
+marbles plan create plan.toml               # write nodes + dependency edges
+marbles plan show checkout-v2               # DAG in topological order, with metadata and edges
+marbles plan gantt checkout-v2              # estimates, critical path, current/peak concurrency
+marbles plan ready checkout-v2              # the parallel frontier the executor consumes
 ```
 
 `plan ready` is deliberately stricter than plain `ready`: a node is offered only when every
@@ -299,14 +278,14 @@ title = "Expose plan endpoints"
 repo = "marbles"
 conflict_group = "api"
 estimate = 45
-done_means = "cargo test --test server plans"
+done_means = "cargo test --test plans"
 deps = ["schema"]
 ```
 
 A node may set `project = "checkout"` when the plan spans repos. `mb create` also accepts the
 metadata directly (`--plan`, `--done-means`, `--repo`, `--conflict-group`, `--risk`,
 `--acceptance`, `--estimate`) for hand-authored nodes. `plan show|gantt|ready` and `plan create`
-are also served as `/v1/plans.*`, so local mode and the hosted API return identical views.
+are local reads and writes over the store.
 
 A full local-mode run — draft, create, show, gantt with critical path, and the conflict-group
 frontier before/after a claim — is captured in [`docs/plan-dag-demo.md`](docs/plan-dag-demo.md)
@@ -315,24 +294,13 @@ run in [`docs/plan-dag-demo.transcript.txt`](docs/plan-dag-demo.transcript.txt).
 
 ## Identity
 
-`marbles serve` resolves every request to a `Principal` before it reaches the
-store:
+The store has an Ed25519 identity: `marbles store identity init` creates it,
+`marbles store descriptor` prints the signed `marbles.store/1` JSON, and `marbles store verify`
+checks one offline against a pinned `(store_id, key_id, public_key)`. Rotating a key keeps the
+old one verifying for a named overlap window.
 
-- **OIDC** (multi-machine/cloud): bearer JWTs verified against your issuer's
-  JWKS (`sso.fpl.dev`, Keycloak, Auth0…). `client_id`s listed in config are
-  agents; user tokens are humans.
-- **Static tokens** (one machine): files under `~/.marbles/tokens/` whose
-  filename is the identity — `human-avery`, `agent-codex-thread-1`. Created by
-  `marbles login` / `marbles agent-token`.
-
-The rule enforced at the API: **bodies may request, credentials may assert.**
-A human token cannot claim work as anyone but itself; an agent cannot sweep
-other people's holds; releasing a live claim requires being its holder.
-
-Hosted deployments set `DATABASE_URL` and `company_claim`. Each verified
-company claim routes to company-scoped rows in PostgreSQL; an unscoped
-credential is rejected instead of falling back to a shared database. The
-checked-in `deploy/server.toml` is the FPL Auth production shape.
+That identity is what `marbles remote` pins when it reads another store. Identity proves *which
+store wrote a row*; a claim is authorized by the store that owns it, not by a bearer credential.
 
 ## Durability
 
@@ -340,12 +308,11 @@ The local store is SQLite in WAL mode with a single writer, `synchronous=FULL`,
 and a five-second busy timeout. Every mutation runs inside `BEGIN IMMEDIATE`, so
 a claim is serialized even when several projects and a sweeper write at once,
 and an acknowledged claim or close survives a crash. The append-only `history`
-table is the audit trail; `outbound_event` is a transactional outbox, written in
-the same transaction as the mutation it describes.
+table is the audit trail.
 
 ```bash
-mb doctor                          # integrity, WAL size, settings, row counts
-mb backup ~/backups/marbles.db     # atomic VACUUM INTO snapshot
+marbles doctor                          # integrity, WAL size, settings, row counts
+marbles backup ~/backups/marbles.db     # atomic VACUUM INTO snapshot
 ```
 
 `backup` refuses to overwrite an existing file and checks source integrity
@@ -353,56 +320,18 @@ first. `doctor` runs `integrity_check` and `foreign_key_check`. Both are local
 commands: run them on the host that owns the store. See
 [`docs/durability.md`](docs/durability.md).
 
-An optional signed webhook wakes an event-driven consumer without making it
-part of the mutation transaction:
-
-```toml
-[webhook]
-url = "http://alfalfad:8787/api/v1/webhooks/marbles"
-secret_file = "/run/secrets/marbles-webhook"
-timeout_seconds = 5
-```
-
-Every history mutation appends an outbox row in the same SQLite transaction.
-The dispatcher signs the exact JSON body with HMAC-SHA256 in
-`X-Marbles-Signature`, retries failures with bounded exponential backoff, and
-marks only a successful 2xx response delivered. Rotate by accepting old and new
-receiver secrets during a deployment, changing the mounted sender secret, then
-removing the old receiver secret. Polling remains the consumer's reconciliation
-path; webhook delivery is a latency optimization, not a second source of truth.
-
-### When the server is down
-
-A hung or unreachable tracker must not hang the fleet, and it must never look like a successful
-write. Every CLI request is bounded — `--timeout-ms` (or `MARBLES_TIMEOUT_MS`, default 8000) caps
-both the whole request and the connect attempt — and the client splits failures in two:
-
-- **Reads** (`list`, `ready`, `show`, `history`, `stats`, `projects`) replay the newest response
-  that server already returned, loudly: `marbles: offline (cached <time>, <age> old, from <url>)`.
-  The exit code stays 0 because the data is real, just old; the banner is the staleness contract.
-- **Writes** are never cached and never queued. An unavailable server exits non-zero with
-  `offline: <op> not applied (no server)` — an outage cannot produce a phantom claim.
-
-Cached bodies live in `$MARBLES_HOME/cache` (default `~/.marbles/cache`), one 0600 file per
-`(server, op, request body)` keyed by SHA-256 so neither endpoints nor tokens appear in names, and
-pruned to the newest 128 entries / 8 MiB. Local mode never writes this cache. This is a cache, not
-replication: one server still owns the truth, clients only remember what it last told them.
-
-OIDC refresh is bounded by the same timeout. A revoked or expired refresh token prints
-`re-login required: … run marbles login` instead of hanging or surfacing a raw `invalid_grant`;
-if the IdP omits a rotated refresh token, the existing one is kept. See
-[`docs/distributed.md`](docs/distributed.md) for the distributed-client contract and why Marbles
-still has one writer.
+There is no server and no event delivery. `outbound_event` remains in the schema
+as part of Marbles' own audit trail; nothing delivers it, and no consumer should
+wait on a webhook that will not arrive. A fleet book is read over `soil:records`.
 
 ## CLI cheat sheet
 
 ```bash
-# Work
+# Work — `mb` (over soil:records)
 mb ready [--project P]                  # eligible work
 mb list [--all] [--project P] [--json]
 mb show <id> ; mb history <id>
 mb create "Title" -p 2 -t task -d "…"
-mb update <id> --status blocked --append-notes "waiting on …"
 mb claim <id> [--as agent-x] [--ttl SECS]
 mb touch <id> ; mb release <id>
 
@@ -415,27 +344,26 @@ mb close  <id> --ack "no delivery expected: …"
 mb dep add <child> <parent> ; mb dep rm <child> <parent>
 mb label add <id> bug ; mb label remove <id> bug
 
-# Organizing
-mb folder create "Business" --slug business
-mb folder tree ; mb folder move <project> <folder|none>
-mb goal create "Ship v1" -p 1
-mb epic create "Storage" --goal <goal-id>
-mb task create "Write the WAL test" --epic <epic-id>
-mb goal list ; mb goal show <goal-id>
-mb burndown --project <project> --days 30 [--json]
-mb portfolio [--folder <slug>] [--days N] [--stale-days N] [--json]
-
-# Projects and operations
-mb init [--folder NAME] [--slug S] [--prefix P]
-mb projects ; mb stats ; mb sweep
-mb doctor ; mb backup <new-path>
+# Local CLI only — `marbles` (a separate SQLite store)
+marbles init [--folder NAME] [--slug S] [--prefix P]
+marbles update <id> --status blocked --append-notes "waiting on …"
+marbles folder create "Business" --slug business
+marbles folder tree ; marbles folder move <project> <folder|none>
+marbles goal create "Ship v1" -p 1
+marbles epic create "Storage" --goal <goal-id>
+marbles task create "Write the WAL test" --epic <epic-id>
+marbles goal list ; marbles goal show <goal-id>
+marbles burndown --project <project> --days 30 [--json]
+marbles portfolio [--folder <slug>] [--days N] [--stale-days N] [--json]
+marbles projects ; marbles stats ; marbles sweep
+marbles doctor ; marbles backup <new-path>
 ```
 
 ## Migrating from Beads
 
 ```bash
 bd export > beads.jsonl
-mb import-bd beads.jsonl --project myrepo [--dry-run]
+marbles import-bd beads.jsonl --project myrepo [--dry-run]
 ```
 
 IDs, statuses, labels, metadata, close reasons, and dependency edges are
@@ -451,12 +379,17 @@ IDs and its dependency edges at import. IDs within one store never change.
 
 ## Layout and status
 
-Single binary (`src/main.rs`), `axum` + bearer-token auth, PostgreSQL for hosted
-operation, and `rusqlite` (WAL) for local operation and tests.
+Two targets. `mb` (`src/bin/mb.rs`) is a wasm spore over `soil:records`, built with
+`--target wasm32-wasip2 --no-default-features --features soil`. `marbles` (`src/main.rs`) is the
+native CLI over a local `rusqlite` (WAL) store.
 
-`v0.x`: interface-first. The HTTP contract and JSON shapes are what we intend to
-freeze before 1.0. Legacy hosted installs without `DATABASE_URL` can still use
-one physical SQLite store per OIDC company during cutover.
+The HTTP server, its auth stack, the PostgreSQL backend, the webhook/Unibus outbox, and the
+Canvas viewer have been removed. There is one writer per lineage, and it is a store, not a
+process.
+
+`v0.x`: interface-first. The JSON shapes are what we intend to freeze before 1.0. Porting the
+remaining local-only reads (`plan`, `portfolio`, `burndown`, `folder`, `goal`/`epic`/`task`) to
+the spore is the next step; today they require the native binary and therefore a second store.
 
 ## Attribution
 

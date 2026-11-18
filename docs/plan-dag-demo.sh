@@ -1,7 +1,9 @@
 #!/bin/bash
-# Local-mode demo for `mb plan show|gantt|ready|create`.
+# Local-mode demo for `marbles plan show|gantt|ready|create`.
 # Usage: MARBLES_HOME=$(mktemp -d) docs/plan-dag-demo.sh
 # Requires: cargo build; MB=target/debug/marbles (override with MB=...).
+# `MB` is a local variable here: the plan verbs live in the native `marbles` binary,
+# not in the `mb` spore.
 set -euo pipefail
 
 MB=${MB:-target/debug/marbles}

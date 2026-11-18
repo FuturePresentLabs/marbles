@@ -13,15 +13,7 @@
 
 pub mod adapter;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod api;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod assertion_cache;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod auth;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod cache;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod client;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod config;
 #[cfg(not(target_arch = "wasm32"))]
@@ -33,15 +25,7 @@ pub mod import;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod jsonl;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod oidc;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod outbox;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod plan;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod postgres_migration;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod postgres_store;
 pub mod records;
 pub mod records_cli;
 #[cfg(not(target_arch = "wasm32"))]
@@ -53,10 +37,6 @@ pub mod soil_engine;
 pub mod store;
 pub mod time;
 pub mod types;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod unibus;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod webhook;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use db::Db;

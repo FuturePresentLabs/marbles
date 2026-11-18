@@ -12,39 +12,35 @@ same second.
   acknowledged transition matters more than raw write throughput.
 - **One writer.** Every mutation runs inside `BEGIN IMMEDIATE`; contention waits up to five
   seconds and then fails instead of interleaving.
-- **Transactional history + outbox.** A mutation and its outbound event commit together. A webhook
-  cannot be delivered for a transition that rolled back, and a transition cannot commit without
-  its outbox row.
+- **Transactional history.** A mutation and its history row commit together, so the audit trail
+  cannot describe a transition that rolled back.
 
 ## Snapshot before risky work
 
-`mb backup <path>` creates an atomic, compact snapshot with SQLite's `VACUUM INTO`. The target
+`marbles backup <path>` creates an atomic, compact snapshot with SQLite's `VACUUM INTO`. The target
 must not already exist, and the source is checked with `PRAGMA integrity_check` before the copy.
 
 ```bash
-mb backup ~/backups/marbles-$(date +%Y%m%d-%H%M%S).db
+marbles backup ~/backups/marbles-$(date +%Y%m%d-%H%M%S).db
 ```
 
 The command prints (or `--json` returns) the path, byte size, timestamp, row counts, and the
-integrity result. To restore, stop the server, keep the current database as a rollback copy, then
-replace it:
+integrity result. To restore, make sure no `marbles` command is running, keep the current database
+as a rollback copy, then replace it:
 
 ```bash
-# server stopped
 cp ~/.marbles/marbles.db ~/.marbles/marbles.db.pre-restore
 cp ~/backups/marbles-20261024-010000.db ~/.marbles/marbles.db
 rm -f ~/.marbles/marbles.db-wal ~/.marbles/marbles.db-shm
-marbles serve
 ```
 
-`backup` and `doctor` are local-mode commands: they read the database file, so run them on the
-host that owns the store, not through a remote `--url`.
+`backup` and `doctor` read the database file, so run them on the host that owns the store.
 
 ## Check the store
 
 ```bash
-mb doctor
-mb doctor --json
+marbles doctor
+marbles doctor --json
 ```
 
 `doctor` reports:
@@ -56,13 +52,13 @@ mb doctor --json
 | `journal_mode`, `synchronous` | expected `wal` / `FULL` |
 | `db_bytes`, `wal_bytes` | current on-disk and WAL size |
 | `projects`, `issues`, `deps`, `history` | row counts |
-| `outbox_pending` | webhook events not yet delivered |
+| `outbox_pending` | history events recorded but never delivered; nothing delivers them now |
 
 ## Backups are not replication
 
-A snapshot is a recovery artifact, not a second writer. Do not point two servers at copies of one
-database, and do not restore over a live server. The design is one writer per lineage; a backup
-respects that by being taken out of band and restored while the writer is stopped.
+A snapshot is a recovery artifact, not a second writer. Do not open two copies of one database, and
+do not restore over a store a command is using. The design is one writer per lineage; a backup
+respects that by being taken out of band and restored while nothing is writing.
 
-For hosted PostgreSQL deployments, use the database's own backup/PITR mechanism. `mb backup` is
-for the local SQLite store.
+A fleet book is not backed up this way: it is a `soil:records` book, and sync is its story, not a
+SQLite snapshot.

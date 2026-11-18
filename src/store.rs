@@ -12,9 +12,6 @@ pub enum Error {
     #[cfg(not(target_arch = "wasm32"))]
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
-    #[cfg(not(target_arch = "wasm32"))]
-    #[error("postgres: {0}")]
-    Postgres(#[from] postgres::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("no issue {0}")]

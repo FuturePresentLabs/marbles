@@ -1,12 +1,12 @@
 # Portfolio view
 
-`mb portfolio` is the read-only rollup above folders, projects, goals, and the ready queue. It
+`marbles portfolio` is the read-only rollup above folders, projects, goals, and the ready queue. It
 answers "what needs attention across the whole store?" without mutating anything.
 
 ```bash
-mb portfolio
-mb portfolio --folder business --days 30 --stale-days 14
-mb portfolio --json
+marbles portfolio
+marbles portfolio --folder business --days 30 --stale-days 14
+marbles portfolio --json
 ```
 
 ## What it counts

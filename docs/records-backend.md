@@ -3,8 +3,13 @@
 **Status: cut over (2026-11).** `mb` on a records-backed host is the spore, not the
 native binary. `~/.local/bin/mb` is the host shim; the commands are a wasm
 component running against `soil:records`; the native `marbles` binary is still
-installed for the operations the spore does not have (`init`, `import`, `plan`,
-`portfolio`, `serve`).
+installed for the operations the spore does not have (`init`, `import-bd`, `plan`,
+`portfolio`, `burndown`, `folder`, `goal`/`epic`/`task`, `store`, `backup`,
+`doctor`).
+
+The native HTTP server, its auth stack, the PostgreSQL backend, the webhook and
+Unibus outbox, and the Canvas viewer were removed after the cutover. There is no
+process that serves the graph; a fleet reads the book.
 
 This document covers the record model (unchanged since the spike), the CLI
 surface, the install, the one-time consolidation, and the sync topology.
@@ -36,7 +41,8 @@ package under `~/.local/share/fungos/commands/mb`, writes the command policy to
 `shims` — Soil `c540c27` or later — because the shim is Soil's: the policy says
 which book and collection to bind, and which variables the command may see.
 
-Reverting is one line: `ln -sf marbles ~/.local/bin/mb`.
+Reverting is one line: `ln -sf marbles ~/.local/bin/mb` — but the native binary no
+longer has `mb`'s command set, so only do that to get the old local store back.
 
 ## The CLI surface
 
@@ -62,10 +68,10 @@ Rules that matter:
 - `MARBLES_PROJECT` / `MARBLES_PREFIX` / `MARBLES_ACTOR` are the only
   environment it reads. An empty value means unset.
 
-The native binary keeps the rest: `init`, `import`, `plan`, `portfolio`,
+The native binary keeps the rest: `init`, `import-bd`, `plan`, `portfolio`,
 `burndown`, `folder`, `goal`/`epic`/`task`, `remote`/`remotes`, `store`, `backup`,
-`doctor`, `serve`, `login`. Those write to a different store, so a project must
-not be split across both.
+`doctor`, `update`. Those write to a different store, so a project must not be
+split across both.
 
 ## Consolidating machines
 
@@ -244,7 +250,7 @@ id in the `marbles` collection and uses `compare-and-swap` for claims.
 Native/default builds are unchanged.
 
 The wasm library surface is `adapter`, `records`, `records_cli`, `store`, `time`,
-`types` and `soil_engine`. The native CLI and server modules remain behind
+`types` and `soil_engine`. The native CLI modules remain behind
 `cfg(not(target_arch = "wasm32"))`. `bin/mb.rs` is the only wasm binary: it parses
 with `records_cli` and translates the result into `Store` calls.
 

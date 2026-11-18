@@ -8,8 +8,7 @@ description = "A small, single-writer issue tracker for fleets of coding agents 
 repository  = "https://github.com/FuturePresentLabs/marbles"
 
 [features]
-default = ["native"]
-native = []
+default = []
 soil = ["dep:soil-sdk-records"]
 
 [dependencies]
@@ -21,25 +20,13 @@ getrandom   = "0.3"
 soil-sdk-records = { git = "https://github.com/mycelium-linux/soil.git", rev = "fc010d45218826b6cf980a352b526c48e0691d45", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-axum        = "0.8"
 base64      = "0.22"
 clap        = { version = "4.6", features = ["derive", "env"] }
 dirs        = "6"
-fs2         = "0.4"
-hmac        = "0.12"
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
-openssl      = { version = "0.10", features = ["vendored"] }
-postgres     = "0.19"
-postgres-openssl = "0.5"
-reqwest     = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+openssl     = { version = "0.10", features = ["vendored"] }
 rusqlite    = { version = "0.37", features = ["bundled", "functions"] }
 sha2        = "0.10"
-tokio       = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "signal"] }
 toml        = "0.9"
-wasmtime    = { version = "34", default-features = false, features = ["cranelift", "runtime", "std"] }
-# The mesh client: framing, registration, and the envelope type. Marbles publishes
-# as a producer, so it needs the hub's wire protocol and nothing else from Unibus.
-unibus      = { git = "https://github.com/mycelium-linux/unibus", rev = "727fce91a4612a30eb1cf3acd802da6633619cc3" }
 
 [[bin]]
 name = "mb"
@@ -48,8 +35,6 @@ required-features = ["soil"]
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["test-util"] }
-tower = "0.5"
 
 [lints.rust]
 unsafe_code = "forbid"

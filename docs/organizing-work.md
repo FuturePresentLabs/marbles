@@ -10,17 +10,17 @@ A folder is a named group of projects. Folders may nest; a project belongs to at
 Projects with no assignment are **unfiled**.
 
 ```bash
-mb folder create "Personal" --slug personal
-mb folder create "Business" --slug business
-mb folder create "Acme" --slug acme --parent business
+marbles folder create "Personal" --slug personal
+marbles folder create "Business" --slug business
+marbles folder create "Acme" --slug acme --parent business
 
-mb folder list                 # table: folder, name, projects
-mb folder tree                 # nested tree with projects in brackets
-mb folder move acme business   # put a project in a folder
-mb folder move acme none       # unfile it
+marbles folder list                 # table: folder, name, projects
+marbles folder tree                 # nested tree with projects in brackets
+marbles folder move acme business   # put a project in a folder
+marbles folder move acme none       # unfile it
 ```
 
-`mb init --folder business` creates the folder if needed and assigns the new project in one step.
+`marbles init --folder business` creates the folder if needed and assigns the new project in one step.
 `mb projects` includes each project's `folder` so a dashboard can group without a second query.
 
 Folders are organizational only. They do not scope claims, readiness, or dependencies: a blocker
@@ -32,13 +32,13 @@ A **goal** is a project-local root ("ship v1", "cut cloud spend by 30%"). An **e
 work under a goal. A **task** is an executable unit under an epic.
 
 ```bash
-mb goal create "Ship v1" -p 1
+marbles goal create "Ship v1" -p 1
 # → acme-goal1
 
-mb epic create "Storage" --goal acme-goal1
+marbles epic create "Storage" --goal acme-goal1
 # → acme-epic1
 
-mb task create "Write WAL durability test" --epic acme-epic1
+marbles task create "Write WAL durability test" --epic acme-epic1
 # → acme-task1
 ```
 
@@ -58,15 +58,15 @@ Cycles are refused, and the tree is rendered from the same rows the queue uses.
 ### Progress and trees
 
 ```bash
-mb goal list                       # every open goal with descendant rollup
-mb goal list --all --json          # include closed goals; machine-readable
-mb goal show acme-goal1            # tree + progress bar
+marbles goal list                       # every open goal with descendant rollup
+marbles goal list --all --json          # include closed goals; machine-readable
+marbles goal show acme-goal1            # tree + progress bar
 ```
 
 Progress counts the goal's descendants, not the goal container itself. A goal with one closed
 task and one open task is 50%, even though the goal issue is still open.
 
-`mb goal show` prints the full tree with status and priority:
+`marbles goal show` prints the full tree with status and priority:
 
 ```text
 acme-goal1 — Ship v1 [open] p1 (goal)
@@ -79,13 +79,13 @@ acme-goal1 [open] Ship v1 (goal, p1)
 
 ## Burndown
 
-`mb burndown` computes a daily remaining-work series from issue creation and close timestamps. It
+`marbles burndown` computes a daily remaining-work series from issue creation and close timestamps. It
 works for a project, a goal, or an epic, and returns JSON with `--json`.
 
 ```bash
-mb burndown --project acme --days 30
-mb burndown --goal acme-goal1 --days 14
-mb burndown --epic acme-epic1 --days 7 --json
+marbles burndown --project acme --days 30
+marbles burndown --goal acme-goal1 --days 14
+marbles burndown --epic acme-epic1 --days 7 --json
 ```
 
 Each point reports:

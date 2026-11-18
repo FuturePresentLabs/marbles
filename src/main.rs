@@ -1,10 +1,9 @@
-//! `marbles` / `mb` — one binary, three modes:
+//! `marbles` — the local CLI over a SQLite store.
 //!
-//! - **CLI (local)**: point at a SQLite file and act directly. One operator, one machine.
-//! - **CLI (client)**: with `MARBLES_URL`/`--url`, every verb is a POST to the server.
-//! - **Server**: `marbles serve` — the fleet mode. One process owns the database; agents
-//!   heartbeat leases; the sweeper reclaims expired agent claims and escalates expired human
-//!   holds every minute.
+//! One operator, one machine, one file. The fleet interface is `mb`, the wasm spore that runs
+//! against a `soil:records` book; this binary is the remaining local tool for the operations the
+//! spore does not have yet (`init`, `import`, `plan`, `portfolio`, `burndown`, the goal/epic/task
+//! hierarchy, and store identity).
 //!
 //! The JSON output shapes match what a Beads-era client expects (`create` → `{"id": …}`,
 //! `list`/`ready` → arrays of beads, `show` → a one-element array) so migration is a binary swap,
@@ -17,15 +16,12 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use marbles::assertion_cache::AssertionCache;
-use marbles::auth::Auth;
-use marbles::client::Client;
 use marbles::config;
-use marbles::db::{CompanyStoreRegistry, CompanyStores, Db, now};
+use marbles::db::{Db, now};
 use marbles::identity::{
     InitOptions, PinnedKey, RemoteRegistry, StoreIdentity, descriptor_from_arg,
     verify_descriptor_json,
 };
-use marbles::postgres_store::PostgresCompanyStores;
 use marbles::refs::{CanonicalRef, audit_remote_dependency, remote_dependency_freshness};
 use marbles::report;
 use marbles::setup::Profile;
@@ -41,34 +37,10 @@ struct Cli {
     /// Project root to resolve (walks up to `.marbles/project.toml`).
     #[arg(short = 'C', long, default_value = ".")]
     dir: PathBuf,
-    /// Server URL; when set, commands talk HTTP instead of the local database.
-    #[arg(long, env = "MARBLES_URL", global = true)]
-    url: Option<String>,
-    /// Bearer token (static local token or OIDC JWT).
-    #[arg(
-        long,
-        env = "MARBLES_TOKEN",
-        global = true,
-        hide_env_values = true,
-        conflicts_with = "token_file"
-    )]
-    token: Option<String>,
-    /// Private file containing a scoped bearer token; read afresh on every invocation.
-    #[arg(long, env = "MARBLES_TOKEN_FILE", global = true)]
-    token_file: Option<PathBuf>,
     /// Machine-readable output.
     #[arg(long, global = true)]
     json: bool,
-    /// Per-request HTTP deadline in milliseconds (connect is capped at 3s).
-    #[arg(
-        long,
-        env = "MARBLES_TIMEOUT_MS",
-        global = true,
-        default_value_t = marbles::client::DEFAULT_TIMEOUT_MS,
-        value_name = "MS"
-    )]
-    timeout_ms: u64,
-    /// Override the acting identity in local mode.
+    /// Override the acting identity.
     #[arg(long, global = true)]
     actor: Option<String>,
     #[command(subcommand)]
@@ -94,48 +66,12 @@ enum Command {
         /// Managed instruction profile installed by init.
         #[arg(long, default_value = "maintainer")]
         profile: String,
-        /// Persist the Marbles service endpoint in project.toml.
-        #[arg(long)]
-        server_url: Option<String>,
         /// Put the project in this folder (created if it does not exist).
         #[arg(long)]
         folder: Option<String>,
     },
-    /// Start the server (fleet mode).
-    Serve {
-        /// Override the listen address from server.toml.
-        #[arg(long)]
-        addr: Option<String>,
-    },
-    /// Mint a local static token; the filename *is* the identity.
-    Login {
-        #[arg(long, default_value = "owner")]
-        name: String,
-        /// OIDC issuer for remote login.
-        #[arg(long)]
-        issuer: Option<String>,
-        /// OIDC client id for remote login.
-        #[arg(long)]
-        client_id: Option<String>,
-        /// OIDC client secret for remote login.
-        #[arg(long, env = "MARBLES_CLIENT_SECRET", hide_env_values = true)]
-        client_secret: Option<String>,
-        /// Local callback registered for the OIDC client.
-        #[arg(long)]
-        redirect_uri: Option<String>,
-    },
-    /// Mint a local agent token (for daemons/sandboxes).
-    AgentToken {
-        name: String,
-    },
-    /// Print the server URL + how to point at it.
-    Url,
-    /// Check the selected endpoint, or local store integrity when running locally.
-    Doctor {
-        /// Project to probe when talking to a hosted server.
-        #[arg(long)]
-        project: Option<String>,
-    },
+    /// Check local store integrity.
+    Doctor,
     Create(Box<CreateArgs>),
     List {
         #[arg(long)]
@@ -625,129 +561,24 @@ enum LabelAction {
     Remove { id: String, label: String },
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let cli = Cli::parse();
-    if let Command::Login {
-        issuer,
-        client_id,
-        client_secret: Some(secret),
-        redirect_uri,
-        ..
-    } = &cli.command
-    {
-        let url = cli.url.as_deref().unwrap_or("https://marbles.fpl.dev");
-        return match marbles::oidc::login(
-            url,
-            issuer.as_deref(),
-            client_id.as_deref(),
-            secret,
-            redirect_uri.as_deref(),
-        )
-        .await
-        {
-            Ok(_) => {
-                println!("signed in to {url}");
-                ExitCode::SUCCESS
-            }
-            Err(err) => fail(err),
-        };
-    }
-    // Explicit automation credentials must not depend on a stale browser profile.
-    let saved = match if cli.token.is_some() || cli.token_file.is_some() {
-        Ok(None)
-    } else {
-        marbles::oidc::load()
-    } {
-        Ok(value) => value,
-        Err(err) => return fail(err),
+    let db = match Db::open(config::db_path()) {
+        Ok(db) => Arc::new(db),
+        Err(err) => return fail(format!("opening {}: {err}", config::db_path().display())),
     };
-    let effective_url = cli
-        .url
-        .clone()
-        .or_else(|| saved.as_ref().map(|value| value.url.clone()))
-        .or_else(|| {
-            if matches!(&cli.command, Command::Init { .. }) {
-                return None;
-            }
-            let dir = std::env::current_dir().ok()?.join(&cli.dir);
-            config::discover_project(&dir).and_then(|(_, project)| project.server_url)
-        });
-    if effective_url.is_some()
-        && matches!(
-            &cli.command,
-            Command::Login { .. } | Command::AgentToken { .. }
-        )
-    {
-        return fail(
-            "local token minting cannot enroll a hosted identity; use MARBLES_CLIENT_SECRET with hosted login, or an operator-provisioned company-scoped service bearer",
-        );
-    }
-    let mode = if let Some(url) = &effective_url {
-        let token = if let Some(token) = cli.token.clone() {
-            token
-        } else if let Some(path) = &cli.token_file {
-            match read_bearer_file(path) {
-                Ok(token) => token,
-                Err(err) => return fail(err),
-            }
-        } else if let Some(saved) = saved {
-            if saved.url.trim_end_matches('/') != url.trim_end_matches('/') {
-                return fail(
-                    "saved Marbles credentials belong to a different server; sign in there or supply an explicit scoped bearer token",
-                );
-            }
-            match marbles::oidc::valid_token_with_timeout(saved, cli.timeout_ms).await {
-                Ok((_, token)) => token,
-                Err(err) => return fail(err),
-            }
-        } else {
-            String::new()
-        };
-        if token.is_empty() {
-            return fail(
-                "remote Marbles has no credential; use MARBLES_CLIENT_SECRET with `mb --url <url> login`, or MARBLES_TOKEN_FILE for a scoped service bearer",
-            );
-        }
-        Mode::Http(Client::with_options(
-            url,
-            &token,
-            marbles::client::Options {
-                timeout: Some(std::time::Duration::from_millis(cli.timeout_ms)),
-                // Remote reads keep a local copy so an outage degrades to the last known graph.
-                // Local mode never reaches this branch and never writes a cache.
-                cache: Some(marbles::cache::Cache::at(marbles::cache::default_root())),
-            },
-        ))
-    } else {
-        let db = match Db::open(config::db_path()) {
-            Ok(db) => Arc::new(db),
-            Err(err) => return fail(format!("opening {}: {err}", config::db_path().display())),
-        };
-        Mode::Local(db)
-    };
-    match run(&cli, &mode, effective_url.as_deref()).await {
+    match run(&cli, &Mode(db)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => fail(message),
     }
 }
 
-enum Mode {
-    Local(Arc<Db>),
-    Http(Client),
-}
+/// The one store this binary opens: the local SQLite file.
+struct Mode(Arc<Db>);
 
 impl Mode {
-    async fn call<T: serde::de::DeserializeOwned>(
-        &self,
-        op: &str,
-        body: &impl serde::Serialize,
-        local: impl FnOnce(&Db) -> Result<T, String>,
-    ) -> Result<T, String> {
-        match self {
-            Mode::Http(client) => client.call(op, body).await,
-            Mode::Local(db) => local(db),
-        }
+    fn call<T>(&self, local: impl FnOnce(&Db) -> Result<T, String>) -> Result<T, String> {
+        local(&self.0)
     }
 }
 
@@ -824,17 +655,8 @@ fn resolve_project(cli: &Cli, explicit: Option<&str>) -> Result<String, String> 
         .ok_or_else(|| "no project: run `marbles init` or pass --project".to_string())
 }
 
-async fn create_issue(mode: &Mode, spec: &NewIssue) -> Result<String, String> {
-    match mode {
-        Mode::Local(db) => db.create(spec, now()).map_err(|e| e.to_string()),
-        Mode::Http(client) => {
-            let response: serde_json::Value = client.call("issues.create", spec).await?;
-            response["id"]
-                .as_str()
-                .map(str::to_string)
-                .ok_or_else(|| format!("issues.create returned no id: {response}"))
-        }
-    }
+fn create_issue(mode: &Mode, spec: &NewIssue) -> Result<String, String> {
+    mode.0.create(spec, now()).map_err(|e| e.to_string())
 }
 
 fn project_folder_map(view: &FolderView) -> BTreeMap<&str, &str> {
@@ -1039,7 +861,7 @@ fn print_folder_view(view: &FolderView, tree: bool) {
     }
 }
 
-async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), String> {
+fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
     let actor = cli.actor.clone().unwrap_or_else(actor_default);
     match &cli.command {
         Command::Init {
@@ -1049,7 +871,6 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             no_hooks,
             no_migrate_beads,
             profile,
-            server_url,
             folder,
         } => {
             let dir = std::env::current_dir().unwrap_or_default().join(&cli.dir);
@@ -1068,28 +889,12 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             std::fs::create_dir_all(&marbles_dir).map_err(|e| e.to_string())?;
             std::fs::write(
                 marbles_dir.join("project.toml"),
-                format!(
-                    "slug = \"{slug}\"\nprefix = \"{prefix}\"\n{}",
-                    server_url
-                        .as_ref()
-                        .map(|url| format!("server_url = \"{url}\"\n"))
-                        .unwrap_or_default()
-                ),
+                format!("slug = \"{slug}\"\nprefix = \"{prefix}\"\n"),
             )
             .map_err(|e| e.to_string())?;
-            match mode {
-                Mode::Local(db) => db
-                    .ensure_project(&slug, &dir.to_string_lossy(), &prefix)
-                    .map_err(|e| e.to_string())?,
-                Mode::Http(client) => {
-                    let _: serde_json::Value = client
-                        .call(
-                            "projects.ensure",
-                            &serde_json::json!({"slug": slug, "root": dir.to_string_lossy(), "prefix": prefix}),
-                        )
-                        .await?;
-                }
-            }
+            mode.0
+                .ensure_project(&slug, &dir.to_string_lossy(), &prefix)
+                .map_err(|e| e.to_string())?;
             if let Some(folder) = folder {
                 let folder = Folder {
                     slug: config::slugify(folder),
@@ -1097,30 +902,19 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                     parent: None,
                     created_at: now(),
                 };
-                let _: serde_json::Value = mode
-                    .call("folders.create", &folder, |db| {
-                        db.ensure_folder(&folder, now())
-                            .map_err(|e| e.to_string())?;
-                        Ok(serde_json::json!({"slug": folder.slug}))
-                    })
-                    .await?;
-                let _: serde_json::Value = mode
-                    .call(
-                        "projects.move",
-                        &serde_json::json!({"project": slug, "folder": folder.slug}),
-                        |db| {
-                            db.set_project_folder(&slug, Some(&folder.slug), now())
-                                .map_err(|e| e.to_string())?;
-                            Ok(serde_json::json!({"project": slug, "folder": folder.slug}))
-                        },
-                    )
-                    .await?;
+                let _: serde_json::Value = mode.call(|db| {
+                    db.ensure_folder(&folder, now())
+                        .map_err(|e| e.to_string())?;
+                    Ok(serde_json::json!({"slug": folder.slug}))
+                })?;
+                let _: serde_json::Value = mode.call(|db| {
+                    db.set_project_folder(&slug, Some(&folder.slug), now())
+                        .map_err(|e| e.to_string())?;
+                    Ok(serde_json::json!({"project": slug, "folder": folder.slug}))
+                })?;
             }
             if !*no_migrate_beads && dir.join(".beads").is_dir() {
-                let db = require_local(
-                    mode,
-                    "automatic Beads migration currently requires local Marbles mode; unset MARBLES_URL or run `bd export | mb import-bd - --project <slug>` against the server",
-                )?;
+                let db = &mode.0;
                 let output = std::process::Command::new("bd")
                     .arg("export")
                     .current_dir(&dir)
@@ -1175,197 +969,35 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             }
             Ok(())
         }
-        Command::Serve { addr } => {
-            let cfg = config::server_config();
-            let webhook = cfg.webhook.clone();
-            let unibus = cfg.unibus.clone();
-            let listen = addr.clone().unwrap_or(cfg.listen);
-            let database_url = std::env::var("DATABASE_URL")
-                .ok()
-                .filter(|url| !url.trim().is_empty());
-            // The API requires a workstation fallback store, but hosted OIDC requests always
-            // resolve through `company_stores`. Keep that fallback ephemeral in PostgreSQL mode
-            // so a production process never creates or mutates a shadow SQLite authority.
-            let db: Arc<dyn marbles::db::Store> = if database_url.is_some() {
-                Arc::new(Db::in_memory().map_err(|e| format!("opening fallback store: {e}"))?)
-            } else {
-                Arc::new(Db::open(config::db_path()).map_err(|e| format!("opening database: {e}"))?)
-            };
-            let company_stores: Option<Arc<dyn CompanyStoreRegistry>> = match database_url {
-                Some(url) => Some(Arc::new(
-                    tokio::task::spawn_blocking(move || PostgresCompanyStores::connect(&url))
-                        .await
-                        .map_err(|_| "PostgreSQL startup worker failed".to_string())?
-                        .map_err(|e| format!("opening hosted PostgreSQL store: {e}"))?,
-                )),
-                _ => cfg
-                    .company_store_root
-                    .map(CompanyStores::new)
-                    .transpose()
-                    .map_err(|e| format!("opening company stores: {e}"))?
-                    .map(|stores| Arc::new(stores) as Arc<dyn CompanyStoreRegistry>),
-            };
-            let auth = Arc::new(Auth::new(cfg.auth, config::token_dir()));
-            let api = Arc::new(marbles::api::Api {
-                db: Arc::clone(&db),
-                company_stores: company_stores.clone(),
-                auth,
-            });
-            if webhook.is_some() && unibus.is_some() {
-                return Err(
-                    "server.toml configures both [server.webhook] and [server.unibus]; the outbox \
-                     records one delivery state per event, so pick one sink"
-                        .to_string(),
-                );
-            }
-            let sink = match (webhook, unibus) {
-                (Some(webhook), None) => Some(marbles::outbox::Sink::Webhook(
-                    marbles::webhook::Publisher::new(
-                        webhook,
-                        Arc::clone(&db),
-                        company_stores.clone(),
-                    )?,
-                )),
-                (None, Some(unibus)) => Some(marbles::outbox::Sink::Unibus(Arc::new(
-                    marbles::unibus::UnibusSink::new(&unibus)?,
-                ))),
-                _ => None,
-            };
-            if let Some(sink) = sink {
-                println!("outbox: delivering to {}", sink.label());
-                tokio::spawn(
-                    marbles::outbox::Dispatcher::new(sink, Arc::clone(&db), company_stores.clone())
-                        .run(),
-                );
-            }
-            let listener = tokio::net::TcpListener::bind(&listen)
-                .await
-                .map_err(|e| format!("binding {listen}: {e}"))?;
-            println!(
-                "marbles serving on http://{listen} (db {}, hosted stores {}, tokens {})",
-                config::db_path().display(),
-                company_stores
-                    .as_ref()
-                    .map(|_| "enabled")
-                    .unwrap_or("disabled"),
-                config::token_dir().display()
-            );
-            let sweeper_db = Arc::clone(&db);
-            let sweeper_companies = company_stores;
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
-                loop {
-                    tick.tick().await;
-                    let companies = sweeper_companies.clone();
-                    let db = Arc::clone(&sweeper_db);
-                    let result = tokio::task::spawn_blocking(move || match &companies {
-                        Some(stores) => stores.sweep_open(now()).map(|reports| {
-                            reports.into_iter().fold(
-                                marbles::db::SweepReport::default(),
-                                |mut all, (_, report)| {
-                                    all.requeued.extend(report.requeued);
-                                    all.escalated.extend(report.escalated);
-                                    all
-                                },
-                            )
-                        }),
-                        None => db.sweep(now()),
-                    })
-                    .await;
-                    let result = match result {
-                        Ok(result) => result,
-                        Err(_) => {
-                            eprintln!("sweep storage worker failed");
-                            continue;
-                        }
-                    };
-                    match result {
-                        Ok(report) => {
-                            if !report.requeued.is_empty() || !report.escalated.is_empty() {
-                                eprintln!(
-                                    "sweep: requeued {:?}, escalated {:?}",
-                                    report.requeued, report.escalated
-                                );
-                            }
-                        }
-                        Err(err) => eprintln!("sweep failed: {err}"),
-                    }
-                }
-            });
-            axum::serve(listener, api.router())
-                .await
-                .map_err(|e| format!("server: {e}"))
-        }
-        Command::Login { name, .. } => {
-            let (path, secret) =
-                marbles::auth::mint_token(&config::token_dir(), ActorKind::Human, name)
-                    .map_err(|e| e.to_string())?;
-            println!("token: {secret}");
-            println!("identity: human/{name} (file {})", path.display());
-            Ok(())
-        }
-        Command::AgentToken { name } => {
-            let (path, secret) =
-                marbles::auth::mint_token(&config::token_dir(), ActorKind::Agent, name)
-                    .map_err(|e| e.to_string())?;
-            println!("token: {secret}");
-            println!("identity: agent/{name} (file {})", path.display());
-            Ok(())
-        }
-        Command::Url => {
-            println!("{}", reported_url(effective_url));
-            Ok(())
-        }
-        Command::Doctor { project } => {
-            let Mode::Http(client) = mode else {
-                let db = require_local(
-                    mode,
-                    "doctor reads the server's database file; run it on the host that owns --url",
-                )?;
-                let report = db.doctor().map_err(|e| e.to_string())?;
-                if cli.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
-                    );
-                } else {
-                    println!("integrity:    {}", report.integrity);
-                    println!("quick check:  {}", report.quick_check);
-                    println!(
-                        "journal:      {} / synchronous {}",
-                        report.journal_mode, report.synchronous
-                    );
-                    println!(
-                        "storage:      {} bytes DB + {} bytes WAL",
-                        report.db_bytes, report.wal_bytes
-                    );
-                    println!(
-                        "rows:         {} projects, {} issues, {} deps, {} history, {} outbox pending",
-                        report.projects,
-                        report.issues,
-                        report.deps,
-                        report.history,
-                        report.outbox_pending
-                    );
-                    if !report.foreign_key_violations.is_empty() {
-                        println!("foreign keys: {}", report.foreign_key_violations.join("; "));
-                    }
-                }
-                return Ok(());
-            };
-            let project = project.clone().or_else(|| project_for(cli).ok());
-            if !client.health().await {
-                return Err("hosted Marbles health check failed; check routing and deployment before re-authenticating".into());
-            }
-            let rows: Vec<Issue> = client
-                .call("issues.ready", &serde_json::json!({"project":project}))
-                .await?;
-            let report = serde_json::json!({"mode":"hosted", "endpoint":effective_url,
-                "health":"ok", "authentication":"ok", "project":project, "ready_count":rows.len()});
+        Command::Doctor => {
+            let report = mode.0.doctor().map_err(|e| e.to_string())?;
             if cli.json {
-                println!("{report}");
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+                );
             } else {
-                println!("Marbles hosted: health and authenticated access OK");
+                println!("integrity:    {}", report.integrity);
+                println!("quick check:  {}", report.quick_check);
+                println!(
+                    "journal:      {} / synchronous {}",
+                    report.journal_mode, report.synchronous
+                );
+                println!(
+                    "storage:      {} bytes DB + {} bytes WAL",
+                    report.db_bytes, report.wal_bytes
+                );
+                println!(
+                    "rows:         {} projects, {} issues, {} deps, {} history, {} outbox pending",
+                    report.projects,
+                    report.issues,
+                    report.deps,
+                    report.history,
+                    report.outbox_pending
+                );
+                if !report.foreign_key_violations.is_empty() {
+                    println!("foreign keys: {}", report.foreign_key_violations.join("; "));
+                }
             }
             Ok(())
         }
@@ -1392,13 +1024,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                 metadata: Some(plan_node_metadata(args)?),
                 external_ref: args.external_ref.clone(),
             };
-            let id: String = match mode {
-                Mode::Local(db) => db.create(&spec, now()).map_err(|e| e.to_string())?,
-                Mode::Http(client) => {
-                    let r: serde_json::Value = client.call("issues.create", &spec).await?;
-                    r["id"].as_str().unwrap_or_default().to_string()
-                }
-            };
+            let id = mode.0.create(&spec, now()).map_err(|e| e.to_string())?;
             if cli.json {
                 println!("{}", serde_json::json!({"id": id}));
             } else {
@@ -1413,13 +1039,10 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             project,
         } => {
             let project = project.clone().or(project_for(cli).ok());
-            let body = serde_json::json!({"project": project, "all": all, "id": id});
-            let rows: Vec<Issue> = mode
-                .call("issues.list", &body, |db| {
-                    db.list(project.as_deref(), *all, id.as_deref())
-                        .map_err(|e| e.to_string())
-                })
-                .await?;
+            let rows: Vec<Issue> = mode.call(|db| {
+                db.list(project.as_deref(), *all, id.as_deref())
+                    .map_err(|e| e.to_string())
+            })?;
             let capped = if *limit <= 0 {
                 rows
             } else {
@@ -1430,50 +1053,21 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
         }
         Command::Ready { project } => {
             let project = project.clone().or(project_for(cli).ok());
-            let body = serde_json::json!({"project": project});
             // Local readiness rules are unchanged; remote edges are re-verified offline below and
             // become named reasons instead of silently dropping the local issue.
-            let rows: Vec<(Issue, Vec<RemoteDependency>)> = match &mode {
-                Mode::Local(db) => db
-                    .ready_with_remote_edges(project.as_deref(), now())
-                    .map_err(|e| e.to_string())?,
-                Mode::Http(client) => {
-                    let issues: Vec<Issue> = client.call("issues.ready", &body).await?;
-                    // Remote edges are local client state; attach them to the server's rows.
-                    let local = Db::open(config::db_path()).ok();
-                    issues
-                        .into_iter()
-                        .map(|issue| {
-                            let edges = local
-                                .as_ref()
-                                .and_then(|db| db.remote_dependencies(&issue.id).ok())
-                                .unwrap_or_default();
-                            (issue, edges)
-                        })
-                        .collect()
-                }
-            };
+            let rows = mode
+                .0
+                .ready_with_remote_edges(project.as_deref(), now())
+                .map_err(|e| e.to_string())?;
             print_readiness(cli, &readiness_rows(rows));
             Ok(())
         }
         Command::Show { id } => {
             // A one-element array: mirrors `bd show --json`, which the migrating clients parse as
             // a list. Boring compatibility is worth more than purity here.
-            let body = serde_json::json!({"id": id});
-            let row: Issue = mode
-                .call("issues.get", &body, |db| {
-                    db.get(id).map_err(|e| e.to_string())
-                })
-                .await?;
-            let mut remote_dependencies = match mode {
-                Mode::Local(db) => db.remote_dependencies(id).map_err(|e| e.to_string())?,
-                // The edge itself is local client state; read it from the local store when the
-                // issue body came over HTTP as well.
-                Mode::Http(_) => Db::open(config::db_path())
-                    .ok()
-                    .and_then(|db| db.remote_dependencies(id).ok())
-                    .unwrap_or_default(),
-            };
+            let row: Issue = mode.call(|db| db.get(id).map_err(|e| e.to_string()))?;
+            let mut remote_dependencies =
+                mode.0.remote_dependencies(id).map_err(|e| e.to_string())?;
             annotate_remote_dependencies(&mut remote_dependencies)?;
             let audits = audit_remote_dependencies(&remote_dependencies);
             if cli.json {
@@ -1550,30 +1144,23 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                 metadata,
             };
             if let Some(assignee) = &args.assignee {
-                let body = serde_json::json!({
-                    "id": args.id.clone(),
-                    "assignee": assignee.clone(),
-                    "ttl_seconds": null,
-                });
-                let receipt: ClaimReceipt = mode
-                    .call("claims.claim", &body, |db| {
-                        let kind = if assignee == &actor_default() {
-                            ActorKind::Human
-                        } else {
-                            ActorKind::Agent
-                        };
-                        db.claim(
-                            &ClaimRequest {
-                                id: args.id.clone(),
-                                assignee: assignee.clone(),
-                                actor_kind: kind,
-                                ttl_seconds: None,
-                            },
-                            now(),
-                        )
-                        .map_err(|e| e.to_string())
-                    })
-                    .await?;
+                let receipt: ClaimReceipt = mode.call(|db| {
+                    let kind = if assignee == &actor_default() {
+                        ActorKind::Human
+                    } else {
+                        ActorKind::Agent
+                    };
+                    db.claim(
+                        &ClaimRequest {
+                            id: args.id.clone(),
+                            assignee: assignee.clone(),
+                            actor_kind: kind,
+                            ttl_seconds: None,
+                        },
+                        now(),
+                    )
+                    .map_err(|e| e.to_string())
+                })?;
                 if !cli.json {
                     println!(
                         "assigned {} to {} ({}) until {}",
@@ -1584,13 +1171,10 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                     );
                 }
             }
-            let body = serde_json::json!({"id": args.id, "patch": patch});
-            let issue: Issue = mode
-                .call("issues.update", &body, |db| {
-                    db.update(&args.id, &patch, &actor, now())
-                        .map_err(|e| e.to_string())
-                })
-                .await?;
+            let issue: Issue = mode.call(|db| {
+                db.update(&args.id, &patch, &actor, now())
+                    .map_err(|e| e.to_string())
+            })?;
             if cli.json {
                 println!(
                     "{}",
@@ -1603,12 +1187,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
         }
         Command::Review { id, pr, commit } => {
             reject_remote_mutation(id, "review")?;
-            let body = serde_json::json!({"id": id});
-            let existing: Issue = mode
-                .call("issues.get", &body, |db| {
-                    db.get(id).map_err(|e| e.to_string())
-                })
-                .await?;
+            let existing: Issue = mode.call(|db| db.get(id).map_err(|e| e.to_string()))?;
             let mut evidence = existing.evidence.clone();
             if let Some(pr) = pr {
                 evidence.retain(|e| e.kind != "pr");
@@ -1623,13 +1202,10 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                 evidence: Some(evidence),
                 ..Default::default()
             };
-            let body = serde_json::json!({"id": id, "patch": patch});
-            let issue: Issue = mode
-                .call("issues.update", &body, |db| {
-                    db.update(id, &patch, &actor, now())
-                        .map_err(|e| e.to_string())
-                })
-                .await?;
+            let issue: Issue = mode.call(|db| {
+                db.update(id, &patch, &actor, now())
+                    .map_err(|e| e.to_string())
+            })?;
             if cli.json {
                 println!(
                     "{}",
@@ -1661,13 +1237,10 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             if let Some(ack) = ack {
                 evidence.push(Evidence::ack(ack.clone()));
             }
-            let body = serde_json::json!({"id": id, "reason": reason, "evidence": evidence});
-            let issue: Issue = mode
-                .call("issues.close", &body, |db| {
-                    db.close(id, reason.as_deref(), &evidence, &actor, now())
-                        .map_err(|e| e.to_string())
-                })
-                .await?;
+            let issue: Issue = mode.call(|db| {
+                db.close(id, reason.as_deref(), &evidence, &actor, now())
+                    .map_err(|e| e.to_string())
+            })?;
             if cli.json {
                 println!(
                     "{}",
@@ -1681,14 +1254,11 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
         Command::Supersede { id, with } => {
             reject_remote_mutation(id, "supersede")?;
             reject_remote_mutation(with, "supersede")?;
-            let body = serde_json::json!({"id": id, "replacement": with});
-            let _: serde_json::Value = mode
-                .call("issues.supersede", &body, |db| {
-                    db.supersede(id, with, &actor, now())
-                        .map(|_| serde_json::json!({"ok": true}))
-                        .map_err(|e| e.to_string())
-                })
-                .await?;
+            let _: serde_json::Value = mode.call(|db| {
+                db.supersede(id, with, &actor, now())
+                    .map(|_| serde_json::json!({"ok": true}))
+                    .map_err(|e| e.to_string())
+            })?;
             println!("{id} superseded by {with}");
             Ok(())
         }
@@ -1703,12 +1273,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             if parent.starts_with("marbles://") {
                 let reference = CanonicalRef::parse(parent)
                     .map_err(|error| format!("invalid canonical remote ref {parent:?}: {error}"))?;
-                let Mode::Local(db) = mode else {
-                    return Err(format!(
-                        "remote dependencies are local client state; `mb dep` over HTTP cannot \
-                         store the verified edge for {reference} (run it against the local store)"
-                    ));
-                };
+                let db = &mode.0;
                 let at = now();
                 if add {
                     let registry = RemoteRegistry::load(&config::remotes_path())
@@ -1751,18 +1316,15 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                 return Ok(());
             }
             reject_remote_mutation(parent, "add a dependency to")?;
-            let body = serde_json::json!({"child": child, "parent": parent});
-            let _: serde_json::Value = mode
-                .call(if add { "deps.add" } else { "deps.remove" }, &body, |db| {
-                    if add {
-                        db.add_dep(child, parent, &actor, now())
-                    } else {
-                        db.remove_dep(child, parent, &actor, now())
-                    }
-                    .map(|_| serde_json::json!({"ok": true}))
-                    .map_err(|e| e.to_string())
-                })
-                .await?;
+            let _: serde_json::Value = mode.call(|db| {
+                if add {
+                    db.add_dep(child, parent, &actor, now())
+                } else {
+                    db.remove_dep(child, parent, &actor, now())
+                }
+                .map(|_| serde_json::json!({"ok": true}))
+                .map_err(|e| e.to_string())
+            })?;
             println!("ok");
             Ok(())
         }
@@ -1772,48 +1334,38 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                 LabelAction::Remove { id, label } => (id, label, false),
             };
             reject_remote_mutation(id, "label")?;
-            let body = serde_json::json!({"id": id, "label": label});
-            let _: serde_json::Value = mode
-                .call(
-                    if add { "labels.add" } else { "labels.remove" },
-                    &body,
-                    |db| {
-                        if add {
-                            db.add_label(id, label, &actor, now())
-                        } else {
-                            db.remove_label(id, label, &actor, now())
-                        }
-                        .map(|_| serde_json::json!({"ok": true}))
-                        .map_err(|e| e.to_string())
-                    },
-                )
-                .await?;
+            let _: serde_json::Value = mode.call(|db| {
+                if add {
+                    db.add_label(id, label, &actor, now())
+                } else {
+                    db.remove_label(id, label, &actor, now())
+                }
+                .map(|_| serde_json::json!({"ok": true}))
+                .map_err(|e| e.to_string())
+            })?;
             println!("ok");
             Ok(())
         }
         Command::Claim { id, as_, ttl } => {
             reject_remote_mutation(id, "claim")?;
             let assignee = as_.clone().unwrap_or_else(|| actor.clone());
-            let body = serde_json::json!({"id": id, "assignee": assignee, "ttl_seconds": ttl});
-            let receipt: ClaimReceipt = mode
-                .call("claims.claim", &body, |db| {
-                    let kind = if assignee == actor_default() {
-                        ActorKind::Human
-                    } else {
-                        ActorKind::Agent
-                    };
-                    db.claim(
-                        &ClaimRequest {
-                            id: id.clone(),
-                            assignee: assignee.clone(),
-                            actor_kind: kind,
-                            ttl_seconds: *ttl,
-                        },
-                        now(),
-                    )
-                    .map_err(|e| e.to_string())
-                })
-                .await?;
+            let receipt: ClaimReceipt = mode.call(|db| {
+                let kind = if assignee == actor_default() {
+                    ActorKind::Human
+                } else {
+                    ActorKind::Agent
+                };
+                db.claim(
+                    &ClaimRequest {
+                        id: id.clone(),
+                        assignee: assignee.clone(),
+                        actor_kind: kind,
+                        ttl_seconds: *ttl,
+                    },
+                    now(),
+                )
+                .map_err(|e| e.to_string())
+            })?;
             if cli.json {
                 println!(
                     "{}",
@@ -1833,38 +1385,30 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
         Command::Touch { id, as_ } => {
             reject_remote_mutation(id, "touch")?;
             let holder = as_.clone().unwrap_or_else(|| actor.clone());
-            let body = serde_json::json!({"id": id, "assignee": holder});
-            let _: serde_json::Value = mode
-                .call("claims.touch", &body, |db| {
-                    db.touch(id, &holder, now())
-                        .map(|e| serde_json::json!({"expires_at": e}))
-                        .map_err(|e| e.to_string())
-                })
-                .await?;
+            let _: serde_json::Value = mode.call(|db| {
+                db.touch(id, &holder, now())
+                    .map(|e| serde_json::json!({"expires_at": e}))
+                    .map_err(|e| e.to_string())
+            })?;
             println!("renewed {id}");
             Ok(())
         }
         Command::Release { id, as_ } => {
             reject_remote_mutation(id, "release")?;
             let holder = as_.clone().unwrap_or_else(|| actor.clone());
-            let body = serde_json::json!({"id": id, "assignee": holder});
-            let _: serde_json::Value = mode
-                .call("claims.release", &body, |db| {
-                    db.release(id, &holder, now())
-                        .map(|_| serde_json::json!({"ok": true}))
-                        .map_err(|e| e.to_string())
-                })
-                .await?;
+            let _: serde_json::Value = mode.call(|db| {
+                db.release(id, &holder, now())
+                    .map(|_| serde_json::json!({"ok": true}))
+                    .map_err(|e| e.to_string())
+            })?;
             println!("released {id}");
             Ok(())
         }
         Command::Sweep => {
-            let report: serde_json::Value = mode
-                .call("claims.sweep", &serde_json::json!({}), |db| {
-                    serde_json::to_value(db.sweep(now()).map_err(|e| e.to_string())?)
-                        .map_err(|e| e.to_string())
-                })
-                .await?;
+            let report: serde_json::Value = mode.call(|db| {
+                serde_json::to_value(db.sweep(now()).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())
+            })?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
@@ -1872,12 +1416,8 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             Ok(())
         }
         Command::History { id } => {
-            let body = serde_json::json!({"id": id});
-            let events: Vec<HistoryEvent> = mode
-                .call("history.get", &body, |db| {
-                    db.history(id).map_err(|e| e.to_string())
-                })
-                .await?;
+            let events: Vec<HistoryEvent> =
+                mode.call(|db| db.history(id).map_err(|e| e.to_string()))?;
             if cli.json {
                 println!(
                     "{}",
@@ -1894,11 +1434,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             Ok(())
         }
         Command::Stats => {
-            let value: serde_json::Value = mode
-                .call("stats", &serde_json::json!({}), |db| {
-                    db.stats().map_err(|e| e.to_string())
-                })
-                .await?;
+            let value: serde_json::Value = mode.call(|db| db.stats().map_err(|e| e.to_string()))?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
@@ -1907,10 +1443,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
         }
         Command::Project { action } => match action {
             ProjectAction::Rm { slug } => {
-                let db = require_local(
-                    mode,
-                    "project rm writes directly; run it where the database lives",
-                )?;
+                let db = &mode.0;
                 let report = db.drop_project(slug).map_err(|e| e.to_string())?;
                 println!(
                     "{}",
@@ -1923,30 +1456,28 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             }
         },
         Command::Projects => {
-            let value: serde_json::Value = mode
-                .call("projects.list", &serde_json::json!({}), |db| {
-                    let view = db.folder_view().map_err(|e| e.to_string())?;
-                    Ok(serde_json::json!(
-                        db.projects()
-                            .map_err(|e| e.to_string())?
-                            .into_iter()
-                            .map(|(slug, root, prefix)| {
-                                let folder = view
-                                    .projects
-                                    .iter()
-                                    .find(|p| p.project == slug)
-                                    .map(|p| p.folder.clone());
-                                serde_json::json!({
-                                    "slug": slug,
-                                    "root": root,
-                                    "prefix": prefix,
-                                    "folder": folder,
-                                })
+            let value: serde_json::Value = mode.call(|db| {
+                let view = db.folder_view().map_err(|e| e.to_string())?;
+                Ok(serde_json::json!(
+                    db.projects()
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .map(|(slug, root, prefix)| {
+                            let folder = view
+                                .projects
+                                .iter()
+                                .find(|p| p.project == slug)
+                                .map(|p| p.folder.clone());
+                            serde_json::json!({
+                                "slug": slug,
+                                "root": root,
+                                "prefix": prefix,
+                                "folder": folder,
                             })
-                            .collect::<Vec<_>>()
-                    ))
-                })
-                .await?;
+                        })
+                        .collect::<Vec<_>>()
+                ))
+            })?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
@@ -1966,13 +1497,11 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                         parent: parent.clone(),
                         created_at: now(),
                     };
-                    let _: serde_json::Value = mode
-                        .call("folders.create", &folder, |db| {
-                            db.ensure_folder(&folder, now())
-                                .map_err(|e| e.to_string())?;
-                            Ok(serde_json::json!({"slug": folder.slug}))
-                        })
-                        .await?;
+                    let _: serde_json::Value = mode.call(|db| {
+                        db.ensure_folder(&folder, now())
+                            .map_err(|e| e.to_string())?;
+                        Ok(serde_json::json!({"slug": folder.slug}))
+                    })?;
                     if cli.json {
                         println!("{}", serde_json::json!({"slug": slug}));
                     } else {
@@ -1980,11 +1509,8 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                     }
                 }
                 FolderAction::List | FolderAction::Tree => {
-                    let view: FolderView = mode
-                        .call("folders.list", &serde_json::json!({}), |db| {
-                            db.folder_view().map_err(|e| e.to_string())
-                        })
-                        .await?;
+                    let view: FolderView =
+                        mode.call(|db| db.folder_view().map_err(|e| e.to_string()))?;
                     if cli.json {
                         println!(
                             "{}",
@@ -2000,14 +1526,11 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                     } else {
                         Some(folder.as_str())
                     };
-                    let body = serde_json::json!({"project": project, "folder": target});
-                    let _: serde_json::Value = mode
-                        .call("projects.move", &body, |db| {
-                            db.set_project_folder(project, target, now())
-                                .map_err(|e| e.to_string())?;
-                            Ok(serde_json::json!({"project": project, "folder": target}))
-                        })
-                        .await?;
+                    let _: serde_json::Value = mode.call(|db| {
+                        db.set_project_folder(project, target, now())
+                            .map_err(|e| e.to_string())?;
+                        Ok(serde_json::json!({"project": project, "folder": target}))
+                    })?;
                     if cli.json {
                         println!(
                             "{}",
@@ -2041,7 +1564,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                         metadata: None,
                         external_ref: None,
                     };
-                    let id = create_issue(mode, &spec).await?;
+                    let id = create_issue(mode, &spec)?;
                     if cli.json {
                         println!("{}", serde_json::json!({"id": id}));
                     } else {
@@ -2050,13 +1573,10 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                 }
                 GoalAction::List { project, all } => {
                     let project = project.clone().or(project_for(cli).ok());
-                    let body = serde_json::json!({"project": project, "all": true});
-                    let issues: Vec<Issue> = mode
-                        .call("issues.list", &body, |db| {
-                            db.list(project.as_deref(), true, None)
-                                .map_err(|e| e.to_string())
-                        })
-                        .await?;
+                    let issues: Vec<Issue> = mode.call(|db| {
+                        db.list(project.as_deref(), true, None)
+                            .map_err(|e| e.to_string())
+                    })?;
                     let mut goals = report::goal_summaries(&issues, project.as_deref());
                     if !*all {
                         goals.retain(|goal| goal.status != "closed");
@@ -2085,18 +1605,11 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                     }
                 }
                 GoalAction::Show { id } => {
-                    let root: Issue = mode
-                        .call("issues.get", &serde_json::json!({"id": id}), |db| {
-                            db.get(id).map_err(|e| e.to_string())
-                        })
-                        .await?;
-                    let body = serde_json::json!({"project": root.project, "all": true});
-                    let issues: Vec<Issue> = mode
-                        .call("issues.list", &body, |db| {
-                            db.list(Some(&root.project), true, None)
-                                .map_err(|e| e.to_string())
-                        })
-                        .await?;
+                    let root: Issue = mode.call(|db| db.get(id).map_err(|e| e.to_string()))?;
+                    let issues: Vec<Issue> = mode.call(|db| {
+                        db.list(Some(&root.project), true, None)
+                            .map_err(|e| e.to_string())
+                    })?;
                     let progress = report::progress_for(&issues, &root.id);
                     let lines = report::tree_lines(&issues, &root.id);
                     if cli.json {
@@ -2126,11 +1639,8 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
         Command::Epic { action } => {
             match action {
                 EpicAction::Create { goal, args } => {
-                    let goal_issue: Issue = mode
-                        .call("issues.get", &serde_json::json!({"id": goal}), |db| {
-                            db.get(goal).map_err(|e| e.to_string())
-                        })
-                        .await?;
+                    let goal_issue: Issue =
+                        mode.call(|db| db.get(goal).map_err(|e| e.to_string()))?;
                     if goal_issue.issue_type != "goal" {
                         return Err(format!("{goal} is a {}, not a goal", goal_issue.issue_type));
                     }
@@ -2156,7 +1666,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                         metadata: None,
                         external_ref: None,
                     };
-                    let id = create_issue(mode, &spec).await?;
+                    let id = create_issue(mode, &spec)?;
                     if cli.json {
                         println!("{}", serde_json::json!({"id": id}));
                     } else {
@@ -2169,11 +1679,8 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
         Command::Task { action } => {
             match action {
                 TaskAction::Create { epic, args } => {
-                    let epic_issue: Issue = mode
-                        .call("issues.get", &serde_json::json!({"id": epic}), |db| {
-                            db.get(epic).map_err(|e| e.to_string())
-                        })
-                        .await?;
+                    let epic_issue: Issue =
+                        mode.call(|db| db.get(epic).map_err(|e| e.to_string()))?;
                     if epic_issue.issue_type != "epic" {
                         return Err(format!(
                             "{epic} is a {}, not an epic",
@@ -2202,7 +1709,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                         metadata: None,
                         external_ref: None,
                     };
-                    let id = create_issue(mode, &spec).await?;
+                    let id = create_issue(mode, &spec)?;
                     if cli.json {
                         println!("{}", serde_json::json!({"id": id}));
                     } else {
@@ -2221,30 +1728,22 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             let root = goal.as_ref().or(epic.as_ref());
             let mut project = project.clone().or(project_for(cli).ok());
             let issues: Vec<Issue> = if let Some(root_id) = root {
-                let root_issue: Issue = mode
-                    .call("issues.get", &serde_json::json!({"id": root_id}), |db| {
-                        db.get(root_id).map_err(|e| e.to_string())
-                    })
-                    .await?;
+                let root_issue: Issue =
+                    mode.call(|db| db.get(root_id).map_err(|e| e.to_string()))?;
                 project = Some(root_issue.project.clone());
-                let body = serde_json::json!({"project": root_issue.project, "all": true});
-                let all: Vec<Issue> = mode
-                    .call("issues.list", &body, |db| {
-                        db.list(Some(&root_issue.project), true, None)
-                            .map_err(|e| e.to_string())
-                    })
-                    .await?;
+                let all: Vec<Issue> = mode.call(|db| {
+                    db.list(Some(&root_issue.project), true, None)
+                        .map_err(|e| e.to_string())
+                })?;
                 let ids = report::descendant_ids(&all, root_id);
                 all.into_iter()
                     .filter(|i| i.id != *root_id && ids.contains(&i.id))
                     .collect()
             } else {
-                let body = serde_json::json!({"project": project, "all": true});
-                mode.call("issues.list", &body, |db| {
+                mode.call(|db| {
                     db.list(project.as_deref(), true, None)
                         .map_err(|e| e.to_string())
-                })
-                .await?
+                })?
             };
             let report = report::burndown(&issues, *days, now());
             if cli.json {
@@ -2282,24 +1781,13 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             days,
             stale_days,
         } => {
-            let view: FolderView = mode
-                .call("folders.list", &serde_json::json!({}), |db| {
-                    db.folder_view().map_err(|e| e.to_string())
-                })
-                .await?;
-            let mut projects: Vec<report::ProjectInfo> = mode
-                .call("projects.list", &serde_json::json!({}), |db| {
-                    project_infos(db)
-                })
-                .await?;
+            let view: FolderView = mode.call(|db| db.folder_view().map_err(|e| e.to_string()))?;
+            let mut projects: Vec<report::ProjectInfo> = mode.call(project_infos)?;
             if let Some(folder) = folder {
                 projects.retain(|project| project.folder.as_deref() == Some(folder.as_str()));
             }
-            let issues: Vec<Issue> = mode
-                .call("issues.list", &serde_json::json!({"all": true}), |db| {
-                    db.list(None, true, None).map_err(|e| e.to_string())
-                })
-                .await?;
+            let issues: Vec<Issue> =
+                mode.call(|db| db.list(None, true, None).map_err(|e| e.to_string()))?;
             let report =
                 report::portfolio(&projects, &view.folders, &issues, now(), *days, *stale_days);
             if cli.json {
@@ -2313,10 +1801,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             Ok(())
         }
         Command::Backup { to } => {
-            let db = require_local(
-                mode,
-                "backup reads the server's database file; run it on the host that owns --url",
-            )?;
+            let db = &mode.0;
             let report = db.backup(to).map_err(|e| e.to_string())?;
             if cli.json {
                 println!(
@@ -2338,13 +1823,11 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
         }
         Command::Plan { action } => match action {
             PlanAction::Show { plan } => {
-                let view: marbles::plan::PlanView = mode
-                    .call("plans.show", &serde_json::json!({"plan": plan}), |db| {
-                        marbles::plan::load(db, plan)
-                            .and_then(|graph| graph.view())
-                            .map_err(|e| e.to_string())
-                    })
-                    .await?;
+                let view: marbles::plan::PlanView = mode.call(|db| {
+                    marbles::plan::load(db, plan)
+                        .and_then(|graph| graph.view())
+                        .map_err(|e| e.to_string())
+                })?;
                 if cli.json {
                     println!(
                         "{}",
@@ -2356,12 +1839,10 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                 Ok(())
             }
             PlanAction::Gantt { plan } => {
-                let gantt: marbles::plan::Gantt = mode
-                    .call("plans.gantt", &serde_json::json!({"plan": plan}), |db| {
-                        let graph = marbles::plan::load(db, plan).map_err(|e| e.to_string())?;
-                        marbles::plan::gantt(&graph, now()).map_err(|e| e.to_string())
-                    })
-                    .await?;
+                let gantt: marbles::plan::Gantt = mode.call(|db| {
+                    let graph = marbles::plan::load(db, plan).map_err(|e| e.to_string())?;
+                    marbles::plan::gantt(&graph, now()).map_err(|e| e.to_string())
+                })?;
                 if cli.json {
                     println!(
                         "{}",
@@ -2373,12 +1854,10 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                 Ok(())
             }
             PlanAction::Ready { plan } => {
-                let frontier: marbles::plan::ReadyView = mode
-                    .call("plans.ready", &serde_json::json!({"plan": plan}), |db| {
-                        let graph = marbles::plan::load(db, plan).map_err(|e| e.to_string())?;
-                        marbles::plan::ready(&graph, now()).map_err(|e| e.to_string())
-                    })
-                    .await?;
+                let frontier: marbles::plan::ReadyView = mode.call(|db| {
+                    let graph = marbles::plan::load(db, plan).map_err(|e| e.to_string())?;
+                    marbles::plan::ready(&graph, now()).map_err(|e| e.to_string())
+                })?;
                 if cli.json {
                     println!(
                         "{}",
@@ -2423,11 +1902,8 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                     }
                     return Ok(());
                 }
-                let report: marbles::plan::CreateReport = mode
-                    .call("plans.create", &resolved, |db| {
-                        marbles::plan::create(db, &resolved, now(), &actor)
-                    })
-                    .await?;
+                let report: marbles::plan::CreateReport =
+                    mode.call(|db| marbles::plan::create(db, &resolved, now(), &actor))?;
                 if cli.json {
                     println!(
                         "{}",
@@ -2449,11 +1925,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
         } => {
             let jsonl = looks_like_jsonl(file)?;
             let report = if jsonl {
-                let db = require_local(
-                    mode,
-                    "JSONL import (with --rewrite-prefix/--dry-run) writes directly; \
-                     run it where the database lives, or convert to the array form for HTTP",
-                )?;
+                let db = &mode.0;
                 db.ensure_project(
                     project,
                     &root
@@ -2477,8 +1949,8 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                         "--dry-run/--rewrite-prefix apply to the JSONL import path only".into(),
                     );
                 }
-                if let Mode::Local(db) = &mode {
-                    db.ensure_project(
+                mode.0
+                    .ensure_project(
                         project,
                         &root
                             .clone()
@@ -2486,16 +1958,9 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
                         &prefix.clone().unwrap_or_else(|| project.clone()),
                     )
                     .map_err(|e| e.to_string())?;
-                    // In server mode the project must already be registered
-                    // (`marbles init` with MARBLES_URL); the API enforces it.
-                }
                 let rows = marbles::import::read_export(file)?;
-                let body = serde_json::json!({"project": project, "rows": rows});
-                let imported: marbles::import::Report = mode
-                    .call("issues.import", &body, |db| {
-                        marbles::import::import(db, project, &rows)
-                    })
-                    .await?;
+                let imported: marbles::import::Report =
+                    mode.call(|db| marbles::import::import(db, project, &rows))?;
                 serde_json::to_value(imported).map_err(|e| e.to_string())?
             };
             println!(
@@ -2534,7 +1999,7 @@ async fn run(cli: &Cli, mode: &Mode, effective_url: Option<&str>) -> Result<(), 
             Ok(())
         }
         Command::Store { action } => run_store(action, cli.json),
-        Command::Remote { action } => run_remote(action, cli.json).await,
+        Command::Remote { action } => run_remote(action, cli.json),
         Command::Remotes => run_remotes(cli.json),
     }
 }
@@ -2752,7 +2217,7 @@ fn audit_remote_dependencies(
 /// Pinned remotes are local client state: `$MARBLES_HOME/remotes.json`, never the tracker API.
 /// A pin proves *who* a remote is for read-only aggregation; it can never authorize a write, and
 /// `remove`/`rotate` never mutate the remote itself.
-async fn run_remote(action: &RemoteAction, json: bool) -> Result<(), String> {
+fn run_remote(action: &RemoteAction, json: bool) -> Result<(), String> {
     let path = config::remotes_path();
     match action {
         RemoteAction::Add {
@@ -2761,7 +2226,6 @@ async fn run_remote(action: &RemoteAction, json: bool) -> Result<(), String> {
             descriptor,
         } => {
             let text = descriptor_from_arg(descriptor)
-                .await
                 .map_err(|err| format!("descriptor rejected: {err}"))?;
             let mut registry = RemoteRegistry::load(&path).map_err(|err| err.to_string())?;
             let record = registry
@@ -2916,7 +2380,6 @@ async fn run_remote(action: &RemoteAction, json: bool) -> Result<(), String> {
             overlap_seconds,
         } => {
             let text = descriptor_from_arg(descriptor)
-                .await
                 .map_err(|err| format!("descriptor rejected: {err}"))?;
             let mut registry = RemoteRegistry::load(&path).map_err(|err| err.to_string())?;
             let record = registry
@@ -3015,14 +2478,6 @@ fn run_remotes(json: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// The URL the current command is actually using. Remote client selection is resolved before
-/// `run`; only genuine local mode falls back to the server's loopback listen address.
-fn reported_url(effective_url: Option<&str>) -> String {
-    effective_url
-        .map(str::to_owned)
-        .unwrap_or_else(|| config::server_config().listen)
-}
-
 /// Merge `mb create`'s plan-metadata sugar into one JSON object. Explicit `--metadata` keys win
 /// only when the sugar is absent, so neither form silently shadows the other.
 fn plan_node_metadata(args: &CreateArgs) -> Result<serde_json::Value, String> {
@@ -3068,37 +2523,6 @@ fn read_spec_arg(value: &str) -> Result<String, String> {
     match std::fs::read_to_string(value) {
         Ok(text) => Ok(text),
         Err(_) => Ok(value.to_string()),
-    }
-}
-
-fn read_bearer_file(path: &std::path::Path) -> Result<String, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("opening bearer file: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = file
-            .metadata()
-            .map_err(|e| e.to_string())?
-            .permissions()
-            .mode();
-        if mode & 0o077 != 0 {
-            return Err("bearer file must be private (chmod 0600)".into());
-        }
-    }
-    let mut value = String::new();
-    std::io::Read::read_to_string(&mut std::io::Read::take(file, 16385), &mut value)
-        .map_err(|e| format!("reading bearer file: {e}"))?;
-    let token = value.trim();
-    if token.is_empty() || value.len() > 16384 || token.chars().any(char::is_whitespace) {
-        return Err("bearer file must contain one nonempty token of at most 16 KiB".into());
-    }
-    Ok(token.to_owned())
-}
-
-fn require_local<'a>(mode: &'a Mode, hint: &str) -> Result<&'a Arc<Db>, String> {
-    match mode {
-        Mode::Local(db) => Ok(db),
-        Mode::Http(_) => Err(hint.to_string()),
     }
 }
 
@@ -3234,47 +2658,5 @@ fn print_readiness(cli: &Cli, rows: &[report::ReadinessRow]) {
                 row.blocking_reasons.join(", ")
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod cli_tests {
-    use super::reported_url;
-
-    #[test]
-    fn url_reports_the_selected_remote_instead_of_the_local_listen_default() {
-        assert_eq!(
-            reported_url(Some("https://marbles.fpl.dev")),
-            "https://marbles.fpl.dev"
-        );
-    }
-    #[test]
-    fn private_bearer_file_is_read_fresh_and_rejects_empty_values() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("token");
-        std::fs::write(&path, "first\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        assert_eq!(super::read_bearer_file(&path).unwrap(), "first");
-        std::fs::write(&path, "rotated\n").unwrap();
-        assert_eq!(super::read_bearer_file(&path).unwrap(), "rotated");
-        std::fs::write(&path, " \n").unwrap();
-        assert!(super::read_bearer_file(&path).is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn bearer_file_rejects_publicly_readable_secrets() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("token");
-        std::fs::write(&path, "private-value").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let error = super::read_bearer_file(&path).unwrap_err();
-        assert!(error.contains("0600"));
-        assert!(!error.contains("private-value"));
     }
 }
