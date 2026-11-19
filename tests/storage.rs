@@ -214,8 +214,14 @@ fn heartbeat_renews_the_holder_and_only_the_holder() {
         db.touch(&id, "agent-b", now()).is_err(),
         "renewal is holder-only"
     );
+    let pending_before = db.pending_events(2_000_000_000, 100).unwrap().len();
     let expiry = db.touch(&id, "agent-a", now() + 30).unwrap();
     assert!(expiry > now() + 30);
+    let pending_after = db.pending_events(2_000_000_000, 100).unwrap().len();
+    assert_eq!(
+        pending_after, pending_before,
+        "a heartbeat is audit history, not an outbound event"
+    );
 }
 
 // ---- sweep ----
