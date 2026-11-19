@@ -42,10 +42,56 @@ fn run() -> Result<(), String> {
         .map(|(key, value)| (key.to_string(), value))
         .collect::<BTreeMap<_, _>>();
     let invocation = records_cli::parse(&argv, &env)?;
-    let store = Adapter::open("marbles".into()).map_err(|error| error.to_string())?;
+    let mut store = Adapter::open("marbles".into()).map_err(|error| error.to_string())?;
     let now = store::now();
-    execute(&store, &invocation, now)
+    let outcome = execute(&store, &invocation, now);
+    // After the write is committed, not before: a record that never landed must
+    // not be announced, and a bus that is down must not undo the record.
+    if outcome.is_ok() {
+        publish_pending(&mut store, now);
+    }
+    outcome
 }
+
+/// Publish what this invocation recorded, once it is committed.
+///
+/// The records host does not know a bus exists; the command composes the two
+/// capabilities itself, which is why this lives here and not in the host. The
+/// outbox row is the ledger: a failed publish leaves `delivered_at` empty and a
+/// later `mb` invocation retries it, so a bus outage costs a notification, not
+/// the write.
+#[cfg(all(feature = "soil", target_arch = "wasm32"))]
+fn publish_pending(store: &mut Adapter, now: i64) {
+    let Ok(events) = store.pending_events(now, 64) else {
+        return;
+    };
+    for event in events {
+        let kind = format!("marbles.issue.{}.v1", event.event);
+        let body = serde_json::json!({
+            "seq": event.seq,
+            "store_id": event.store_id,
+            "project": event.project,
+            "issue_id": event.issue_id,
+            "occurred_at": event.occurred_at,
+            "event": event.event,
+        })
+        .to_string();
+        match soil_sdk_unibus::soil::unibus::bus::publish(&kind, body.as_bytes(), None, 0) {
+            Ok(_) => {
+                let _ = store.mark_event_delivered(event.seq, now);
+            }
+            Err(error) => {
+                let _ = store.mark_event_failed(event.seq, now + 60_000, &format!("{error:?}"));
+            }
+        }
+    }
+}
+
+/// A host binary has no bus to publish on, and no outbox to drain: the native
+/// `mb` is a client of the server, which owns delivery.
+#[cfg(not(all(feature = "soil", target_arch = "wasm32")))]
+fn publish_pending(_store: &mut Adapter, _now: i64) {}
+
 
 /// The only environment a caller can use to scope an invocation. A Spore has no
 /// ambient environment; these three are the documented `mb` contract, and the

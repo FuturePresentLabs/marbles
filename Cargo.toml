@@ -10,7 +10,7 @@ repository  = "https://github.com/FuturePresentLabs/marbles"
 [features]
 default = ["native"]
 native = []
-soil = ["dep:soil-sdk-records"]
+soil = ["dep:soil-sdk-records", "dep:soil-sdk-unibus"]
 
 [dependencies]
 chrono      = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -18,7 +18,10 @@ serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 thiserror   = "2"
 getrandom   = "0.3"
-soil-sdk-records = { git = "https://github.com/mycelium-linux/soil.git", rev = "fc010d45218826b6cf980a352b526c48e0691d45", optional = true }
+soil-sdk-records = { git = "https://github.com/mycelium-linux/soil.git", rev = "bc1495575b6b78dfdef337f5bc42e5d141ab2190", optional = true }
+# Publishing after the write is the Spore's job, not the records host's: the
+# host links both interfaces, and the command composes them.
+soil-sdk-unibus = { git = "https://github.com/mycelium-linux/soil.git", rev = "bc1495575b6b78dfdef337f5bc42e5d141ab2190", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 axum        = "0.8"

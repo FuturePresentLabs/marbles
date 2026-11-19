@@ -100,6 +100,10 @@ name = "mb"
 version = "$VERSION"
 summary = "Marbles task tracker over soil:records"
 module = "module.wasm"
+# The two capabilities this command composes: records to write, the bus to
+# publish what it wrote. Without the second the command still works and simply
+# never announces anything, which is why it is listed here rather than assumed.
+requires = ["soil:records", "soil:unibus"]
 
 [limits]
 timeout_ms = 300000
