@@ -52,10 +52,14 @@ That builds `mb.wasm` for `wasm32-wasip2`, installs it as a command package, and
 `soil-command shims` to generate `mb` — see [`docs/records-backend.md`](docs/records-backend.md).
 It needs a `soil-command` from a Soil checkout on `PATH`.
 
-**`marbles` — the local CLI.** The native binary. It covers the operations the spore does not
-have yet: `init`, `import-bd`, `plan`, `portfolio`, `burndown`, the `folder`/`goal`/`epic`/`task`
-hierarchy, `backup`, `doctor`, and store identity. It reads and writes its own SQLite file at
-`~/.marbles/marbles.db`, so a project must not be split across both.
+**`marbles` — the local CLI.** The native binary. It is now only for work that belongs to the
+machine rather than to the book: `init` and `setup` (they write `.marbles/project.toml` and the
+`AGENTS.md` block), `import-bd` (it reads a Beads export from the filesystem), `backup` (the host
+owns the records book), and `store`/`remote`/`remotes` (native Ed25519 store identity and the
+on-disk remote pin registry). Everything else — `create`, `update`, `claim`, `close`, `plan`,
+`portfolio`, `burndown`, `folder`, `goal`/`epic`/`task`, `project rm`, `doctor` — runs on both
+interfaces. It reads and writes its own SQLite file at `~/.marbles/marbles.db`, so a project must
+not be split across both.
 
 From a tagged release (Linux x86-64 and ARM64, macOS ARM64):
 
@@ -346,17 +350,31 @@ mb label add <id> bug ; mb label remove <id> bug
 
 # Local CLI only — `marbles` (a separate SQLite store)
 marbles init [--folder NAME] [--slug S] [--prefix P]
-marbles update <id> --status blocked --append-notes "waiting on …"
-marbles folder create "Business" --slug business
-marbles folder tree ; marbles folder move <project> <folder|none>
-marbles goal create "Ship v1" -p 1
-marbles epic create "Storage" --goal <goal-id>
-marbles task create "Write the WAL test" --epic <epic-id>
-marbles goal list ; marbles goal show <goal-id>
-marbles burndown --project <project> --days 30 [--json]
-marbles portfolio [--folder <slug>] [--days N] [--stale-days N] [--json]
-marbles projects ; marbles stats ; marbles sweep
-marbles doctor ; marbles backup <new-path>
+marbles setup [--profile maintainer] [--target AGENTS.md] [--remove]
+marbles import-bd beads.jsonl --project myrepo [--dry-run]
+marbles backup <new-path>
+marbles store identity init | show | rotate
+marbles remote add|list|show|assertions|remove|rotate
+marbles remotes
+```
+
+Everything else is on both interfaces. The records Spore answers the same commands with the
+same JSON shapes:
+
+```bash
+mb update <id> --status blocked --append-notes "waiting on …"
+mb folder create "Business" --slug business
+mb folder list ; mb folder tree ; mb folder move <project> <folder|none>
+mb goal create "Ship v1" -p 1
+mb epic create "Storage" --goal <goal-id>
+mb task create "Write the WAL test" --epic <epic-id>
+mb goal list [--all] ; mb goal show <goal-id>
+mb burndown --project <project> --days 30
+mb portfolio [--folder <slug>] [--days N] [--stale-days N]
+mb plan show|gantt|ready <plan>
+mb plan create <spec|-> [--dry-run]
+mb project rm <slug>
+mb doctor
 ```
 
 ## Migrating from Beads
@@ -387,9 +405,11 @@ The HTTP server, its auth stack, the PostgreSQL backend, the webhook/Unibus outb
 Canvas viewer have been removed. There is one writer per lineage, and it is a store, not a
 process.
 
-`v0.x`: interface-first. The JSON shapes are what we intend to freeze before 1.0. Porting the
-remaining local-only reads (`plan`, `portfolio`, `burndown`, `folder`, `goal`/`epic`/`task`) to
-the spore is the next step; today they require the native binary and therefore a second store.
+`v0.x`: interface-first. The JSON shapes are what we intend to freeze before 1.0. The records
+spore now answers the whole read surface (`plan`, `portfolio`, `burndown`, `folder`,
+`goal`/`epic`/`task`, `update`, `project rm`, `doctor`) as well as the agent workflow; what stays
+native is only the work that needs the host's filesystem or a native store identity (`init`,
+`setup`, `import-bd`, `backup`, `store`, `remote`/`remotes`).
 
 ## Attribution
 
