@@ -146,6 +146,18 @@ become non-destructive.
 | `history` + `outbound_event` | `marbles_event` / `outbound_event` | `["seq"]` | One `seq` feeds both, mirroring SQLite's `last_insert_rowid()` feeding both inserts in `log_event`. |
 | `store_meta`            | `store_meta`      | `["key"]`                   | Stores the store id under key `store_id`. |
 
+### Composite keys in one records collection
+
+A record is addressed by `<type>/<json-array>`. For a multi-column key
+(`dependency` = child→parent, `remote_dep` = child + canonical ref) Marbles'
+importer writes **one** array element whose components are joined by the ASCII
+unit separator, e.g. `dependency/["child\u001fparent"]`. The Spore reads that
+spelling and the older multi-element array, and writes the importer's spelling;
+both parse to the same `Key` and a load keeps one, so an edge is never counted
+twice. Writing the other spelling would make every imported dependency invisible
+to `ready`, `show`, and `close` — the failure mode is silent, so it is covered by
+unit tests on the encoder rather than left to a live book to reveal.
+
 ### Revisions, tombstones, and the "current" view
 
 - `Engine::append(name, key, data, deleted, at)` pushes a `Revision { seq, key, data, deleted }`

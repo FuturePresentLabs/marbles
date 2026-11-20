@@ -27,7 +27,10 @@ use std::cell::{Cell, RefCell};
 use serde_json::Value;
 use soil_sdk_records::{Book, CasResult as SoilCasResult, Version as SoilVersion};
 
-use crate::records::{CasResult, Key, Name, RecordSchema, Revision, Version};
+use crate::records::{
+    CasResult, Key, Name, RecordSchema, Revision, Version, entity_id, legacy_entity_id,
+    parse_entity_id,
+};
 
 const COLLECTION: &str = "marbles";
 /// Records per `scan` call while reading one type.
@@ -99,16 +102,22 @@ impl SoilEngine {
     }
 
     fn id(name: &str, key: &Key) -> String {
-        format!(
-            "{name}/{}",
-            serde_json::to_string(&key.0).expect("key serializes")
-        )
+        entity_id(name, key)
     }
 
-    fn parse_id(id: &str) -> Option<(&str, Key)> {
-        let (name, encoded) = id.split_once('/')?;
-        let key = serde_json::from_str::<Vec<String>>(encoded).ok()?;
-        Some((name, Key::new(key)))
+    fn parse_id(id: &str) -> Option<(String, Key)> {
+        parse_entity_id(id)
+    }
+
+    /// Remove the pre-fix two-element encoding of the same composite key, so an
+    /// old duplicate cannot survive a tombstone and resurrect the edge.
+    fn retire_legacy(book: &Book, name: &str, key: &Key) {
+        let Some(legacy) = legacy_entity_id(name, key) else {
+            return;
+        };
+        if book.get(legacy.clone()).ok().flatten().is_some() {
+            let _ = book.delete(legacy);
+        }
     }
 
     fn book() -> Book {
@@ -116,7 +125,13 @@ impl SoilEngine {
     }
 
     fn entry_current(name: &str, key: &Key) -> Option<soil_sdk_records::Entry> {
-        Self::book().get(Self::id(name, key)).ok().flatten()
+        let book = Self::book();
+        if let Some(entry) = book.get(Self::id(name, key)).ok().flatten() {
+            return Some(entry);
+        }
+        // A composite key written by the old Spore lives under its other spelling.
+        let legacy = legacy_entity_id(name, key)?;
+        book.get(legacy).ok().flatten()
     }
 
     pub fn define(&mut self, schema: RecordSchema) -> Result<(), String> {
@@ -144,13 +159,17 @@ impl SoilEngine {
         // `.expect`s, so a contended store aborted the guest with a wasm
         // backtrace and no indication of which write had failed.
         if deleted {
-            book.delete(id.clone())
-                .unwrap_or_else(|error| panic!("soil:records delete {id}: {error}"));
+            // A legacy-only record has no canonical entry to delete.
+            if book.get(id.clone()).ok().flatten().is_some() {
+                book.delete(id.clone())
+                    .unwrap_or_else(|error| panic!("soil:records delete {id}: {error}"));
+            }
         } else {
             let body = serde_json::to_vec(&data).expect("record body serializes");
             book.upsert(id.clone(), Self::schema_id(name), body)
                 .unwrap_or_else(|error| panic!("soil:records upsert {id}: {error}"));
         }
+        Self::retire_legacy(&book, name, key);
         let seq = self.next_seq();
         self.invalidate();
         seq
@@ -209,6 +228,9 @@ impl SoilEngine {
             }
         }
         records.sort_by(|left, right| left.0.cmp(&right.0));
+        // The two spellings of a composite key parse to the same `Key`; keep one
+        // so an edge is not counted (or offered) twice.
+        records.dedup_by(|left, right| left.0 == right.0);
         self.types.borrow_mut().insert(name.to_string(), records);
     }
 
