@@ -5,15 +5,21 @@
 //! in local mode and against the hosted API.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
+// Remote-federation views depend on the native identity/assertion machinery;
+// the issue-graph reports below do not, and compile for the wasm Spore.
+#[cfg(not(target_arch = "wasm32"))]
 use crate::assertion_cache::{AssertionCache, AssertionFreshness, AssertionView};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::identity::RemoteRegistry;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::refs::{ReceiptState, ReferenceAudit};
 use crate::types::{Folder, Issue, STATUSES};
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Progress {
@@ -782,7 +788,7 @@ pub fn dashboard(
     stale_days: i64,
     default_estimate_min: i64,
     now: i64,
-) -> Result<Dashboard, crate::db::Error> {
+) -> Result<Dashboard, crate::store::Error> {
     let days = days.max(1);
     let selected = scope_issues(all_issues, projects, &scope);
     let work: Vec<&Issue> = selected
@@ -863,6 +869,7 @@ pub fn dashboard(
 /// This is a projection of local client state (`remotes.json` + the assertion cache). It is not a
 /// project, issue, or folder row, and nothing in the projection can create one: a remote store is
 /// listed here precisely so it never has to look like local work.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteWorkspaceEntry {
     pub name: String,
@@ -884,6 +891,7 @@ pub struct RemoteWorkspaceEntry {
 }
 
 /// The whole read-only Remotes workspace: pinned stores, their identities, and freshness.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemotesWorkspace {
     pub registry: String,
@@ -905,6 +913,7 @@ pub struct RemotesWorkspace {
 /// * only when every reference verifies inside the window is the remote `fresh`.
 ///
 /// No references means `unknown`, never `fresh`/zero.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn remote_workspace_freshness(views: &[AssertionView]) -> AssertionFreshness {
     let mut stale = false;
     let mut fresh = false;
@@ -925,6 +934,7 @@ pub fn remote_workspace_freshness(views: &[AssertionView]) -> AssertionFreshness
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn remote_entry(
     registry: &RemoteRegistry,
     cache: &AssertionCache,
@@ -972,6 +982,7 @@ impl ReadinessRow {
 ///
 /// A verified receipt prints all six fields explicitly. A rejected one prints the named state and
 /// the evidence anyway: hiding it would make the rejection unauditable.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn audit_receipt_line(audit: &ReferenceAudit) -> String {
     match &audit.receipt {
         Some(receipt) if audit.state == ReceiptState::Verified => format!(
@@ -1002,6 +1013,7 @@ pub fn audit_receipt_line(audit: &ReferenceAudit) -> String {
 }
 
 /// The strict verdict for one remote dependency edge.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteGate {
     /// A fresh, signature-verified assertion says the remote issue is `closed`.
@@ -1016,6 +1028,7 @@ pub enum RemoteGate {
 /// not good enough even when it says `closed`: an old claim about a remote issue cannot make local
 /// work claimable. `unknown` (never observed, or an unreachable remote) and `unverifiable` (bad
 /// signature, retired key, wrong store/issue) both block, as does a fresh non-`closed` state.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn remote_gate(view: &AssertionView) -> RemoteGate {
     match view.freshness {
         AssertionFreshness::Fresh => match view.asserted_state() {
@@ -1044,6 +1057,7 @@ pub fn remote_gate(view: &AssertionView) -> RemoteGate {
 /// A missing registry is an empty workspace (`registry_present = false`), not an error. A corrupt
 /// registry is rejected by [`RemoteRegistry::load`] before this function runs, so the CLI fails
 /// closed with a named error rather than showing a half-built view.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn remotes_workspace(
     registry: &RemoteRegistry,
     cache: &AssertionCache,

@@ -236,10 +236,238 @@ fn transport_flags_are_refused_by_name() {
 
 #[test]
 fn an_unknown_command_lists_what_works() {
-    let error = parse_error(&["portfolio"]);
-    assert!(error.contains("portfolio"), "{error}");
-    for command in ["ready", "review", "touch", "stats"] {
+    let error = parse_error(&["frobnicate"]);
+    assert!(error.contains("frobnicate"), "{error}");
+    for command in ["ready", "review", "touch", "stats", "plan", "portfolio"] {
         assert!(error.contains(command), "{error} should name {command}");
+    }
+}
+
+#[test]
+fn native_only_commands_say_what_they_need_instead_of_looking_typoed() {
+    for command in [
+        "init",
+        "setup",
+        "import-bd",
+        "backup",
+        "store",
+        "remote",
+        "remotes",
+    ] {
+        let error = parse_error(&[command]);
+        assert!(error.contains("native `marbles`"), "{command}: {error}");
+        assert!(
+            !error.contains("unknown command"),
+            "{command} is known, just native: {error}"
+        );
+    }
+    assert!(parse_error(&["init"]).contains("filesystem"));
+    assert!(parse_error(&["store"]).contains("Ed25519"));
+}
+
+#[test]
+fn equals_joined_flags_are_the_same_spelling_as_separate_arguments() {
+    // clap accepts `--ttl=60`; a script written against the native CLI should
+    // not have to learn a second spelling.
+    let joined = parse(&["claim", "marbles-1", "--ttl=60", "--as=worker-1"]);
+    let separate = parse(&["claim", "marbles-1", "--ttl", "60", "--as", "worker-1"]);
+    assert_eq!(joined.request, separate.request);
+}
+
+#[test]
+fn update_parses_every_native_field_and_keeps_metadata_verbatim() {
+    let request = parse(&[
+        "update",
+        "marbles-1",
+        "--title",
+        "new title",
+        "--description",
+        "new body",
+        "--status",
+        "review",
+        "--priority",
+        "1",
+        "--append-notes",
+        "more",
+        "--assignee",
+        "worker-2",
+        "--metadata",
+        r#"{"a":1}"#,
+        "--set-metadata",
+        "b=two",
+    ])
+    .request;
+    match request {
+        Request::Update(args) => {
+            assert_eq!(args.id, "marbles-1");
+            assert_eq!(args.title.as_deref(), Some("new title"));
+            assert_eq!(args.status.as_deref(), Some("review"));
+            assert_eq!(args.priority, Some(1));
+            assert_eq!(args.assignee.as_deref(), Some("worker-2"));
+            assert_eq!(args.metadata.as_deref(), Some(r#"{"a":1}"#));
+            assert_eq!(
+                args.set_metadata,
+                Some(("b".to_string(), "two".to_string()))
+            );
+        }
+        other => panic!("expected an update, got {other:?}"),
+    }
+    let error = parse_error(&["update", "marbles-1", "--set-metadata", "no-equals"]);
+    assert!(error.contains("key=value"), "{error}");
+}
+
+#[test]
+fn folder_actions_and_the_unfile_spellings() {
+    assert!(matches!(
+        parse(&["folder", "create", "Work Stuff", "--parent", "personal"]).request,
+        Request::Folder(records_cli::FolderAction::Create { .. })
+    ));
+    assert!(matches!(
+        parse(&["folder", "list"]).request,
+        Request::Folder(records_cli::FolderAction::List)
+    ));
+    assert!(matches!(
+        parse(&["folder", "tree"]).request,
+        Request::Folder(records_cli::FolderAction::Tree)
+    ));
+    for unfiled in ["none", "-", ""] {
+        assert!(matches!(
+            parse(&["folder", "move", "soil", unfiled]).request,
+            Request::Folder(records_cli::FolderAction::Move { folder: None, .. })
+        ));
+    }
+    assert!(matches!(
+        parse(&["folder", "move", "soil", "work"]).request,
+        Request::Folder(records_cli::FolderAction::Move {
+            folder: Some(_),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn goal_epic_and_task_take_the_native_shape() {
+    assert!(matches!(
+        parse(&[
+            "goal",
+            "create",
+            "Ship it",
+            "-p",
+            "1",
+            "--available-at",
+            "0"
+        ])
+        .request,
+        Request::Goal(records_cli::GoalAction::Create(_))
+    ));
+    assert!(matches!(
+        parse(&["goal", "list", "--all"]).request,
+        Request::Goal(records_cli::GoalAction::List { all: true })
+    ));
+    assert!(matches!(
+        parse(&["goal", "show", "marbles-1"]).request,
+        Request::Goal(records_cli::GoalAction::Show { .. })
+    ));
+    match parse(&["epic", "create", "--goal", "marbles-1", "An epic"]).request {
+        Request::Epic(records_cli::EpicAction::Create { goal, args }) => {
+            assert_eq!(goal, "marbles-1");
+            assert_eq!(args.title, "An epic");
+        }
+        other => panic!("expected an epic, got {other:?}"),
+    }
+    // Flags before the title are the native spelling.
+    match parse(&["task", "create", "-p", "1", "--epic", "marbles-2", "A task"]).request {
+        Request::Task(records_cli::TaskAction::Create { epic, args }) => {
+            assert_eq!(epic, "marbles-2");
+            assert_eq!(args.title, "A task");
+            assert_eq!(args.priority, 1);
+        }
+        other => panic!("expected a task, got {other:?}"),
+    }
+    assert!(parse_error(&["epic", "create", "no goal"]).contains("--goal"));
+    assert!(parse_error(&["task", "create", "no epic"]).contains("--epic"));
+}
+
+#[test]
+fn burndown_portfolio_plan_and_doctor_parse() {
+    match parse(&["burndown", "--goal", "g", "--days", "7"]).request {
+        Request::Burndown { goal, days, .. } => {
+            assert_eq!(goal.as_deref(), Some("g"));
+            assert_eq!(days, 7);
+        }
+        other => panic!("expected a burndown, got {other:?}"),
+    }
+    match parse(&["portfolio", "--folder", "work", "--stale-days", "3"]).request {
+        Request::Portfolio {
+            folder,
+            days,
+            stale_days,
+        } => {
+            assert_eq!(folder.as_deref(), Some("work"));
+            assert_eq!(days, 14);
+            assert_eq!(stale_days, 3);
+        }
+        other => panic!("expected a portfolio, got {other:?}"),
+    }
+    assert!(matches!(
+        parse(&["plan", "show", "ship"]).request,
+        Request::Plan(records_cli::PlanAction::Show { .. })
+    ));
+    assert!(matches!(
+        parse(&["plan", "create", "name = \"x\"", "--dry-run"]).request,
+        Request::Plan(records_cli::PlanAction::Create { dry_run: true, .. })
+    ));
+    assert!(matches!(parse(&["doctor"]).request, Request::Doctor));
+    assert!(matches!(
+        parse(&["project", "rm", "soil"]).request,
+        Request::ProjectRemove { .. }
+    ));
+}
+
+#[test]
+fn create_accepts_the_plan_node_sugar() {
+    match parse(&[
+        "create",
+        "node",
+        "--id",
+        "marbles-fixed",
+        "--available-at",
+        "0",
+        "--external-ref",
+        "gh:1",
+        "--plan",
+        "ship",
+        "--done-means",
+        "cargo test",
+        "--repo",
+        "marbles",
+        "--conflict-group",
+        "db",
+        "--risk",
+        "high",
+        "--acceptance",
+        "green",
+        "--estimate",
+        "45",
+        "--metadata",
+        r#"{"k":1}"#,
+    ])
+    .request
+    {
+        Request::Create(args) => {
+            assert_eq!(args.id.as_deref(), Some("marbles-fixed"));
+            assert_eq!(args.available_at, Some(0));
+            assert_eq!(args.external_ref.as_deref(), Some("gh:1"));
+            assert_eq!(args.plan.as_deref(), Some("ship"));
+            assert_eq!(args.done_means.as_deref(), Some("cargo test"));
+            assert_eq!(args.repo.as_deref(), Some("marbles"));
+            assert_eq!(args.conflict_group.as_deref(), Some("db"));
+            assert_eq!(args.risk.as_deref(), Some("high"));
+            assert_eq!(args.acceptance.as_deref(), Some("green"));
+            assert_eq!(args.estimate, Some(45));
+            assert_eq!(args.metadata.as_deref(), Some(r#"{"k":1}"#));
+        }
+        other => panic!("expected a create, got {other:?}"),
     }
 }
 

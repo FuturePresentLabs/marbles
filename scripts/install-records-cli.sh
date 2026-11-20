@@ -173,4 +173,4 @@ fi
 
 echo
 echo "done. mb now runs the soil:records store at $RECORDS_ROOT, book $BOOK."
-printf 'the native binary is still `marbles`: init, import, plan and portfolio live there.\n'
+printf 'the native binary is still `marbles` for the host-owned operations: init, setup, import-bd, backup, and store/remote/remotes.\n'

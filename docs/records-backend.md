@@ -2,10 +2,21 @@
 
 **Status: cut over (2026-11).** `mb` on a records-backed host is the spore, not the
 native binary. `~/.local/bin/mb` is the host shim; the commands are a wasm
-component running against `soil:records`; the native `marbles` binary is still
-installed for the operations the spore does not have (`init`, `import-bd`, `plan`,
-`portfolio`, `burndown`, `folder`, `goal`/`epic`/`task`, `store`, `backup`,
-`doctor`).
+component running against `soil:records`. The command surface is at parity with
+the native CLI for everything that is a read or a write over the work graph:
+`create`, `update`, `list`, `ready`, `show`, `history`, `claim`,
+`touch`, `release`, `close`, `review`, `supersede`, `dep`, `label`, `sweep`,
+`stats`, `projects`, `project rm`, `doctor`, `folder` (create/list/tree/move),
+`goal`/`epic`/`task`, `burndown`, `portfolio`, and `plan` (show/gantt/ready/
+create).
+
+The native `marbles` binary is still installed only for work that belongs to the
+machine rather than the book: `init` and `setup` (they write
+`.marbles/project.toml` and `AGENTS.md`), `import-bd` (it reads a Beads export
+from the filesystem), `backup` (the host owns the records book), and
+`store`/`remote`/`remotes` (native Ed25519 identity and the on-disk remote pin
+registry). Asking the spore for one of those is a named error that says which
+need what — not "unknown command".
 
 The native HTTP server, its auth stack, the PostgreSQL backend, the webhook and
 Unibus outbox, and the Canvas viewer were removed after the cutover. There is no
@@ -51,8 +62,9 @@ host by [tests/records_cli.rs](../tests/records_cli.rs), so the wasm target is
 not the only place the surface is written down.
 
 ```text
-claim close create dep history label list projects ready release review
-show stats supersede sweep touch
+burndown claim close create dep doctor epic folder goal history label list
+plan portfolio project projects ready release review show stats supersede
+sweep task touch update
 ```
 
 Rules that matter:
@@ -67,6 +79,14 @@ Rules that matter:
   the store the host opened, not to an endpoint of the caller's choosing.
 - `MARBLES_PROJECT` / `MARBLES_PREFIX` / `MARBLES_ACTOR` are the only
   environment it reads. An empty value means unset.
+- `--flag=value` is accepted, as in clap. `-t`/`-p`/`-l`/`-d` are accepted on
+  the create family.
+- `--metadata` takes inline JSON, or `-` for stdin. `@file` and a plan spec given
+  as a path are refused by name: the host owns the filesystem, and the spore is
+  not given one. Pass the spec inline, or pipe it (`mb plan create -`).
+- `folder list` and `folder tree` both answer `FolderView` (folders plus their
+  parents); rendering a tree is the caller's job, because a Spore has no
+  terminal.
 
 The native binary keeps the rest: `init`, `import-bd`, `plan`, `portfolio`,
 `burndown`, `folder`, `goal`/`epic`/`task`, `remote`/`remotes`, `store`, `backup`,
@@ -125,6 +145,18 @@ become non-destructive.
 | `remote_dep`            | `remote_dep`      | `["child","canonical_ref"]` | Cross-store dependency; keyed by canonical ref. |
 | `history` + `outbound_event` | `marbles_event` / `outbound_event` | `["seq"]` | One `seq` feeds both, mirroring SQLite's `last_insert_rowid()` feeding both inserts in `log_event`. |
 | `store_meta`            | `store_meta`      | `["key"]`                   | Stores the store id under key `store_id`. |
+
+### Composite keys in one records collection
+
+A record is addressed by `<type>/<json-array>`. For a multi-column key
+(`dependency` = child→parent, `remote_dep` = child + canonical ref) Marbles'
+importer writes **one** array element whose components are joined by the ASCII
+unit separator, e.g. `dependency/["child\u001fparent"]`. The Spore reads that
+spelling and the older multi-element array, and writes the importer's spelling;
+both parse to the same `Key` and a load keeps one, so an edge is never counted
+twice. Writing the other spelling would make every imported dependency invisible
+to `ready`, `show`, and `close` — the failure mode is silent, so it is covered by
+unit tests on the encoder rather than left to a live book to reveal.
 
 ### Revisions, tombstones, and the "current" view
 
@@ -279,10 +311,9 @@ on one machine, then look for `issue/["probe-..."]` in the other machine's
 
 1. **Chunk `records.sync.ops.v1`.** The ops response is unbounded; a page plus a
    `more` flag would let any book bootstrap under any permit bound.
-2. **Parity for the remaining commands.** `plan`, `portfolio`, `burndown`,
-   `folder`, `goal`/`epic`/`task` are reads over the same records and could move
-   to the spore; today they require the native binary and therefore a second
-   store.
+2. **Filesystem arguments for the spore.** `--metadata @file` and
+   `plan create <path>` are inline-only until the command policy can grant a
+   preopened directory; today the host owns the filesystem.
 3. **Event head pointer.** `SoilEngine::max_event_seq` scans the whole collection
    on every invocation to avoid reusing an id. A `store_meta` head written under
    the same CAS as the event would make history importable again.

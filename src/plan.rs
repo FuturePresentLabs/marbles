@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
-use crate::db::{Error, Result, Store};
+use crate::store::{Error, Result, Store};
 use crate::types::{Issue, NewIssue};
 
 pub const META_PLAN: &str = "plan";

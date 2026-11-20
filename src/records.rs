@@ -91,6 +91,54 @@ impl fmt::Display for Key {
     }
 }
 
+/// The separator between the components of a composite key inside one record
+/// entity id.
+///
+/// A records collection addresses a record by `<type>/<json-array>`. Marbles'
+/// `soil-marbles-import` encodes a composite natural key as *one* array element
+/// whose components are joined by the ASCII unit separator, and the book this
+/// Spore reads is full of edges written that way. The in-memory engine used a
+/// multi-element array, which is the same key under a different spelling: the
+/// Spore must read both and write the one the book already uses, or every
+/// imported dependency is invisible to `ready`, `show`, and `close`.
+pub const KEY_SEPARATOR: char = '\u{1f}';
+
+/// The canonical entity id for a record: the type, then one JSON array element
+/// holding the key components joined by [`KEY_SEPARATOR`]. A single-component
+/// key is `type/["id"]`, byte-identical to what the importer writes.
+pub fn entity_id(name: &str, key: &Key) -> String {
+    let joined = key.0.join("\u{1f}");
+    format!(
+        "{name}/{}",
+        serde_json::to_string(&[joined]).expect("a key component always serializes")
+    )
+}
+
+/// The pre-fix spelling of a composite key: a multi-element JSON array. Returned
+/// only for composite keys, so callers can retire a duplicate written by an old
+/// Spore without paying a host call for the common single-key record.
+pub fn legacy_entity_id(name: &str, key: &Key) -> Option<String> {
+    (key.0.len() > 1).then(|| {
+        format!(
+            "{name}/{}",
+            serde_json::to_string(&key.0).expect("a key component always serializes")
+        )
+    })
+}
+
+/// Split an entity id back into its record type and natural key. Accepts both
+/// spellings of a composite key, so records written before this encoding and
+/// records written after it answer the same way.
+pub fn parse_entity_id(id: &str) -> Option<(String, Key)> {
+    let (name, encoded) = id.split_once('/')?;
+    let parts = serde_json::from_str::<Vec<String>>(encoded).ok()?;
+    let key: Vec<String> = parts
+        .iter()
+        .flat_map(|part| part.split(KEY_SEPARATOR).map(str::to_string))
+        .collect();
+    Some((name.to_string(), Key(key)))
+}
+
 /// A revision as it is written to the durable trail file. The record-type name is carried here
 /// because the trail is a single append-only log shared by every record type.
 #[cfg(not(all(feature = "soil", target_arch = "wasm32")))]
@@ -411,6 +459,30 @@ pub type Name = String;
 #[cfg(all(test, not(all(feature = "soil", target_arch = "wasm32"))))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entity_ids_round_trip_single_and_composite_keys() {
+        let issue = Key::new(["marbles-1".to_string()]);
+        assert_eq!(entity_id("issue", &issue), "issue/[\"marbles-1\"]");
+        assert_eq!(parse_entity_id("issue/[\"marbles-1\"]").unwrap().1, issue);
+
+        let edge = Key::new(["child".to_string(), "parent".to_string()]);
+        let id = entity_id("dependency", &edge);
+        assert_eq!(id, "dependency/[\"child\\u001fparent\"]");
+        assert_eq!(parse_entity_id(&id).unwrap().1, edge);
+        assert!(legacy_entity_id("dependency", &edge).is_some());
+        assert!(legacy_entity_id("issue", &issue).is_none());
+    }
+
+    #[test]
+    fn parse_reads_the_importer_and_the_old_spore_spelling_alike() {
+        // What `soil-marbles-import` writes, and what the old Spore wrote.
+        let imported = parse_entity_id("dependency/[\"a\\u001fb\"]").unwrap();
+        let old = parse_entity_id("dependency/[\"a\",\"b\"]").unwrap();
+        assert_eq!(imported.0, "dependency");
+        assert_eq!(imported.1, Key::new(["a".to_string(), "b".to_string()]));
+        assert_eq!(imported.1, old.1);
+    }
 
     #[test]
     fn memory_compare_and_swap_rejects_stale_versions() {
