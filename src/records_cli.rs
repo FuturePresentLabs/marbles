@@ -214,6 +214,27 @@ pub enum Request {
     Doctor,
 }
 
+impl Request {
+    /// Whether this command can mutate the store. Used to avoid paying the
+    /// outbox drain on a pure query; a conservative `false` only delays a
+    /// retry until the next write.
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        matches!(
+            self,
+            Request::List { .. }
+                | Request::Ready
+                | Request::Show { .. }
+                | Request::History { .. }
+                | Request::Stats
+                | Request::Projects
+                | Request::Burndown { .. }
+                | Request::Portfolio { .. }
+                | Request::Doctor
+        )
+    }
+}
+
 /// Commands this backend answers. Named so the failure for anything else can
 /// say what does work instead of echoing an unknown-word error.
 pub const COMMANDS: &[&str] = &[
