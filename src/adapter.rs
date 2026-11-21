@@ -425,6 +425,11 @@ impl Inner {
                 "detail": detail,
             }),
         );
+        // A heartbeat is a lease renewal, not work moving: keep it in the audit
+        // trail and out of the bus queue.
+        if event == "heartbeat" {
+            return Ok(());
+        }
         // The outbound event only fires when the issue exists; the SQLite version selects on it.
         let project = self
             .load_issue(id)

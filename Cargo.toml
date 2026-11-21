@@ -9,7 +9,7 @@ repository  = "https://github.com/FuturePresentLabs/marbles"
 
 [features]
 default = []
-soil = ["dep:soil-sdk-records"]
+soil = ["dep:soil-sdk-records", "dep:soil-sdk-unibus"]
 
 [dependencies]
 chrono      = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -21,6 +21,9 @@ getrandom   = "0.3"
 # parses the same spec the native CLI does.
 toml        = "0.9"
 soil-sdk-records = { git = "https://github.com/mycelium-linux/soil.git", rev = "fc010d45218826b6cf980a352b526c48e0691d45", optional = true }
+# Publishing after the write is the Spore's job, not the records host's: the
+# host links both interfaces, and the command composes them.
+soil-sdk-unibus = { git = "https://github.com/mycelium-linux/soil.git", rev = "fc010d45218826b6cf980a352b526c48e0691d45", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 base64      = "0.22"

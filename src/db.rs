@@ -1806,6 +1806,11 @@ fn log_event(
         "INSERT INTO history(issue_id, ts, actor, event, detail) VALUES (?1,?2,?3,?4,?5)",
         params![id, ts, actor, event, detail],
     )?;
+    // A heartbeat is a lease renewal, not work moving: keep it in `history`
+    // and out of the bus queue.
+    if event == "heartbeat" {
+        return Ok(());
+    }
     let seq = tx.last_insert_rowid();
     tx.execute(
         "INSERT INTO outbound_event(seq, store_id, issue_id, project, occurred_at, event, next_attempt_at)

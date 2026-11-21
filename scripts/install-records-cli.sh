@@ -100,6 +100,10 @@ name = "mb"
 version = "$VERSION"
 summary = "Marbles task tracker over soil:records"
 module = "module.wasm"
+# The two capabilities this command composes: records to write, the bus to
+# publish what it wrote. Without the second the command still works and simply
+# never announces anything, which is why it is listed here rather than assumed.
+requires = ["soil:records", "soil:unibus"]
 
 [limits]
 timeout_ms = 300000
@@ -126,6 +130,11 @@ else
 RECORDS_ROOT="@RECORDS_ROOT@"
 RECORDS_BOOK="@RECORDS_BOOK@"
 RECORDS_COLLECTION="@RECORDS_COLLECTION@"
+# Optional: a soil-sdk-unibus client config. When set, `mb` publishes its
+# outbox after each successful write; without it the queue stays durable and
+# `mb` still works.
+UNIBUS_CONFIG=${UNIBUS_CONFIG:-}
+export UNIBUS_CONFIG
 # The variables the command may see. The shim forwards exactly these, by name.
 FUNGOS_COMMAND_ENV="MARBLES_ACTOR MARBLES_PROJECT"
 MARBLES_ACTOR=${MARBLES_ACTOR:-${USER:-${LOGNAME:-agent}}}

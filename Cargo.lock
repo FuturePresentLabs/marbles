@@ -532,6 +532,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "soil-sdk-records",
+ "soil-sdk-unibus",
  "tempfile",
  "thiserror",
  "toml",
@@ -818,6 +819,17 @@ dependencies = [
  "serde",
  "serde_json",
  "soil-sdk-codec",
+ "thiserror",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "soil-sdk-unibus"
+version = "0.1.0"
+source = "git+https://github.com/mycelium-linux/soil.git?rev=fc010d45218826b6cf980a352b526c48e0691d45#fc010d45218826b6cf980a352b526c48e0691d45"
+dependencies = [
+ "serde",
+ "serde_json",
  "thiserror",
  "wit-bindgen 0.57.1",
 ]
