@@ -51,9 +51,11 @@ fn run() -> Result<(), String> {
     let now = store::now();
     let answer = records_exec::execute(&store, &invocation, now)?;
     // After the write is committed, not before: a record that never landed must
-    // not be announced, and a bus that is down must not undo the record. Reads
-    // drain too, so the queue does not need a separate tick.
-    publish_pending(&mut store, now);
+    // not be announced, and a bus that is down must not undo the record. A pure
+    // read does not pay the drain.
+    if !invocation.request.is_read_only() {
+        publish_pending(&mut store, now);
+    }
     print_json(&answer)
 }
 
@@ -66,9 +68,15 @@ fn run() -> Result<(), String> {
 /// the write.
 #[cfg(all(feature = "soil", target_arch = "wasm32"))]
 fn publish_pending(store: &mut Adapter, now: i64) {
+    use std::time::{Duration, Instant};
+
     let Ok(events) = store.pending_events(now, 64) else {
         return;
     };
+    // `publish` means queued at the host, not accepted by the hub. Keep the
+    // request ids and wait for the hub's reply before calling an event
+    // delivered; an unmatched reply leaves the row pending for the next run.
+    let mut awaiting: BTreeMap<String, i64> = BTreeMap::new();
     for event in events {
         // Heartbeats renew a lease; they are audit history, not work moving.
         if event.event == "heartbeat" {
@@ -85,14 +93,47 @@ fn publish_pending(store: &mut Adapter, now: i64) {
             "event": event.event,
         })
         .to_string();
-        match soil_sdk_unibus::soil::unibus::bus::publish(&kind, body.as_bytes(), None, 0) {
-            Ok(_) => {
-                let _ = store.mark_event_delivered(event.seq, now);
+        match soil_sdk_unibus::publish(&kind, body.as_bytes(), None, 0) {
+            Ok(request_id) => {
+                awaiting.insert(request_id, event.seq);
             }
             Err(error) => {
                 let _ = store.mark_event_failed(event.seq, now + 60_000, &format!("{error:?}"));
             }
         }
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(250);
+    while !awaiting.is_empty() && Instant::now() < deadline {
+        let Ok(page) = soil_sdk_unibus::poll(&["unibus.reply"], None, 64) else {
+            break;
+        };
+        for frame in page.frames {
+            let Ok(reply) = serde_json::from_slice::<serde_json::Value>(&frame.body) else {
+                continue;
+            };
+            let Some(request_id) = reply.get("request_id").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let Some(seq) = awaiting.remove(request_id) else {
+                continue;
+            };
+            if reply.get("success").and_then(|value| value.as_bool()) == Some(true) {
+                let _ = store.mark_event_delivered(seq, now);
+            } else {
+                let message = reply
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("hub rejected the publish");
+                let _ = store.mark_event_failed(seq, now + 60_000, message);
+            }
+        }
+        if !awaiting.is_empty() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    for seq in awaiting.into_values() {
+        let _ = store.mark_event_failed(seq, now + 60_000, "no hub reply");
     }
 }
 
