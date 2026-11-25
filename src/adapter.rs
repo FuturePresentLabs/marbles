@@ -23,7 +23,7 @@ use std::sync::Mutex;
 
 use serde_json::{Value, json};
 
-use crate::records::{Engine, Key, RecordSchema, Version};
+use crate::records::{Engine, Key, RecordSchema, Revision, Version};
 use crate::store::{Error, EventContext, Result};
 use crate::types::*;
 
@@ -81,6 +81,11 @@ pub fn schemas() -> Vec<RecordSchema> {
         cols(MARBLES_EVENT, &["seq"], &[]),
         cols(STORE_META, &["key"], &[]),
     ]
+    .into_iter()
+    // Capabilities, verification observations, measurements and decisions are typed records in
+    // this same store. They are not issues: a capability outlives the tasks that touch it.
+    .chain(crate::capability::schemas())
+    .collect()
 }
 
 /// The mutable state behind an [`Adapter`]: the append-only engine, the shared audit-sequence
@@ -197,6 +202,34 @@ impl Adapter {
     pub fn drop_project(&self, slug: &str) -> Result<crate::store::ProjectRemoval> {
         let mut g = self.lock();
         Inner::drop_project(&mut g, slug)
+    }
+
+    // ---- typed records ----
+    //
+    // A record type declared in `schemas()` is addressable by its natural key. Every call takes
+    // the same lock as the work graph, so a capability observation is serialized against a claim
+    // and there is still exactly one writer per lineage. Reads and writes are the append-only
+    // engine's own operations: nothing here adds a second source of truth or a delivery channel.
+
+    /// The current state of one record, if the type exists and the key is live.
+    pub fn record_get(&self, type_name: &str, key: &Key) -> Option<Value> {
+        self.lock().current(type_name, key)
+    }
+
+    /// Every live key of a record type, in key order.
+    pub fn record_keys(&self, type_name: &str) -> Vec<Key> {
+        self.lock().keys(type_name)
+    }
+
+    /// Append a revision for one record and return its sequence number.
+    pub fn record_put(&self, type_name: &str, key: &Key, data: Value) -> Result<i64> {
+        let mut g = self.lock();
+        Ok(g.append(type_name, key, data))
+    }
+
+    /// The append-only trail for one record, tombstones included.
+    pub fn record_history(&self, type_name: &str, key: &Key) -> Vec<Revision> {
+        self.lock().engine.history_of(type_name, key)
     }
 }
 

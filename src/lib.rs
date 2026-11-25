@@ -14,6 +14,7 @@
 pub mod adapter;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod assertion_cache;
+pub mod capability;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod config;
 #[cfg(not(target_arch = "wasm32"))]

@@ -16,10 +16,11 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::adapter::Adapter;
+use crate::capability;
 use crate::plan;
 use crate::records_cli::{
-    CreateArgs, FolderAction, GoalAction, Invocation, PlanAction, Request, UpdateArgs,
-    WorkCreateArgs,
+    CapabilityAction, CreateArgs, FolderAction, GoalAction, Invocation, PlanAction, Request,
+    UpdateArgs, WorkCreateArgs,
 };
 use crate::report;
 use crate::store::Store;
@@ -174,7 +175,99 @@ pub fn execute(store: &Adapter, invocation: &Invocation, now: i64) -> Result<Val
             actor,
             now,
         ),
+        Request::Capability(action) => capability_command(store, action, now),
         Request::Doctor => doctor(store),
+    }
+}
+
+fn capability_command(
+    store: &Adapter,
+    action: &CapabilityAction,
+    now: i64,
+) -> Result<Value, String> {
+    let age = |days: i64| -> Result<i64, String> {
+        if days < 0 {
+            return Err("--max-age-days cannot be negative".into());
+        }
+        Ok(days * 24 * 60 * 60)
+    };
+    match action {
+        CapabilityAction::Create { id, patch } => {
+            let capability = capability::create(store, id, patch, now)?;
+            serde_json::to_value(capability).map_err(|e| e.to_string())
+        }
+        CapabilityAction::Update { id, patch } => {
+            let capability = capability::update(store, id, patch, now)?;
+            serde_json::to_value(capability).map_err(|e| e.to_string())
+        }
+        CapabilityAction::List {
+            implementation,
+            health,
+            commercial_readiness,
+            missing_layer,
+            stale,
+            max_age_days,
+        } => {
+            let max_age = age(*max_age_days)?;
+            let views: Vec<capability::CapabilityView> = capability::views(store, now, max_age)
+                .into_iter()
+                .filter(|v| {
+                    implementation
+                        .as_deref()
+                        .is_none_or(|wanted| v.implementation == wanted)
+                })
+                .filter(|v| health.as_deref().is_none_or(|wanted| v.health == wanted))
+                .filter(|v| {
+                    commercial_readiness
+                        .as_deref()
+                        .is_none_or(|wanted| v.commercial_readiness == wanted)
+                })
+                .filter(|v| {
+                    missing_layer
+                        .as_deref()
+                        .is_none_or(|layer| v.gaps.iter().any(|gap| gap == layer))
+                })
+                .filter(|v| !*stale || !v.stale.is_empty())
+                .collect();
+            value(&views)
+        }
+        CapabilityAction::Show { id, max_age_days } => {
+            capability::show(store, id, now, age(*max_age_days)?)
+        }
+        CapabilityAction::Verify(spec) => {
+            let verification = capability::verify(store, spec, now)?;
+            serde_json::to_value(verification).map_err(|e| e.to_string())
+        }
+        CapabilityAction::Measure(spec) => {
+            let measurement = capability::measure(store, spec, now)?;
+            serde_json::to_value(measurement).map_err(|e| e.to_string())
+        }
+        CapabilityAction::Decide(spec) => {
+            let decision = capability::decide(store, spec, now)?;
+            serde_json::to_value(decision).map_err(|e| e.to_string())
+        }
+        CapabilityAction::Verified {
+            layer,
+            max_age_days,
+        } => value(&capability::verified(
+            store,
+            layer.as_deref(),
+            now,
+            age(*max_age_days)?,
+        )?),
+        CapabilityAction::Gaps {
+            layer,
+            max_age_days,
+        } => value(&capability::gaps(store, layer, now, age(*max_age_days)?)?),
+        CapabilityAction::Stale { max_age_days } => {
+            value(&capability::stale(store, now, age(*max_age_days)?))
+        }
+        CapabilityAction::PilotBlockers { max_age_days } => {
+            value(&capability::pilot_blockers(store, now, age(*max_age_days)?))
+        }
+        CapabilityAction::Baseline { metric } => {
+            value(&capability::baseline(store, metric.as_deref()))
+        }
     }
 }
 
