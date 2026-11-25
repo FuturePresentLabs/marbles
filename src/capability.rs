@@ -94,6 +94,10 @@ pub const LAYERS: &[&str] = &[
     "commercial",
 ];
 pub const RESULTS: &[&str] = &["pass", "fail", "not_tested", "not_applicable", "blocked"];
+/// How the observation was obtained. `reported` is a real record (a commit, a delivery log, an
+/// operator report); `reproduced` means the observer re-ran the workload and saw the result.
+/// Neither word upgrades the engineering outcome, and readiness reports them side by side.
+pub const REPRODUCTION: &[&str] = &["reported", "reproduced", "not_applicable"];
 pub const DECISION_STATUS: &[&str] = &["proposed", "accepted", "rejected", "superseded"];
 
 /// Default age after which a same-revision observation is labelled `stale`. Verification is not
@@ -217,10 +221,14 @@ pub struct Capability {
     /// The revision this capability currently is. Verification only counts against this value.
     #[serde(default)]
     pub implementation_id: String,
-    /// Layers that must be `pass`/`fresh` before the capability can be called ready. Empty means
-    /// “not gating anything yet”, which is honest rather than assuming every layer is required.
+    /// Platform integration gates: optional infrastructure layers (Soil, Studio, …). A missing
+    /// platform gate is reported, but it does not block a commercial pilot on its own.
     #[serde(default)]
     pub required_layers: Vec<String>,
+    /// Commercial acceptance gates: the layers a customer-facing pilot actually requires. These
+    /// are the gates `pilot-blockers` reports. Empty means “no commercial gate declared yet”.
+    #[serde(default)]
+    pub commercial_gates: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
     pub created_at: i64,
@@ -253,6 +261,8 @@ pub struct CapabilityPatch {
     pub implementation_id: Option<String>,
     #[serde(default)]
     pub required_layers: Option<Vec<String>>,
+    #[serde(default)]
+    pub commercial_gates: Option<Vec<String>>,
     #[serde(default)]
     pub superseded_by: Option<String>,
 }
@@ -295,6 +305,9 @@ impl CapabilityPatch {
         if let Some(v) = &self.required_layers {
             capability.required_layers = v.clone();
         }
+        if let Some(v) = &self.commercial_gates {
+            capability.commercial_gates = v.clone();
+        }
         if let Some(v) = &self.superseded_by {
             capability.superseded_by = if v.is_empty() { None } else { Some(v.clone()) };
             if capability.superseded_by.is_some() && self.lifecycle.is_none() {
@@ -329,8 +342,12 @@ fn validate_capability(capability: &Capability) -> Result<(), String> {
     {
         return Err("implementation_id contains whitespace".into());
     }
-    for layer in &capability.required_layers {
-        require_vocab("required layer", layer, LAYERS)?;
+    for layer in capability
+        .required_layers
+        .iter()
+        .chain(capability.commercial_gates.iter())
+    {
+        require_vocab("gate layer", layer, LAYERS)?;
     }
     Ok(())
 }
@@ -359,6 +376,7 @@ pub fn create(
         commercial_readiness: "research".into(),
         implementation_id: String::new(),
         required_layers: Vec::new(),
+        commercial_gates: Vec::new(),
         superseded_by: None,
         created_at: now,
         updated_at: now,
@@ -450,6 +468,14 @@ pub struct Verification {
     pub limitations: String,
     #[serde(default)]
     pub verifier: String,
+    /// `reported` | `reproduced` | `not_applicable`. Defaults to `reported` when absent, because
+    /// that is the weaker and safer claim.
+    #[serde(default)]
+    pub reproduction: String,
+    /// The criterion this workload was judged against, so a pass cannot be read as a broader
+    /// claim than the one that was tested.
+    #[serde(default)]
+    pub acceptance: String,
     pub observed_at: i64,
 }
 
@@ -476,6 +502,10 @@ pub struct NewVerification {
     #[serde(default)]
     pub verifier: String,
     #[serde(default)]
+    pub reproduction: Option<String>,
+    #[serde(default)]
+    pub acceptance: String,
+    #[serde(default)]
     pub observed_at: Option<i64>,
 }
 
@@ -494,6 +524,8 @@ pub fn verify(store: &Adapter, spec: &NewVerification, now: i64) -> Result<Verif
     if spec.implementation_id.chars().any(char::is_whitespace) {
         return Err("implementation_id contains whitespace".into());
     }
+    let reproduction = spec.reproduction.as_deref().unwrap_or("reported");
+    require_vocab("reproduction", reproduction, REPRODUCTION)?;
     if spec.result == "pass"
         && spec.evidence.trim().is_empty()
         && spec.command.trim().is_empty()
@@ -522,6 +554,8 @@ pub fn verify(store: &Adapter, spec: &NewVerification, now: i64) -> Result<Verif
                 &spec.workload,
                 &spec.command,
                 &spec.evidence,
+                &spec.acceptance,
+                reproduction,
             ],
         ),
         capability_id: spec.capability_id.clone(),
@@ -534,6 +568,8 @@ pub fn verify(store: &Adapter, spec: &NewVerification, now: i64) -> Result<Verif
         evidence: spec.evidence.clone(),
         limitations: spec.limitations.clone(),
         verifier: spec.verifier.clone(),
+        reproduction: reproduction.to_string(),
+        acceptance: spec.acceptance.clone(),
         observed_at,
     };
     let value = serde_json::to_value(&verification).map_err(|e| e.to_string())?;
@@ -603,6 +639,12 @@ pub struct LayerState {
     pub workload: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limitations: Option<String>,
+    /// `reported` | `reproduced` | `not_applicable`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reproduction: Option<String>,
+    /// The workload-specific criterion this observation was judged against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<String>,
 }
 
 fn layer_state(
@@ -629,6 +671,8 @@ fn layer_state(
         command: (!v.command.is_empty()).then(|| v.command.clone()),
         workload: (!v.workload.is_empty()).then(|| v.workload.clone()),
         limitations: (!v.limitations.is_empty()).then(|| v.limitations.clone()),
+        reproduction: (!v.reproduction.is_empty()).then(|| v.reproduction.clone()),
+        acceptance: (!v.acceptance.is_empty()).then(|| v.acceptance.clone()),
     };
     // Prefer an observation of the revision the capability currently is. If there is none, the
     // newest observation still describes a real past result — but it belongs to a different
@@ -654,6 +698,8 @@ fn layer_state(
             command: None,
             workload: None,
             limitations: None,
+            reproduction: None,
+            acceptance: None,
         },
     }
 }
@@ -672,17 +718,28 @@ pub struct CapabilityView {
     pub lifecycle: String,
     pub commercial_readiness: String,
     pub implementation_id: String,
+    /// Platform integration gates (optional infrastructure; a miss does not block a pilot).
     pub required_layers: Vec<String>,
+    /// Commercial acceptance gates (a miss does block a commercial pilot).
+    pub commercial_gates: Vec<String>,
     pub superseded_by: Option<String>,
     pub updated_at: i64,
     pub layers: Vec<LayerState>,
-    /// Required layers that are not a fresh `pass`.
+    /// Every declared gate that is not a fresh `pass` (platform + commercial).
     pub gaps: Vec<String>,
+    /// Platform integration gates that are not a fresh `pass`.
+    pub platform_gaps: Vec<String>,
+    /// Commercial acceptance gates that are not a fresh `pass`.
+    pub commercial_gaps: Vec<String>,
     /// Layers whose newest evidence is stale, bound to another revision, or unverifiable.
     pub stale: Vec<String>,
-    /// Human-readable reasons this capability is not pilot-ready.
+    /// Human-readable reasons this capability is not commercial-pilot-ready. Platform gaps are
+    /// deliberately absent: an optional integration must not block a viable pilot.
     pub blockers: Vec<String>,
+    /// Platform-only gaps, reported so the operator can see them without being blocked by them.
+    pub platform_blockers: Vec<String>,
     pub technically_ready: bool,
+    pub commercial_ready: bool,
 }
 
 fn view(
@@ -692,7 +749,12 @@ fn view(
     max_age_seconds: i64,
 ) -> CapabilityView {
     let observations = verifications_for(store, &capability.id);
-    let mut layers: BTreeSet<String> = capability.required_layers.iter().cloned().collect();
+    let mut layers: BTreeSet<String> = capability
+        .required_layers
+        .iter()
+        .chain(capability.commercial_gates.iter())
+        .cloned()
+        .collect();
     for observation in &observations {
         layers.insert(observation.layer.clone());
     }
@@ -701,16 +763,25 @@ fn view(
         .map(|layer| layer_state(&layer, &observations, capability, now, max_age_seconds))
         .collect();
 
-    let gaps: Vec<String> = capability
-        .required_layers
-        .iter()
-        .filter(|layer| {
-            !states
-                .iter()
-                .any(|s| &s.layer == *layer && s.status == "pass" && s.freshness == "fresh")
-        })
-        .cloned()
-        .collect();
+    let unmet = |gates: &[String]| -> Vec<String> {
+        gates
+            .iter()
+            .filter(|layer| {
+                !states
+                    .iter()
+                    .any(|s| &s.layer == *layer && s.status == "pass" && s.freshness == "fresh")
+            })
+            .cloned()
+            .collect()
+    };
+    let platform_gaps = unmet(&capability.required_layers);
+    let commercial_gaps = unmet(&capability.commercial_gates);
+    let mut gaps: Vec<String> = platform_gaps.clone();
+    for gap in &commercial_gaps {
+        if !gaps.contains(gap) {
+            gaps.push(gap.clone());
+        }
+    }
     let stale: Vec<String> = states
         .iter()
         .filter(|s| {
@@ -722,6 +793,12 @@ fn view(
         .map(|s| s.layer.clone())
         .collect();
 
+    let describe = |gap: &String| -> String {
+        match states.iter().find(|s| &s.layer == gap) {
+            Some(state) => format!("{gap}: {} ({})", state.status, state.freshness),
+            None => format!("{gap}: missing"),
+        }
+    };
     let mut blockers = Vec::new();
     if capability.health == "blocked" {
         blockers.push("health: blocked".to_string());
@@ -729,15 +806,16 @@ fn view(
     if capability.lifecycle != "active" {
         blockers.push(format!("lifecycle: {}", capability.lifecycle));
     }
-    for gap in &gaps {
-        let state = states.iter().find(|s| &s.layer == gap);
-        match state {
-            Some(state) => blockers.push(format!("{gap}: {} ({})", state.status, state.freshness)),
-            None => blockers.push(format!("{gap}: missing")),
-        }
+    for gap in &commercial_gaps {
+        blockers.push(format!("commercial gate {}", describe(gap)));
     }
-    let technically_ready =
-        capability.lifecycle == "active" && capability.health != "blocked" && gaps.is_empty();
+    let platform_blockers: Vec<String> = platform_gaps
+        .iter()
+        .map(|gap| format!("platform gate {}", describe(gap)))
+        .collect();
+    let healthy = capability.lifecycle == "active" && capability.health != "blocked";
+    let technically_ready = healthy && gaps.is_empty();
+    let commercial_ready = healthy && commercial_gaps.is_empty();
 
     CapabilityView {
         id: capability.id.clone(),
@@ -753,13 +831,18 @@ fn view(
         commercial_readiness: capability.commercial_readiness.clone(),
         implementation_id: capability.implementation_id.clone(),
         required_layers: capability.required_layers.clone(),
+        commercial_gates: capability.commercial_gates.clone(),
         superseded_by: capability.superseded_by.clone(),
         updated_at: capability.updated_at,
         layers: states,
         gaps,
+        platform_gaps,
+        commercial_gaps,
         stale,
         blockers,
+        platform_blockers,
         technically_ready,
+        commercial_ready,
     }
 }
 
@@ -828,6 +911,8 @@ pub fn verified(
             "evidence": observation.evidence,
             "artifact_digest": observation.artifact_digest,
             "limitations": observation.limitations,
+            "reproduction": observation.reproduction,
+            "acceptance": observation.acceptance,
         }));
     }
     Ok(out)
@@ -855,6 +940,8 @@ pub fn stale(store: &Adapter, now: i64, max_age_seconds: i64) -> Vec<Value> {
                 "observed_at": observation.observed_at,
                 "limitations": observation.limitations,
                 "evidence": observation.evidence,
+                "reproduction": observation.reproduction,
+                "acceptance": observation.acceptance,
             }));
         }
     }
@@ -873,7 +960,9 @@ pub fn gaps(
     require_vocab("layer", layer, LAYERS)?;
     let mut out = Vec::new();
     for capability in list(store) {
-        if !capability.required_layers.iter().any(|l| l == layer) {
+        let platform_gate = capability.required_layers.iter().any(|l| l == layer);
+        let commercial_gate = capability.commercial_gates.iter().any(|l| l == layer);
+        if !platform_gate && !commercial_gate {
             continue;
         }
         let view = view(store, &capability, now, max_age_seconds);
@@ -891,6 +980,13 @@ pub fn gaps(
             "current_implementation_id": capability.implementation_id,
             "observed_at": state.and_then(|s| s.observed_at),
             "limitations": state.and_then(|s| s.limitations.clone()),
+            "gate": match (platform_gate, commercial_gate) {
+                (true, true) => "platform+commercial",
+                (true, false) => "platform",
+                (false, true) => "commercial",
+                (false, false) => "none",
+            },
+            "blocks_commercial_pilot": commercial_gate,
         }));
     }
     Ok(out)
@@ -914,7 +1010,9 @@ pub fn pilot_blockers(store: &Adapter, now: i64, max_age_seconds: i64) -> Vec<Va
                 "implementation": v.implementation,
                 "health": v.health,
                 "implementation_id": v.implementation_id,
-                "gaps": v.gaps,
+                "commercial_gates": v.commercial_gates,
+                "commercial_gaps": v.commercial_gaps,
+                "platform_gaps": v.platform_gaps,
                 "stale": v.stale,
                 "blockers": v.blockers,
             })

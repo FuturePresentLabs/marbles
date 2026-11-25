@@ -45,7 +45,17 @@ one execution layer:
 
 An observation is `pass`, `fail`, `not_tested`, `not_applicable`, or `blocked`, and carries the
 workload, test command, evidence reference, artifact digest, date, and limitations. Several
-observations of the same layer are kept; the newest is what the view reports.
+observations of the same layer are kept; the newest is what the view reports. Two more fields
+keep the claim honest:
+
+- `reproduction` — `reported` (a commit message, delivery log, or document says it happened),
+  `reproduced` (the observer re-ran the workload and saw the result), or `not_applicable`.
+  Omitting it means `reported`, the weaker claim.
+- `acceptance` — the workload-specific criterion the observation was judged against, so a pass
+  cannot be read as a broader claim than the one that was tested.
+
+The readiness views print reproduction and acceptance next to the result. A signature, if one is
+ever added, would establish provenance; it would not turn `reported` into `reproduced`.
 
 **A changed implementation does not inherit an old pass.** Freshness is computed on read:
 
@@ -100,7 +110,7 @@ rationale is refused.
 mb capability create ID --title T --owner O [--project P] \
     [--implementation P] [--health H] [--lifecycle L] \
     [--commercial-readiness R] [--implementation-id REV] \
-    [--required-layers native,sidecar,loam,soil,studio,commercial] \
+    [--platform-gates soil,studio] [--commercial-gates native,commerce] \
     [--contract-version V] [--contract-maturity M]
 mb capability update ID [same flags]
 mb capability show ID [--max-age-days N]
@@ -108,6 +118,7 @@ mb capability show ID [--max-age-days N]
 # observe
 mb capability verify ID --layer L --result R --implementation-id REV \
     [--workload W] [--command C] [--evidence E] [--artifact-digest D] \
+    [--acceptance A] [--reproduction reported|reproduced] \
     [--limitations L] [--verifier WHO] [--observed-at EPOCH]
 mb capability measure ID --metric M --value V --unit U \
     [--workload W] [--profile P] [--samples N] [--outcome O] \
@@ -123,12 +134,36 @@ mb capability gaps --layer L              # who lacks a fresh pass at this layer
 mb capability stale                       # evidence too old or from another revision
 mb capability pilot-blockers              # demo/pilot claims with an unmet gate
 mb capability baseline [--metric M]       # the latest value of each metric
+
+# one read-only call for an orchestrator or MCP connector
+mb [--project P] inventory [--max-age-days N]
 ```
 
-`--required-layers` is what makes readiness falsifiable. Empty means “not gating anything
-yet”, which is honest; a capability that claims `demo_ready` should name the layers a demo
-actually requires. `pilot-blockers` reports capabilities whose commercial readiness is
-`demo_ready` or above and whose health, lifecycle, or required layers still have a blocker.
+`mb inventory` returns `capabilities`, `ready_tasks`, `decisions`, and `measurements` (the
+baseline) in one read-only answer. It is the query an external orchestration agent uses; it
+writes nothing and creates no delivery channel.
+
+## Two kinds of gate
+
+`required_layers` are **platform integration gates**: optional infrastructure paths such as Soil
+or Studio. `commercial_gates` are **commercial acceptance gates**: the layers a customer-facing
+pilot actually needs. The view reports them separately:
+
+| field | meaning |
+|---|---|
+| `platform_gaps` | platform gates without a fresh pass; reported, not pilot-blocking |
+| `commercial_gaps` | commercial gates without a fresh pass; these block a pilot |
+| `platform_blockers` | human-readable platform gaps |
+| `blockers` | health, lifecycle, and commercial gaps only |
+| `technically_ready` | healthy, active, and every declared gate satisfied |
+| `commercial_ready` | healthy, active, and every commercial gate satisfied |
+
+`pilot-blockers` filters on `commercial_ready`, so a missing optional Soil or Studio path cannot
+block an otherwise viable pilot. `gaps --layer L` still reports both kinds and tags each row with
+`gate` (`platform`, `commercial`, or `platform+commercial`) and `blocks_commercial_pilot`.
+
+Empty lists mean “no gate declared yet”, which is honest. A capability that claims `demo_ready`
+should name the gates a demo actually requires.
 
 ## What this deliberately does not do
 
@@ -160,17 +195,22 @@ the “do not inherit verification from an earlier revision” rule. Running it 
 ```text
 ## which capabilities lack Soil verification?
 [ { "capability_id": "panopticon.provider", "layer": "soil", "status": "missing",
-    "freshness": "unknown", "current_implementation_id": "7dcceff" },
+    "freshness": "unknown", "gate": "platform", "blocks_commercial_pilot": false },
   { "capability_id": "transmog.batch-provider", "layer": "soil", "status": "missing",
-    "freshness": "unknown", "current_implementation_id": "b8c93fb4" },
-  { "capability_id": "twenty.provider", "layer": "soil", "status": "missing",
-    "freshness": "unknown", "current_implementation_id": "8795eb1" } ]
+    "freshness": "unknown", "gate": "platform", "blocks_commercial_pilot": false },
+  { "capability_id": "twenty.webhook-relay", "layer": "soil", "status": "missing",
+    "freshness": "unknown", "gate": "platform", "blocks_commercial_pilot": false } ]
 
 ## what blocks a commercial pilot?
-[ { "capability_id": "transmog.batch-provider", "commercial_readiness": "demo_ready",
-    "implementation": "execution_verified", "gaps": ["soil"],
-    "blockers": ["soil: missing (unknown)"] } ]
+[ { "capability_id": "website-factory.proposals",
+    "commercial_readiness": "demo_ready", "implementation": "execution_verified",
+    "commercial_gaps": ["commercial"], "platform_gaps": ["studio"],
+    "blockers": ["commercial gate commercial: missing (unknown)"] } ]
 ```
+
+The Transmog provider is no longer listed by a missing Soil path: Soil is a platform gate, and
+its commercial gate (Loam execution) is a fresh pass. The Website Factory is listed because no
+customer acceptance exists yet — the commercial fact, not an optional integration.
 
 The `Loam` capability no longer carries the ledger's “Soil-to-WIT marshalling BLOCKED” row:
 `f7313e5` landed the generic provider host, and the record says what that test does and does not

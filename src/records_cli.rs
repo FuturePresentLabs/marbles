@@ -212,6 +212,11 @@ pub enum Request {
     },
     Plan(PlanAction),
     Capability(Box<CapabilityAction>),
+    /// One read-only answer for an orchestration agent: capabilities with evidence, ready work,
+    /// decisions, and the measurement baseline. No writes, no delivery, no new store.
+    Inventory {
+        max_age_days: i64,
+    },
     Doctor,
 }
 
@@ -290,6 +295,7 @@ impl Request {
     pub fn is_read_only(&self) -> bool {
         match self {
             Request::Capability(action) => action.is_read_only(),
+            Request::Inventory { .. } => true,
             _ => matches!(
                 self,
                 Request::List { .. }
@@ -320,6 +326,7 @@ pub const COMMANDS: &[&str] = &[
     "folder",
     "goal",
     "history",
+    "inventory",
     "label",
     "list",
     "plan",
@@ -639,6 +646,22 @@ fn parse_command(name: &str, rest: &[String]) -> Result<Request, String> {
         "portfolio" => parse_portfolio(rest),
         "plan" => parse_plan(rest),
         "capability" => parse_capability(rest),
+        "inventory" => {
+            let mut max_age_days = 30;
+            let mut index = 0;
+            while let Some(arg) = rest.get(index) {
+                match arg.as_str() {
+                    "--max-age-days" => {
+                        max_age_days = value(rest, index, "--max-age-days")?
+                            .parse()
+                            .map_err(|_| "--max-age-days needs a number".to_string())?;
+                        index += 2;
+                    }
+                    other => return Err(format!("unknown inventory option {other}")),
+                }
+            }
+            Ok(Request::Inventory { max_age_days })
+        }
         other => {
             if let Some((_, why)) = NATIVE_ONLY.iter().find(|(command, _)| *command == other) {
                 return Err(format!(
@@ -1241,9 +1264,13 @@ fn parse_capability(rest: &[String]) -> Result<Request, String> {
                         patch.implementation_id = Some(value(rest, index, "--implementation-id")?);
                         index += 2;
                     }
-                    "--required-layers" => {
-                        patch.required_layers =
-                            Some(split_csv(&value(rest, index, "--required-layers a,b")?));
+                    "--required-layers" | "--platform-gates" => {
+                        patch.required_layers = Some(split_csv(&value(rest, index, arg)?));
+                        index += 2;
+                    }
+                    "--commercial-gates" => {
+                        patch.commercial_gates =
+                            Some(split_csv(&value(rest, index, "--commercial-gates a,b")?));
                         index += 2;
                     }
                     "--superseded-by" => {
@@ -1357,6 +1384,14 @@ fn parse_capability(rest: &[String]) -> Result<Request, String> {
                     }
                     "--verifier" => {
                         spec.verifier = value(rest, index, "--verifier")?;
+                        index += 2;
+                    }
+                    "--reproduction" => {
+                        spec.reproduction = Some(value(rest, index, "--reproduction")?);
+                        index += 2;
+                    }
+                    "--acceptance" => {
+                        spec.acceptance = value(rest, index, "--acceptance")?;
                         index += 2;
                     }
                     "--observed-at" => {

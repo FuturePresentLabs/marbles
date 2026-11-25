@@ -176,6 +176,31 @@ pub fn execute(store: &Adapter, invocation: &Invocation, now: i64) -> Result<Val
             now,
         ),
         Request::Capability(action) => capability_command(store, action, now),
+        Request::Inventory { max_age_days } => {
+            if *max_age_days < 0 {
+                return Err("--max-age-days cannot be negative".into());
+            }
+            let max_age = max_age_days * 24 * 60 * 60;
+            let capabilities = capability::views(store, now, max_age);
+            let ready = store.ready(project, now).map_err(err)?;
+            let decisions = capability::decisions(store);
+            let measurements = capability::baseline(store, None);
+            Ok(json!({
+                "generated_at": now,
+                "max_age_seconds": max_age,
+                "scope": project,
+                "counts": {
+                    "capabilities": capabilities.len(),
+                    "ready_tasks": ready.len(),
+                    "decisions": decisions.len(),
+                    "measurements": measurements.len(),
+                },
+                "capabilities": capabilities,
+                "ready_tasks": ready,
+                "decisions": decisions,
+                "measurements": measurements,
+            }))
+        }
         Request::Doctor => doctor(store),
     }
 }

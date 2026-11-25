@@ -39,7 +39,9 @@ fn seed(store: &Adapter) {
             "--implementation-id",
             "b8c93fb4",
             "--required-layers",
-            "loam,soil",
+            "soil",
+            "--commercial-gates",
+            "loam",
         ],
     );
     run(
@@ -60,6 +62,10 @@ fn seed(store: &Adapter) {
             "commit b8c93fb4",
             "--limitations",
             "reported, not re-run",
+            "--reproduction",
+            "reported",
+            "--acceptance",
+            "provider returns a DFM result",
         ],
     );
     run(
@@ -108,13 +114,19 @@ fn six_questions_are_queries_over_the_same_store() {
     assert_eq!(gaps[0]["capability_id"], "transmog.batch-provider");
     assert_eq!(gaps[0]["status"], "missing");
 
+    // Reported vs reproduced is preserved on the observation.
+    assert_eq!(verified[0]["reproduction"], "reported");
+    assert_eq!(verified[0]["acceptance"], "provider returns a DFM result");
+
     // Which verification evidence is stale? (none yet, so the command is empty, not an error)
     assert_eq!(run(&store, &["capability", "stale"]), Value::Array(vec![]));
 
-    // What blocks a commercial pilot?
+    // What blocks a commercial pilot? The Soil gap is a platform gate, not a commercial one.
     let blockers = run(&store, &["capability", "pilot-blockers"]);
-    assert_eq!(blockers[0]["capability_id"], "transmog.batch-provider");
-    assert_eq!(blockers[0]["gaps"], serde_json::json!(["soil"]));
+    assert_eq!(blockers, serde_json::json!([]));
+    let gaps = run(&store, &["capability", "gaps", "--layer", "soil"]);
+    assert_eq!(gaps[0]["gate"], "platform");
+    assert_eq!(gaps[0]["blocks_commercial_pilot"], false);
 
     // Which measurements establish the current baseline?
     let baseline = run(
@@ -149,6 +161,49 @@ fn a_new_revision_turns_its_old_verification_into_a_stale_answer() {
     let gaps = run(&store, &["capability", "gaps", "--layer", "loam"]);
     assert_eq!(gaps[0]["status"], "pass");
     assert_eq!(gaps[0]["freshness"], "revision_mismatch");
+}
+
+#[test]
+fn a_commercial_gate_blocks_and_is_reported_separately() {
+    let store = Adapter::in_memory().expect("store");
+    seed(&store);
+    run(
+        &store,
+        &[
+            "capability",
+            "update",
+            "transmog.batch-provider",
+            "--commercial-gates",
+            "loam,commercial",
+        ],
+    );
+
+    let blockers = run(&store, &["capability", "pilot-blockers"]);
+    assert_eq!(blockers[0]["capability_id"], "transmog.batch-provider");
+    assert_eq!(
+        blockers[0]["commercial_gaps"],
+        serde_json::json!(["commercial"])
+    );
+    assert_eq!(blockers[0]["platform_gaps"], serde_json::json!(["soil"]));
+}
+
+#[test]
+fn inventory_is_one_read_only_call_for_an_orchestrator() {
+    let store = Adapter::in_memory().expect("store");
+    seed(&store);
+    let inventory = run(&store, &["inventory"]);
+    assert_eq!(inventory["counts"]["capabilities"], 1);
+    assert_eq!(
+        inventory["capabilities"][0]["id"],
+        "transmog.batch-provider"
+    );
+    assert!(inventory["ready_tasks"].is_array());
+    assert!(inventory["decisions"].is_array());
+    assert_eq!(inventory["measurements"][0]["metric"], "dfm_seconds");
+
+    let argv: Vec<String> = ["inventory"].iter().map(|s| s.to_string()).collect();
+    let invocation = records_cli::parse(&argv, &BTreeMap::new()).expect("parse");
+    assert!(invocation.request.is_read_only());
 }
 
 #[test]

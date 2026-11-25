@@ -1,0 +1,132 @@
+# Operational integration: MCP and Studio consumers
+
+This page is the contract for systems that *read* Marbles capability records. It adds no store,
+server, scheduler, or event bus. Both consumers use the same single-writer book through the
+host-opened `mb` command, exactly as a Spore does.
+
+## The one read
+
+```sh
+mb [--project SLUG] inventory [--max-age-days N]
+```
+
+`mb` always answers JSON. `inventory` is read-only, does not drain the outbox, and does not write
+an issue, claim, or revision. `--project` scopes `ready_tasks`; capabilities, decisions, and
+measurements are store-wide because they outlive any one project.
+
+```json
+{
+  "generated_at": 1795634371,
+  "max_age_seconds": 2592000,
+  "scope": "marbles",
+  "counts": {
+    "capabilities": 9,
+    "ready_tasks": 0,
+    "decisions": 7,
+    "measurements": 9
+  },
+  "capabilities": [
+    {
+      "id": "transmog.batch-provider",
+      "title": "Transmog batch provider",
+      "owner": "Transmog",
+      "project": "transmog",
+      "implementation": "execution_verified",
+      "health": "healthy",
+      "lifecycle": "active",
+      "commercial_readiness": "demo_ready",
+      "implementation_id": "b8c93fb4",
+      "required_layers": ["soil"],
+      "commercial_gates": ["loam"],
+      "layers": [
+        {
+          "layer": "loam",
+          "status": "pass",
+          "freshness": "fresh",
+          "implementation_id": "b8c93fb4",
+          "observed_at": 1795634371,
+          "reproduction": "reported",
+          "acceptance": "DFM analysis returns; commercial quote validity is not asserted",
+          "evidence": "commit b8c93fb4; integration ledger 2026-11-25",
+          "limitations": "debug-native profile; one reported observation"
+        }
+      ],
+      "platform_gaps": ["soil"],
+      "commercial_gaps": [],
+      "stale": [],
+      "blockers": [],
+      "platform_blockers": ["platform gate soil: missing (unknown)"],
+      "technically_ready": false,
+      "commercial_ready": true
+    }
+  ],
+  "ready_tasks": [],
+  "decisions": [],
+  "measurements": []
+}
+```
+
+### Rules a consumer must preserve
+
+1. **Read the store the host opened.** Do not add `--url`/`--token`; do not let a caller choose an
+   endpoint. A connector that can point at an arbitrary book is a second writer by another name.
+2. **Treat `freshness` and `gaps` as the answer, not a boolean.** A pass is only current when
+   `freshness == "fresh"` and `implementation_id` equals the capability's current revision.
+   `revision_mismatch` means the evidence belongs to an earlier revision.
+3. **Keep `reported` and `reproduced` distinct.** A consumer that ignores `reproduction` will
+   present a commit message as if it had re-run the workload.
+4. **Do not gate a pilot on `platform_gaps`.** Only `commercial_gaps` (and `health`/`lifecycle`)
+   block a commercial pilot. `platform_blockers` is information for platform planning.
+5. **Do not infer readiness.** `commercial_readiness` is an operator field; `commercial_ready` is
+   derived from declared gates and evidence. Neither is a forecast.
+6. **Do not write through a read surface.** Any mutation stays on the claimed-work path
+   (`mb claim`/`close`) or the explicit capability commands.
+
+## MCP surface
+
+The Mycelium MCP connector does not need a new protocol. It can expose one tool per record kind,
+or one aggregate tool. Both call the same command:
+
+| tool | call | result |
+|---|---|---|
+| `marbles.inventory` | `mb inventory` | the object above |
+| `marbles.capabilities` | `mb capability list` | capability views |
+| `marbles.capability` | `mb capability show ID` | one capability plus its observations, measurements, decisions |
+| `marbles.verified` | `mb capability verified --layer L` | revisions that passed one layer, with freshness |
+| `marbles.pilot_blockers` | `mb capability pilot-blockers` | commercial blockers only |
+| `marbles.ready` | `mb ready` | unblocked, unclaimed work past grace |
+| `marbles.decisions` | part of `inventory` | decisions with status and supersession |
+| `marbles.baseline` | `mb capability baseline` | latest measurement per capability+metric |
+
+An orchestration loop is then: `inventory` → choose a `ready_task` → `claim` → inspect the
+capability's evidence before assuming a revision is verified → `review`/`close` with a receipt.
+The capability surface never makes a claim or starts a run.
+
+**Authority boundary.** The MCP connector authenticates the caller (Edgerunner grant or the host's
+policy) and passes only a project/actor scope. It must not accept an endpoint, book path, or
+credential from the model. Read-only tools are read-only in the command implementation
+(`Request::is_read_only`), not merely by prompt convention.
+
+## Studio capability inventory view
+
+Studio is a **consumer**, not an owner. It reads `mb inventory` (or `mb capability list`) and
+renders:
+
+* a capability row with the four axes shown as separate columns, never collapsed into a single
+  status;
+* a layer matrix with `status` / `freshness` / `reproduction` / `acceptance`, plus the revision
+  the observation tested and the capability's current revision;
+* a "commercial gates" lane and a separate "platform gates" lane, so a missing optional Soil
+  path reads as optional;
+* the decision list for the selected capability, with superseded decisions visibly retained;
+* the measurement baseline, with workload, profile, unit, samples, and limitations.
+
+The view must not cache a projection into its own store, invent a readiness value, or hide
+`revision_mismatch`/`stale` rows. If Studio wants a writable action, it issues the same `mb`
+mutation under the same claim rules; it does not get a private write path.
+
+## Versioning
+
+The record bodies are `v0.x` and follow the same interface-first policy as the rest of Marbles.
+Fields are additive. A consumer should ignore fields it does not know and must not assume that
+`gaps` is only platform or only commercial — read `platform_gaps` and `commercial_gaps` directly.

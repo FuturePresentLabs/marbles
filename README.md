@@ -307,21 +307,26 @@ structured measurements, and decisions that can supersede each other.
 ```bash
 mb capability create transmog.batch-provider --title "Transmog batch provider" \
   --implementation execution_verified --implementation-id b8c93fb4 \
-  --required-layers sidecar,loam,soil --commercial-readiness demo_ready
+  --platform-gates soil --commercial-gates loam --commercial-readiness demo_ready
 mb capability verify transmog.batch-provider --layer loam --result pass \
   --implementation-id b8c93fb4 --workload "DFM, 369684-byte artifact" \
-  --evidence "commit b8c93fb4" --limitations "reported, not re-run"
+  --evidence "commit b8c93fb4" --acceptance "DFM analysis returns" \
+  --reproduction reported --limitations "reported, not re-run"
 
 mb capability verified --layer loam   # which revisions passed Loam execution?
 mb capability gaps --layer soil       # who lacks a fresh Soil pass?
 mb capability stale                   # what evidence is old or from another revision?
-mb capability pilot-blockers          # which demo/pilot claims still have a gate?
+mb capability pilot-blockers          # commercial gates still unmet?
 mb capability baseline                # the latest value of each metric
+mb inventory                          # capabilities + ready tasks + decisions + measurements
 ```
 
-A pass at revision A is never inherited by revision B: it becomes `revision_mismatch` and a gap.
-Nothing is inferred from technical execution to commercial readiness. See
-[`docs/capabilities.md`](docs/capabilities.md).
+Platform gates (Soil, Studio) are reported but never block a commercial pilot; commercial gates
+do. A pass at revision A is never inherited by revision B: it becomes `revision_mismatch` and a
+gap. `reproduction` keeps `reported` (a commit or delivery log) distinct from `reproduced` (a
+re-run). Nothing is inferred from technical execution to commercial readiness. See
+[`docs/capabilities.md`](docs/capabilities.md) and
+[`docs/operational-integration.md`](docs/operational-integration.md).
 
 ## Identity
 
@@ -407,6 +412,7 @@ mb doctor
 mb capability create|update|list|show|verify|measure|decide
 mb capability verified --layer L ; mb capability gaps --layer L
 mb capability stale ; mb capability pilot-blockers ; mb capability baseline
+mb [--project P] inventory [--max-age-days N]
 ```
 
 ## Migrating from Beads

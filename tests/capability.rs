@@ -3,7 +3,6 @@
 
 use marbles::adapter::Adapter;
 use marbles::capability::{self, CapabilityPatch, NewDecision, NewMeasurement, NewVerification};
-use serde_json::Value;
 
 const NOW: i64 = 1_800_000_000;
 const DAY: i64 = 24 * 60 * 60;
@@ -387,7 +386,7 @@ fn decisions_supersede_and_are_listed_on_the_capability() {
 }
 
 #[test]
-fn pilot_blockers_name_the_missing_layer() {
+fn platform_gaps_do_not_block_commercial_pilots() {
     let store = adapter();
     capability::create(
         &store,
@@ -397,7 +396,9 @@ fn pilot_blockers_name_the_missing_layer() {
             lifecycle: Some("active".into()),
             implementation: Some("execution_verified".into()),
             implementation_id: Some("rev".into()),
-            required_layers: Some(vec!["loam".into(), "soil".into()]),
+            // Soil is optional platform integration; Loam execution is the commercial seam.
+            required_layers: Some(vec!["soil".into()]),
+            commercial_gates: Some(vec!["loam".into()]),
             commercial_readiness: Some("demo_ready".into()),
             ..CapabilityPatch::default()
         },
@@ -406,17 +407,120 @@ fn pilot_blockers_name_the_missing_layer() {
     .expect("create");
     verify_pass(&store, "transmog.batch", "loam", "rev");
 
+    let view = capability::views(&store, NOW, 30 * DAY)
+        .into_iter()
+        .next()
+        .expect("view");
+    assert_eq!(view.platform_gaps, vec!["soil"]);
+    assert!(view.commercial_gaps.is_empty());
+    assert!(view.commercial_ready);
+    assert!(!view.technically_ready);
+    assert_eq!(
+        view.platform_blockers,
+        vec!["platform gate soil: missing (unknown)"]
+    );
+    assert!(
+        capability::pilot_blockers(&store, NOW, 30 * DAY).is_empty(),
+        "a missing optional platform integration must not block a viable pilot"
+    );
+
+    // A commercial gate does block, and the same query says why.
+    capability::update(
+        &store,
+        "transmog.batch",
+        &CapabilityPatch {
+            commercial_gates: Some(vec!["loam".into(), "commercial".into()]),
+            ..CapabilityPatch::default()
+        },
+        NOW,
+    )
+    .expect("add a commercial gate");
     let blockers = capability::pilot_blockers(&store, NOW, 30 * DAY);
     assert_eq!(blockers.len(), 1);
-    assert_eq!(blockers[0]["capability_id"], "transmog.batch");
-    assert_eq!(blockers[0]["gaps"], serde_json::json!(["soil"]));
-
-    let shown = capability::show(&store, "transmog.batch", NOW, 30 * DAY).expect("show");
-    assert_eq!(shown["capability"]["technically_ready"], Value::Bool(false));
     assert_eq!(
-        shown["capability"]["blockers"],
-        serde_json::json!(["soil: missing (unknown)"])
+        blockers[0]["commercial_gaps"],
+        serde_json::json!(["commercial"])
     );
+    assert_eq!(blockers[0]["platform_gaps"], serde_json::json!(["soil"]));
+    assert_eq!(
+        blockers[0]["blockers"],
+        serde_json::json!(["commercial gate commercial: missing (unknown)"])
+    );
+}
+
+#[test]
+fn reported_and_reproduced_observations_are_distinguished() {
+    let store = adapter();
+    create(&store, "x");
+    capability::update(
+        &store,
+        "x",
+        &CapabilityPatch {
+            implementation_id: Some("rev".into()),
+            ..CapabilityPatch::default()
+        },
+        NOW,
+    )
+    .expect("update");
+
+    capability::verify(
+        &store,
+        &NewVerification {
+            capability_id: "x".into(),
+            layer: "loam".into(),
+            result: "pass".into(),
+            implementation_id: "rev".into(),
+            evidence: "commit abc".into(),
+            reproduction: Some("reported".into()),
+            acceptance: "provider returns identity".into(),
+            ..NewVerification::default()
+        },
+        NOW,
+    )
+    .expect("reported");
+    capability::verify(
+        &store,
+        &NewVerification {
+            capability_id: "x".into(),
+            layer: "soil".into(),
+            result: "pass".into(),
+            implementation_id: "rev".into(),
+            command: "cargo test -p loam soil_providers".into(),
+            reproduction: Some("reproduced".into()),
+            acceptance: "identity reaches Soil".into(),
+            ..NewVerification::default()
+        },
+        NOW,
+    )
+    .expect("reproduced");
+
+    let verified = capability::verified(&store, None, NOW, 30 * DAY).unwrap();
+    let by_layer = |layer: &str| {
+        verified
+            .iter()
+            .find(|v| v["layer"] == layer)
+            .expect("observation")
+    };
+    assert_eq!(by_layer("loam")["reproduction"], "reported");
+    assert_eq!(by_layer("loam")["acceptance"], "provider returns identity");
+    assert_eq!(by_layer("soil")["reproduction"], "reproduced");
+
+    // Omitting the flag is the weaker claim by default.
+    capability::verify(
+        &store,
+        &NewVerification {
+            capability_id: "x".into(),
+            layer: "native".into(),
+            result: "pass".into(),
+            implementation_id: "rev".into(),
+            command: "true".into(),
+            ..NewVerification::default()
+        },
+        NOW,
+    )
+    .expect("default reproduction");
+    let native = capability::verified(&store, Some("native"), NOW, 30 * DAY).unwrap();
+    assert_eq!(native[0]["reproduction"], "reported");
 }
 
 #[test]

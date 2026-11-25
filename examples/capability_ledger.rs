@@ -1,19 +1,18 @@
-//! Seed a capability ledger from actual implementation evidence, then answer the six readiness
-//! questions through the same `mb capability` command path the Spore uses.
-//!
-//! Run it with:
+//! Seed a capability ledger from actual implementation evidence, then answer the readiness
+//! questions and the orchestrator inventory through the same `mb` command path the Spore uses.
 //!
 //! ```sh
-//! cargo run --example capability_ledger
+//! cargo run --example capability_ledger            # throwaway trail
+//! cargo run --example capability_ledger /tmp/book  # keep it
 //! ```
 //!
-//! The observations name commits that exist in the local checkouts (`7ebce24d`, `b8c93fb4`,
-//! `f7313e5`, `7dcceff`, `8795eb1`, `ed385ff`). Where the only evidence is the integration ledger
-//! rather than a commit present in the checkout (`b33b2c3`), the record says so in `limitations`
-//! instead of inventing a re-run.
+//! The observations name commits that exist in the local checkouts (`86cfdc8`, `6cc857f`,
+//! `7dcceff`, `8795eb1`, `b8c93fb4`, `f7313e5`, `ed385ff`). Where the only evidence is a report
+//! or the integration ledger rather than a command re-run here (`b33b2c3`), the record says
+//! `reproduction: reported` and names the limitation instead of inventing a reproduction.
 //!
-//! This is a demo against a throwaway append-only trail. It is not a second store: the same
-//! records work in the fleet's `soil:records` book.
+//! This is a demo against an append-only trail. It is not a second store: the same records work
+//! in the fleet's `soil:records` book.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -57,14 +56,38 @@ fn main() {
 
     println!("\n## which measurements establish the current baseline?");
     ask(&store, now, &["capability", "baseline"]);
+
+    println!("\n## one read-only call for an orchestrator (inventory)");
+    let inventory = ask(&store, now, &["inventory"]);
+    println!(
+        "counts: {}",
+        serde_json::to_string_pretty(&inventory["counts"]).unwrap()
+    );
+    println!(
+        "commercial blockers: {}",
+        serde_json::to_string_pretty(
+            &inventory["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|c| c["commercial_ready"] == false)
+                .map(|c| serde_json::json!({
+                    "id": c["id"],
+                    "commercial_gaps": c["commercial_gaps"],
+                    "platform_gaps": c["platform_gaps"],
+                }))
+                .collect::<Vec<_>>()
+        )
+        .unwrap()
+    );
 }
 
-fn ask(store: &Adapter, now: i64, argv: &[&str]) {
+fn ask(store: &Adapter, now: i64, argv: &[&str]) -> Value {
     let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
     let invocation = records_cli::parse(&argv, &BTreeMap::new()).expect("parse");
     let answer = records_exec::execute(store, &invocation, now).expect("execute");
     println!("{}", serde_json::to_string_pretty(&answer).unwrap());
-    let _: &Value = &answer;
+    answer
 }
 
 #[allow(clippy::too_many_arguments)] // a seed fixture reads better as one row per line
@@ -78,7 +101,8 @@ fn capability(
     implementation: &str,
     revision: &str,
     readiness: &str,
-    required_layers: &[&str],
+    platform_gates: &[&str],
+    commercial_gates: &[&str],
 ) {
     capability::create(
         store,
@@ -92,7 +116,8 @@ fn capability(
             health: Some("healthy".into()),
             lifecycle: Some("active".into()),
             commercial_readiness: Some(readiness.into()),
-            required_layers: Some(required_layers.iter().map(|l| l.to_string()).collect()),
+            required_layers: Some(platform_gates.iter().map(|l| l.to_string()).collect()),
+            commercial_gates: Some(commercial_gates.iter().map(|l| l.to_string()).collect()),
             ..CapabilityPatch::default()
         },
         now,
@@ -101,6 +126,7 @@ fn capability(
 }
 
 fn seed_capabilities(store: &Adapter, now: i64) {
+    // The native baseline is the ledger's report; the commit is not in this checkout.
     capability(
         store,
         now,
@@ -111,8 +137,10 @@ fn seed_capabilities(store: &Adapter, now: i64) {
         "execution_verified",
         "b33b2c3",
         "internal_validated",
+        &[],
         &["native"],
     );
+    // Soil is optional platform integration; Loam execution is the commercial seam.
     capability(
         store,
         now,
@@ -123,7 +151,8 @@ fn seed_capabilities(store: &Adapter, now: i64) {
         "execution_verified",
         "b8c93fb4",
         "demo_ready",
-        &["sidecar", "loam", "soil"],
+        &["soil"],
+        &["loam"],
     );
     capability(
         store,
@@ -136,6 +165,7 @@ fn seed_capabilities(store: &Adapter, now: i64) {
         "f7313e5",
         "internal_validated",
         &["soil"],
+        &[],
     );
     capability(
         store,
@@ -147,7 +177,8 @@ fn seed_capabilities(store: &Adapter, now: i64) {
         "implemented",
         "7dcceff",
         "internal_prototype",
-        &["native", "loam", "soil"],
+        &["soil"],
+        &["native"],
     );
     capability(
         store,
@@ -159,7 +190,36 @@ fn seed_capabilities(store: &Adapter, now: i64) {
         "implemented",
         "8795eb1",
         "internal_prototype",
-        &["loam", "soil"],
+        &["soil"],
+        &["loam"],
+    );
+    // The relay's live delivery is the commercial fact; Soil is not on that path.
+    capability(
+        store,
+        now,
+        "twenty.webhook-relay",
+        "Twenty webhook relay",
+        "Agent 2 / Twenty",
+        "fpl-twenty",
+        "execution_verified",
+        "6cc857f",
+        "internal_validated",
+        &["soil"],
+        &["native"],
+    );
+    // The Factory sells websites. A Studio inventory view is optional platform work.
+    capability(
+        store,
+        now,
+        "website-factory.proposals",
+        "Website Factory proposals",
+        "Agent 4 / Website Factory",
+        "website-factory",
+        "execution_verified",
+        "86cfdc8",
+        "demo_ready",
+        &["studio"],
+        &["native", "commercial"],
     );
     capability(
         store,
@@ -172,6 +232,7 @@ fn seed_capabilities(store: &Adapter, now: i64) {
         "ed385ff",
         "internal_prototype",
         &["native"],
+        &[],
     );
 
     // The contract is a capability too, but it gates no execution layer yet.
@@ -207,7 +268,9 @@ fn verify(
     workload: &str,
     command: &str,
     evidence: &str,
+    acceptance: &str,
     limitations: &str,
+    reproduction: &str,
     observed_at: i64,
 ) {
     capability::verify(
@@ -220,7 +283,9 @@ fn verify(
             workload: workload.into(),
             command: command.into(),
             evidence: evidence.into(),
+            acceptance: acceptance.into(),
             limitations: limitations.into(),
+            reproduction: Some(reproduction.into()),
             observed_at: Some(observed_at),
             ..NewVerification::default()
         },
@@ -230,8 +295,6 @@ fn verify(
 }
 
 fn seed_verifications(store: &Adapter, now: i64) {
-    // The native baseline is the ledger's report. The commit is not in this checkout, so the
-    // record carries that limitation rather than pretending it was re-run.
     verify(
         store,
         now,
@@ -242,7 +305,9 @@ fn seed_verifications(store: &Adapter, now: i64) {
         "DFM",
         "transmog analyze",
         "integration ledger 2026-11-25; commit b33b2c3 not present in the local checkout",
+        "native analysis returns for the DFM workload",
         "reported, not independently audited",
+        "reported",
         now,
     );
 
@@ -256,7 +321,9 @@ fn seed_verifications(store: &Adapter, now: i64) {
         "5 stateless ops over a 361 KB STL",
         "transmog-batch sidecar",
         "commit b8c93fb4; plugins/transmog-batch",
+        "sidecar answers the stateless operations",
         "reported by the commit and its README, not re-run here",
+        "reported",
         now,
     );
     verify(
@@ -269,7 +336,9 @@ fn seed_verifications(store: &Adapter, now: i64) {
         "DFM, 369684-byte artifact",
         "loam provider call fpl:transmog analyze",
         "commit b8c93fb4; integration ledger 2026-11-25",
+        "DFM analysis returns; commercial quote validity is not asserted",
         "debug-native profile; one reported observation",
+        "reported",
         now,
     );
     verify(
@@ -282,12 +351,13 @@ fn seed_verifications(store: &Adapter, now: i64) {
         "quote, Taig profile",
         "loam provider call fpl:transmog quote",
         "commit b8c93fb4; integration ledger 2026-11-25",
-        "commercial quote validity not established",
+        "quote call executes; commercial validity not established",
+        "one reported observation",
+        "reported",
         now - 1,
     );
 
-    // The provider host landed after the ledger's baseline; these older observations are kept so
-    // the stale view can show why an earlier pass does not apply to the current revision.
+    // Older revisions stay in the trail and are visible as revision_mismatch, never inherited.
     verify(
         store,
         now,
@@ -298,7 +368,9 @@ fn seed_verifications(store: &Adapter, now: i64) {
         "provider call by interface and function name",
         "cargo test -p loam provider_host",
         "commit c4fc171",
+        "provider host resolves and calls by name",
         "superseded by f7313e5; not the current revision",
+        "reported",
         now,
     );
     verify(
@@ -311,7 +383,9 @@ fn seed_verifications(store: &Adapter, now: i64) {
         "composed runtime artefact identity",
         "cargo test -p loam runtime",
         "commit afd8dd0",
+        "composed artefact is verified, not trusted",
         "superseded by f7313e5; not the current revision",
+        "reported",
         now,
     );
     verify(
@@ -324,7 +398,9 @@ fn seed_verifications(store: &Adapter, now: i64) {
         "Soil defun calling (host-call \"fpl:transmog\" \"identity\")",
         "cargo test -p loam soil_providers",
         "commit f7313e5",
+        "identity reaches Soil; an ungranted interface is refused by name",
         "proves the identity call and marshalling; not a DFM or quote call through Soil",
+        "reported",
         now,
     );
 
@@ -338,7 +414,9 @@ fn seed_verifications(store: &Adapter, now: i64) {
         "OSM index, Nominatim hydration, resolve",
         "panopticon sidecar",
         "commit 7dcceff; provider/docs/DELIVERY.md",
+        "discovery and hydration answer from the NZ index",
         "reported by the provider delivery doc, not re-run here",
+        "reported",
         now,
     );
     verify(
@@ -351,7 +429,9 @@ fn seed_verifications(store: &Adapter, now: i64) {
         "real Loam consumer integration tests",
         "cargo test -p panopticon-provider-consumer",
         "commit 7dcceff; provider/consumer/tests/provider.rs",
+        "consumer imports fpl:panopticon and completes its calls",
         "Soil orchestration example is still labelled unverified",
+        "reported",
         now,
     );
 
@@ -365,7 +445,41 @@ fn seed_verifications(store: &Adapter, now: i64) {
         "gtm consumer imports fpl:twenty/crm",
         "cargo test -p fpl-twenty-consumer",
         "commit 8795eb1; consumer/",
-        "adapter and sidecar exercised against deployment config; no Soil path",
+        "typed CRM calls succeed through the adapter and sidecar",
+        "no Soil path; deployment config external",
+        "reported",
+        now,
+    );
+
+    verify(
+        store,
+        now,
+        "twenty.webhook-relay",
+        "native",
+        "pass",
+        "6cc857f",
+        "live Twenty company.created/updated -> relay -> Confluence -> Unibus -> Elmers",
+        "curl the relay with valid, invalid, and duplicate signatures",
+        "commit 6cc857f; docs/events.md evidence run",
+        "invalid signature 401; duplicate 202 duplicate=true with no second consumer run; retry after a 503 delivered exactly one event",
+        "reported by docs/events.md, not re-run here; relay is on a personal Cloudflare account; Confluence records the verifier family as github",
+        "reported",
+        now,
+    );
+
+    verify(
+        store,
+        now,
+        "website-factory.proposals",
+        "native",
+        "pass",
+        "86cfdc8",
+        "ten NZ manufacturer proposals, build + QA + audit",
+        "node src/factory.mjs profiles/<id>.json <archetype>",
+        "commit 86cfdc8; out/internal/buckley-systems/qa.json",
+        "qa.ok true, 21 checks, 0 failed; signed preview links; sales package produced",
+        "reported by repo artifacts; not re-run here; no business has been contacted",
+        "reported",
         now,
     );
 
@@ -377,9 +491,11 @@ fn seed_verifications(store: &Adapter, now: i64) {
         "pass",
         "ed385ff",
         "standalone Studio with a pinned Coherence project",
-        "studio build",
+        "npm test",
         "commit ed385ff",
+        "editor serves from the extracted repo",
         "no Soil or capability-view integration yet",
+        "reported",
         now,
     );
 }
@@ -470,6 +586,53 @@ fn seed_measurements(store: &Adapter, now: i64) {
         reported,
         now,
     );
+
+    // Actual timings from out/internal/buckley-systems/report.json at 86cfdc8.
+    let factory = "one report.json artifact; Node 26 local build";
+    measure(
+        "website-factory.proposals",
+        "proposal_build_ms",
+        36.0,
+        "ms",
+        "buckley-systems, automate preview",
+        "node-26",
+        "site rendered",
+        factory,
+        now,
+    );
+    measure(
+        "website-factory.proposals",
+        "proposal_qa_ms",
+        1.0,
+        "ms",
+        "buckley-systems, automate preview",
+        "node-26",
+        "21 checks, 0 failed",
+        factory,
+        now,
+    );
+    measure(
+        "website-factory.proposals",
+        "proposal_audit_ms",
+        13949.0,
+        "ms",
+        "buckley-systems, automate preview",
+        "node-26",
+        "existing-site audit completed (14 findings)",
+        factory,
+        now,
+    );
+    measure(
+        "website-factory.proposals",
+        "proposal_total_ms",
+        13987.0,
+        "ms",
+        "buckley-systems, automate preview",
+        "node-26",
+        "proposal packaged",
+        factory,
+        now,
+    );
 }
 
 fn seed_decisions(store: &Adapter, now: i64) {
@@ -529,14 +692,36 @@ fn seed_decisions(store: &Adapter, now: i64) {
         &["loam.provider-host"],
         &[],
     );
-    // Evidence for the supersession: f7313e5 enforces crate canon and lands the generic provider
-    // host in Loam rather than adding a parallel Soil implementation.
     decide(
         "DEC-014",
         "Loam owns the generic provider host; Soil consumes it",
         "accepted",
-        "The host needs the registry and grants, which already live in Loam. f7313e5 maps Value <-> WIT there and enforces crate canon, so DEC-010's unresolved ownership is settled by implementation.",
+        "The host needs the registry and grants, which already live in Loam. f7313e5 maps Value <-> WIT there and enforces crate canon.",
         &["loam.provider-host"],
         &["DEC-010"],
+    );
+    decide(
+        "DEC-015",
+        "Optional platform integrations do not gate commercial pilots",
+        "accepted",
+        "A missing Soil or Studio path is reported as a platform gap. It blocks platform readiness, not a customer pilot whose commercial gates are met.",
+        &[
+            "transmog.batch-provider",
+            "twenty.webhook-relay",
+            "website-factory.proposals",
+        ],
+        &[],
+    );
+    decide(
+        "DEC-016",
+        "Reported and reproduced evidence are recorded separately",
+        "accepted",
+        "A commit message, delivery log, or document is a reported observation. Only a re-run is reproduced. Both are useful; collapsing them loses the distinction.",
+        &[
+            "transmog.native",
+            "twenty.webhook-relay",
+            "website-factory.proposals",
+        ],
+        &[],
     );
 }
