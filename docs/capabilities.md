@@ -212,6 +212,11 @@ The Transmog provider is no longer listed by a missing Soil path: Soil is a plat
 its commercial gate (Loam execution) is a fresh pass. The Website Factory is listed because no
 customer acceptance exists yet — the commercial fact, not an optional integration.
 
+The seed also carries the quoting vertical from Quotron 3000 (`28b96fb`): a DXF waterjet RFQ
+priced against a pinned rate revision (`79.801 USD`, `23.169 in` cut path, `0.672 h` machine
+time, 5 pierces) with an internal-test PDF. Its commercial gate is still missing because no
+customer has accepted a quote.
+
 The `Loam` capability no longer carries the ledger's “Soil-to-WIT marshalling BLOCKED” row:
 `f7313e5` landed the generic provider host, and the record says what that test does and does not
 prove (an identity call, not a DFM or quote through Soil).

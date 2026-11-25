@@ -234,6 +234,20 @@ fn seed_capabilities(store: &Adapter, now: i64) {
         &["native"],
         &[],
     );
+    // The RFQ vertical is real, but the PDF is internal-test and no customer has accepted it.
+    capability(
+        store,
+        now,
+        "quoting.waterjet-rfq",
+        "Waterjet RFQ-to-quote vertical",
+        "Agent 5 / Quoting",
+        "quotron3000",
+        "execution_verified",
+        "28b96fb",
+        "demo_ready",
+        &["studio"],
+        &["native", "commercial"],
+    );
 
     // The contract is a capability too, but it gates no execution layer yet.
     capability::create(
@@ -498,6 +512,22 @@ fn seed_verifications(store: &Adapter, now: i64) {
         "reported",
         now,
     );
+
+    verify(
+        store,
+        now,
+        "quoting.waterjet-rfq",
+        "native",
+        "pass",
+        "28b96fb",
+        "DXF bracket waterjet RFQ, Mild Steel 0.25 in, qty 2",
+        "QUOTRON_BIN=.tools/quotron npm test",
+        "commit 28b96fb; docs/RFQ-VERTICAL.md; docs/artifacts/internal-test-quotation.pdf",
+        "price total 79.801 USD, calibration true, factory status eligible, internal-test PDF recorded in the outbox",
+        "internal-test PDF only; shop approval required; never sent to a customer; no customer acceptance recorded",
+        "reported",
+        now,
+    );
 }
 
 fn seed_measurements(store: &Adapter, now: i64) {
@@ -633,6 +663,53 @@ fn seed_measurements(store: &Adapter, now: i64) {
         factory,
         now,
     );
+
+    // Actual observed run from docs/RFQ-VERTICAL.md at 28b96fb.
+    let quoting = "one observed run; internal-test quotation; rate revision pinned and verified";
+    measure(
+        "quoting.waterjet-rfq",
+        "quote_total_usd",
+        79.801,
+        "usd",
+        "bracket.dxf, Mild Steel 0.25 in, qty 2",
+        "quotron 0.1.0, pinned rate revision",
+        "factory status eligible; internal-test PDF",
+        quoting,
+        now,
+    );
+    measure(
+        "quoting.waterjet-rfq",
+        "cut_path_in",
+        23.169,
+        "in",
+        "bracket.dxf",
+        "quotron 0.1.0",
+        "measurement reported by transmog-estimate via Quotron",
+        quoting,
+        now,
+    );
+    measure(
+        "quoting.waterjet-rfq",
+        "machine_time_h",
+        0.672,
+        "h",
+        "bracket.dxf, waterjet, qty 2",
+        "quotron 0.1.0",
+        "machine time priced",
+        quoting,
+        now,
+    );
+    measure(
+        "quoting.waterjet-rfq",
+        "pierces",
+        5.0,
+        "count",
+        "bracket.dxf",
+        "quotron 0.1.0",
+        "pierce count priced",
+        quoting,
+        now,
+    );
 }
 
 fn seed_decisions(store: &Adapter, now: i64) {
@@ -722,6 +799,14 @@ fn seed_decisions(store: &Adapter, now: i64) {
             "twenty.webhook-relay",
             "website-factory.proposals",
         ],
+        &[],
+    );
+    decide(
+        "DEC-017",
+        "Quotron owns price policy; Studio does not reimplement rates",
+        "accepted",
+        "Studio calls the existing Quotron waterjet CLI. Missing or changed rate records block; no price is invented. The internal-test PDF is not a customer quote.",
+        &["quoting.waterjet-rfq"],
         &[],
     );
 }

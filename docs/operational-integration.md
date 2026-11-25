@@ -82,6 +82,27 @@ measurements are store-wide because they outlive any one project.
 6. **Do not write through a read surface.** Any mutation stays on the claimed-work path
    (`mb claim`/`close`) or the explicit capability commands.
 
+## Lineage selection
+
+A task id belongs to exactly one store. Marbles has two legitimate single-writer lineages:
+the `soil:records` book that `mb` opens, and the native `~/.marbles/marbles.db` that the native
+`marbles` binary opens. They are not synchronized; a project must not be split across them.
+
+The connector must select one explicitly and report it:
+
+- `MYCELIUM_TASKS_LINEAGE=records` (default) reads the book named by
+  `~/.config/fungos/commands/mb.env`.
+- `MYCELIUM_TASKS_LINEAGE=native` reads the native SQLite store.
+
+`tasks_list` reports `lineage` and `other_lineage`. `tasks_get` reads the selected lineage, then
+probes the other read-only and returns `split_lineage: true` with a warning rather than a bare
+not-found. It never copies or writes the row. Neither lineage is silently preferred.
+
+A not-found is an ordinary exit, not a panic. The connector classifies the guest's terminal
+`mb: issue not found: …` / `marbles: no issue …` line even when an older loam printed a wasm
+backtrace first, and returns `kind: "not_found"` with the terminal line only. `unknown command`,
+`usage`, and `invalid` are `usage`; a real trap with no guest error line is `panic`.
+
 ## MCP surface
 
 The Mycelium MCP connector does not need a new protocol. It can expose one tool per record kind,
@@ -90,6 +111,7 @@ or one aggregate tool. Both call the same command:
 | tool | call | result |
 |---|---|---|
 | `marbles.inventory` | `mb inventory` | the object above |
+| `marbles.lineage` | `mb` policy + binary paths | which book/root/database is read |
 | `marbles.capabilities` | `mb capability list` | capability views |
 | `marbles.capability` | `mb capability show ID` | one capability plus its observations, measurements, decisions |
 | `marbles.verified` | `mb capability verified --layer L` | revisions that passed one layer, with freshness |
@@ -97,6 +119,7 @@ or one aggregate tool. Both call the same command:
 | `marbles.ready` | `mb ready` | unblocked, unclaimed work past grace |
 | `marbles.decisions` | part of `inventory` | decisions with status and supersession |
 | `marbles.baseline` | `mb capability baseline` | latest measurement per capability+metric |
+| `marbles.lineage` | read the shim policy; do not guess | selected book, records root, native database |
 
 An orchestration loop is then: `inventory` → choose a `ready_task` → `claim` → inspect the
 capability's evidence before assuming a revision is verified → `review`/`close` with a receipt.
@@ -124,6 +147,26 @@ renders:
 The view must not cache a projection into its own store, invent a readiness value, or hide
 `revision_mismatch`/`stale` rows. If Studio wants a writable action, it issues the same `mb`
 mutation under the same claim rules; it does not get a private write path.
+
+## Backend availability
+
+`mb capability …` and `mb inventory` are implemented in the Rust records CLI in this repository.
+The fleet's installed `mb` is currently the Soil-language port, which answers issue commands but
+not the capability surface; it reports `unknown command`. The connector maps that to
+`-32004 capability records are not available in the installed Marbles backend` with the exact
+required command, rather than exposing a wasm backtrace.
+
+Installing the Rust `mb` is gated on a healthy portable-target builder:
+
+```sh
+cargo check --target wasm32-wasip2 --no-default-features --features soil
+scripts/install-records-cli.sh --records-book personal/<you>/marbles
+```
+
+Until that install, capability evidence is staged in
+`examples/capability_ledger.rs` and cannot be persisted to the live book. Issue writes
+(`create`/`claim`/`review`/`close`) do work through the installed port and were exercised against
+a temporary book; no production task was modified.
 
 ## Versioning
 
