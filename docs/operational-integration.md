@@ -172,6 +172,12 @@ without `--force`).
 `mb inventory` is bounded by default: `--limit` caps ready tasks at 50 (max 200) and returns
 `ready_total`/`ready_truncated` so a caller can see what it did not receive.
 
+## Lineage migration
+
+The two lineages are not merged. See [`lineage-migration.md`](lineage-migration.md) for the
+proposed authoritative decision (DEC-018): the records book for new fleet work, the native store
+read-only historical, and per-issue explicit recreation with `external_ref` rather than a copy.
+
 ## Versioning
 
 The record bodies are `v0.x` and follow the same interface-first policy as the rest of Marbles.

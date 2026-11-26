@@ -282,4 +282,8 @@ dec DEC-017 "Quotron owns price policy; Studio does not reimplement rates" accep
     "Studio calls the existing Quotron waterjet CLI. Missing or changed rate records block; no price is invented. The internal-test PDF is not a customer quote." \
     "quoting.waterjet-rfq"
 
+dec DEC-018 "Records book is the authoritative lineage" proposed \
+    "New fleet work writes to the soil:records book. The native single-file store is read-only historical until each open issue is deliberately recreated with an external_ref to its native id; no rows are copied and no automatic merge is performed." \
+    ""
+
 echo "seeded capability ledger into the authorized records book"
