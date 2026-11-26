@@ -1142,6 +1142,7 @@ fn run(cli: &Cli, mode: &Mode) -> Result<(), String> {
                 available_at: None,
                 evidence: None,
                 metadata,
+                expected_version: None,
             };
             if let Some(assignee) = &args.assignee {
                 let receipt: ClaimReceipt = mode.call(|db| {

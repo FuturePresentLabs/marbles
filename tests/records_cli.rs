@@ -34,7 +34,7 @@ fn the_documented_agent_workflow_parses() {
     // uses: `mb ready --json`, `mb claim <id> --as <who>`, `mb review <id> --pr URL`.
     assert!(matches!(
         parse(&["ready", "--json"]).request,
-        Request::Ready
+        Request::Ready { .. }
     ));
     assert!(matches!(
         parse(&["claim", "marbles-1", "--as", "worker-1"]).request,

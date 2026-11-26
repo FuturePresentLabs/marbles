@@ -296,6 +296,38 @@ frontier before/after a claim — is captured in [`docs/plan-dag-demo.md`](docs/
 with the reproducer at [`docs/plan-dag-demo.sh`](docs/plan-dag-demo.sh) and the raw verbatim
 run in [`docs/plan-dag-demo.transcript.txt`](docs/plan-dag-demo.transcript.txt).
 
+## Capabilities and evidence
+
+A task is work; it closes. A **capability** is functionality that keeps existing across tasks —
+Transmog's native engine, the Panopticon provider, the Soil-to-provider bridge. Capabilities are
+typed records in the same store, with four independent axes (implementation progress, health,
+lifecycle, commercial readiness), per-layer verification bound to the revision it tested,
+structured measurements, and decisions that can supersede each other.
+
+```bash
+mb capability create transmog.batch-provider --title "Transmog batch provider" \
+  --implementation execution_verified --implementation-id b8c93fb4 \
+  --platform-gates soil --commercial-gates loam --commercial-readiness demo_ready
+mb capability verify transmog.batch-provider --layer loam --result pass \
+  --implementation-id b8c93fb4 --workload "DFM, 369684-byte artifact" \
+  --evidence "commit b8c93fb4" --acceptance "DFM analysis returns" \
+  --reproduction reported --limitations "reported, not re-run"
+
+mb capability verified --layer loam   # which revisions passed Loam execution?
+mb capability gaps --layer soil       # who lacks a fresh Soil pass?
+mb capability stale                   # what evidence is old or from another revision?
+mb capability pilot-blockers          # commercial gates still unmet?
+mb capability baseline                # the latest value of each metric
+mb inventory                          # capabilities + ready tasks + decisions + measurements
+```
+
+Platform gates (Soil, Studio) are reported but never block a commercial pilot; commercial gates
+do. A pass at revision A is never inherited by revision B: it becomes `revision_mismatch` and a
+gap. `reproduction` keeps `reported` (a commit or delivery log) distinct from `reproduced` (a
+re-run). Nothing is inferred from technical execution to commercial readiness. See
+[`docs/capabilities.md`](docs/capabilities.md) and
+[`docs/operational-integration.md`](docs/operational-integration.md).
+
 ## Identity
 
 The store has an Ed25519 identity: `marbles store identity init` creates it,
@@ -375,6 +407,12 @@ mb plan show|gantt|ready <plan>
 mb plan create <spec|-> [--dry-run]
 mb project rm <slug>
 mb doctor
+
+# Capabilities, evidence, measurements, decisions
+mb capability create|update|list|show|verify|measure|decide
+mb capability verified --layer L ; mb capability gaps --layer L
+mb capability stale ; mb capability pilot-blockers ; mb capability baseline
+mb [--project P] inventory [--max-age-days N]
 ```
 
 ## Migrating from Beads

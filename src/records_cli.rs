@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use crate::types::{ActorKind, Evidence};
 
 /// Everything a caller resolved before the request proper.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Invocation {
     /// Scope filter. `None` is every project, which is what `Store::list(None, ..)`
     /// already means: a project scopes a query, it is not required identity.
@@ -78,6 +78,23 @@ pub struct UpdateArgs {
     pub metadata: Option<String>,
     /// `key=value` sugar for one metadata key; `value` is stored as a JSON string.
     pub set_metadata: Option<(String, String)>,
+    /// If set, the update applies only when the current record revision matches.
+    pub expected_version: Option<u64>,
+}
+
+/// Bounded, read-only filters over the work graph. This is one scan with
+/// predicates, not a search index or a second store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchArgs {
+    pub query: Option<String>,
+    pub status: Option<String>,
+    pub issue_type: Option<String>,
+    pub assignee: Option<String>,
+    pub label: Option<String>,
+    pub ready: bool,
+    pub blocked: bool,
+    pub all: bool,
+    pub limit: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,17 +151,28 @@ pub enum PlanAction {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Request {
     List {
         all: bool,
         id: Option<String>,
         limit: i64,
     },
-    Ready,
+    Ready {
+        /// 0 means every ready issue, for compatibility with the native CLI.
+        limit: i64,
+    },
     Show {
         id: String,
     },
+    /// Current revision of one issue, for a caller that wants conditional writes.
+    Revision {
+        id: String,
+    },
+    /// Bounded read with predicates. No write, no index.
+    Search(Box<SearchArgs>),
+    /// The machine-readable command surface for a Spore or connector.
+    Manifest,
     Create(Box<CreateArgs>),
     Update(Box<UpdateArgs>),
     Claim {
@@ -211,7 +239,81 @@ pub enum Request {
         stale_days: i64,
     },
     Plan(PlanAction),
+    Capability(Box<CapabilityAction>),
+    /// One read-only answer for an orchestration agent: capabilities with evidence, ready work,
+    /// decisions, and the measurement baseline. No writes, no delivery, no new store.
+    Inventory {
+        max_age_days: i64,
+        limit: i64,
+    },
     Doctor,
+}
+
+/// The capability/evidence surface. Every variant is a read over the same typed records the
+/// mutating variants append to; none of them creates an issue, a project, or a second store.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CapabilityAction {
+    Create {
+        id: String,
+        patch: crate::capability::CapabilityPatch,
+    },
+    Update {
+        id: String,
+        patch: crate::capability::CapabilityPatch,
+    },
+    List {
+        implementation: Option<String>,
+        health: Option<String>,
+        commercial_readiness: Option<String>,
+        missing_layer: Option<String>,
+        stale: bool,
+        max_age_days: i64,
+    },
+    Show {
+        id: String,
+        max_age_days: i64,
+    },
+    Verify(crate::capability::NewVerification),
+    Measure(crate::capability::NewMeasurement),
+    Decide(crate::capability::NewDecision),
+    /// Independent observations of one layer, with the revision each tested.
+    Verified {
+        layer: Option<String>,
+        max_age_days: i64,
+    },
+    /// Required layers that are not a fresh pass.
+    Gaps {
+        layer: String,
+        max_age_days: i64,
+    },
+    /// Evidence that is too old or bound to a different revision.
+    Stale {
+        max_age_days: i64,
+    },
+    /// What stands between today and a commercial pilot.
+    PilotBlockers {
+        max_age_days: i64,
+    },
+    /// The latest observation of each (capability, metric) pair.
+    Baseline {
+        metric: Option<String>,
+    },
+}
+
+impl CapabilityAction {
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        matches!(
+            self,
+            CapabilityAction::List { .. }
+                | CapabilityAction::Show { .. }
+                | CapabilityAction::Verified { .. }
+                | CapabilityAction::Gaps { .. }
+                | CapabilityAction::Stale { .. }
+                | CapabilityAction::PilotBlockers { .. }
+                | CapabilityAction::Baseline { .. }
+        )
+    }
 }
 
 impl Request {
@@ -220,18 +322,25 @@ impl Request {
     /// retry until the next write.
     #[must_use]
     pub fn is_read_only(&self) -> bool {
-        matches!(
-            self,
-            Request::List { .. }
-                | Request::Ready
-                | Request::Show { .. }
-                | Request::History { .. }
-                | Request::Stats
-                | Request::Projects
-                | Request::Burndown { .. }
-                | Request::Portfolio { .. }
-                | Request::Doctor
-        )
+        match self {
+            Request::Capability(action) => action.is_read_only(),
+            Request::Inventory { .. } => true,
+            _ => matches!(
+                self,
+                Request::List { .. }
+                    | Request::Ready { .. }
+                    | Request::Show { .. }
+                    | Request::Revision { .. }
+                    | Request::Search { .. }
+                    | Request::Manifest
+                    | Request::History { .. }
+                    | Request::Stats
+                    | Request::Projects
+                    | Request::Burndown { .. }
+                    | Request::Portfolio { .. }
+                    | Request::Doctor
+            ),
+        }
     }
 }
 
@@ -239,6 +348,7 @@ impl Request {
 /// say what does work instead of echoing an unknown-word error.
 pub const COMMANDS: &[&str] = &[
     "burndown",
+    "capability",
     "claim",
     "close",
     "create",
@@ -248,14 +358,18 @@ pub const COMMANDS: &[&str] = &[
     "folder",
     "goal",
     "history",
+    "inventory",
     "label",
     "list",
+    "manifest",
     "plan",
     "portfolio",
     "project",
     "projects",
     "ready",
     "release",
+    "revision",
+    "search",
     "review",
     "show",
     "stats",
@@ -406,10 +520,31 @@ fn parse_command(name: &str, rest: &[String]) -> Result<Request, String> {
             }
             Ok(Request::List { all, id, limit })
         }
-        "ready" => no_flags(rest, Request::Ready),
+        "ready" => {
+            let mut limit = 0;
+            let mut index = 0;
+            while let Some(arg) = rest.get(index) {
+                match arg.as_str() {
+                    "--limit" => {
+                        limit = value(rest, index, "--limit")?
+                            .parse::<i64>()
+                            .map_err(|_| "--limit needs a number".to_string())?
+                            .clamp(0, 200);
+                        index += 2;
+                    }
+                    other => return Err(format!("unknown ready option {other}")),
+                }
+            }
+            Ok(Request::Ready { limit })
+        }
         "show" => Ok(Request::Show {
             id: positional(rest, 0, "show ID")?,
         }),
+        "revision" => Ok(Request::Revision {
+            id: positional(rest, 0, "revision ID")?,
+        }),
+        "manifest" => no_flags(rest, Request::Manifest),
+        "search" => Ok(Request::Search(Box::new(parse_search(rest)?))),
         "history" => Ok(Request::History {
             id: positional(rest, 0, "history ID")?,
         }),
@@ -566,6 +701,34 @@ fn parse_command(name: &str, rest: &[String]) -> Result<Request, String> {
         "burndown" => parse_burndown(rest),
         "portfolio" => parse_portfolio(rest),
         "plan" => parse_plan(rest),
+        "capability" => parse_capability(rest),
+        "inventory" => {
+            let mut max_age_days = 30;
+            let mut limit = 50;
+            let mut index = 0;
+            while let Some(arg) = rest.get(index) {
+                match arg.as_str() {
+                    "--max-age-days" => {
+                        max_age_days = value(rest, index, "--max-age-days")?
+                            .parse()
+                            .map_err(|_| "--max-age-days needs a number".to_string())?;
+                        index += 2;
+                    }
+                    "--limit" => {
+                        limit = value(rest, index, "--limit")?
+                            .parse::<i64>()
+                            .map_err(|_| "--limit needs a number".to_string())?
+                            .clamp(1, 200);
+                        index += 2;
+                    }
+                    other => return Err(format!("unknown inventory option {other}")),
+                }
+            }
+            Ok(Request::Inventory {
+                max_age_days,
+                limit,
+            })
+        }
         other => {
             if let Some((_, why)) = NATIVE_ONLY.iter().find(|(command, _)| *command == other) {
                 return Err(format!(
@@ -580,6 +743,66 @@ fn parse_command(name: &str, rest: &[String]) -> Result<Request, String> {
             ))
         }
     }
+}
+
+fn parse_search(rest: &[String]) -> Result<SearchArgs, String> {
+    let mut args = SearchArgs {
+        query: None,
+        status: None,
+        issue_type: None,
+        assignee: None,
+        label: None,
+        ready: false,
+        blocked: false,
+        all: false,
+        limit: 50,
+    };
+    let mut index = 0;
+    while let Some(arg) = rest.get(index) {
+        match arg.as_str() {
+            "--query" => {
+                args.query = Some(value(rest, index, "--query")?);
+                index += 2;
+            }
+            "--status" => {
+                args.status = Some(value(rest, index, "--status")?);
+                index += 2;
+            }
+            "--type" => {
+                args.issue_type = Some(value(rest, index, "--type")?);
+                index += 2;
+            }
+            "--assignee" => {
+                args.assignee = Some(value(rest, index, "--assignee")?);
+                index += 2;
+            }
+            "--label" => {
+                args.label = Some(value(rest, index, "--label")?);
+                index += 2;
+            }
+            "--ready" => {
+                args.ready = true;
+                index += 1;
+            }
+            "--blocked" => {
+                args.blocked = true;
+                index += 1;
+            }
+            "--all" => {
+                args.all = true;
+                index += 1;
+            }
+            "--limit" => {
+                args.limit = value(rest, index, "--limit")?
+                    .parse::<i64>()
+                    .map_err(|_| "--limit needs a number".to_string())?
+                    .clamp(1, 200);
+                index += 2;
+            }
+            other => return Err(format!("unknown search option {other}")),
+        }
+    }
+    Ok(args)
 }
 
 fn parse_create(rest: &[String]) -> Result<CreateArgs, String> {
@@ -696,6 +919,7 @@ fn parse_update(rest: &[String]) -> Result<UpdateArgs, String> {
         assignee: None,
         metadata: None,
         set_metadata: None,
+        expected_version: None,
     };
     let mut index = 1;
     while let Some(arg) = rest.get(index) {
@@ -738,6 +962,14 @@ fn parse_update(rest: &[String]) -> Result<UpdateArgs, String> {
                     .split_once('=')
                     .ok_or_else(|| format!("--set-metadata wants key=value, got {pair}"))?;
                 args.set_metadata = Some((key.to_string(), value.to_string()));
+                index += 2;
+            }
+            "--expect-revision" => {
+                args.expected_version = Some(
+                    value(rest, index, "--expect-revision")?
+                        .parse()
+                        .map_err(|_| "--expect-revision needs a number".to_string())?,
+                );
                 index += 2;
             }
             other => return Err(format!("unknown update option {other}")),
@@ -1110,6 +1342,417 @@ fn parse_plan(rest: &[String]) -> Result<Request, String> {
         )),
         None => Err("usage: mb plan show|gantt|ready|create".into()),
     }
+}
+
+fn parse_capability(rest: &[String]) -> Result<Request, String> {
+    use crate::capability::{CapabilityPatch, NewDecision, NewMeasurement, NewVerification};
+    let usage = "usage: mb capability create|update|list|show|verify|measure|decide|verified|gaps|stale|pilot-blockers|baseline";
+    let action = rest.first().map(String::as_str).ok_or(usage)?;
+    match action {
+        "create" | "update" => {
+            let id = positional(rest, 1, &format!("capability {action} ID"))?;
+            let mut patch = CapabilityPatch::default();
+            let mut index = 2;
+            while let Some(arg) = rest.get(index) {
+                match arg.as_str() {
+                    "--title" => {
+                        patch.title = Some(value(rest, index, "--title")?);
+                        index += 2;
+                    }
+                    "--owner" => {
+                        patch.owner = Some(value(rest, index, "--owner")?);
+                        index += 2;
+                    }
+                    "--project" => {
+                        patch.project = Some(value(rest, index, "--project")?);
+                        index += 2;
+                    }
+                    "-d" | "--description" => {
+                        patch.description = Some(value(rest, index, "--description")?);
+                        index += 2;
+                    }
+                    "--contract-version" => {
+                        patch.contract_version = Some(value(rest, index, "--contract-version")?);
+                        index += 2;
+                    }
+                    "--contract-maturity" => {
+                        patch.contract_maturity = Some(value(rest, index, "--contract-maturity")?);
+                        index += 2;
+                    }
+                    "--implementation" => {
+                        patch.implementation = Some(value(rest, index, "--implementation")?);
+                        index += 2;
+                    }
+                    "--health" => {
+                        patch.health = Some(value(rest, index, "--health")?);
+                        index += 2;
+                    }
+                    "--lifecycle" => {
+                        patch.lifecycle = Some(value(rest, index, "--lifecycle")?);
+                        index += 2;
+                    }
+                    "--commercial-readiness" => {
+                        patch.commercial_readiness =
+                            Some(value(rest, index, "--commercial-readiness")?);
+                        index += 2;
+                    }
+                    "--implementation-id" => {
+                        patch.implementation_id = Some(value(rest, index, "--implementation-id")?);
+                        index += 2;
+                    }
+                    "--required-layers" | "--platform-gates" => {
+                        patch.required_layers = Some(split_csv(&value(rest, index, arg)?));
+                        index += 2;
+                    }
+                    "--commercial-gates" => {
+                        patch.commercial_gates =
+                            Some(split_csv(&value(rest, index, "--commercial-gates a,b")?));
+                        index += 2;
+                    }
+                    "--superseded-by" => {
+                        patch.superseded_by = Some(value(rest, index, "--superseded-by")?);
+                        index += 2;
+                    }
+                    other => return Err(format!("unknown capability {action} option {other}")),
+                }
+            }
+            Ok(Request::Capability(Box::new(if action == "create" {
+                CapabilityAction::Create { id, patch }
+            } else {
+                CapabilityAction::Update { id, patch }
+            })))
+        }
+        "list" => {
+            let mut implementation = None;
+            let mut health = None;
+            let mut commercial_readiness = None;
+            let mut missing_layer = None;
+            let mut stale = false;
+            let mut max_age_days = 30;
+            let mut index = 1;
+            while let Some(arg) = rest.get(index) {
+                match arg.as_str() {
+                    "--implementation" => {
+                        implementation = Some(value(rest, index, "--implementation")?);
+                        index += 2;
+                    }
+                    "--health" => {
+                        health = Some(value(rest, index, "--health")?);
+                        index += 2;
+                    }
+                    "--commercial-readiness" => {
+                        commercial_readiness = Some(value(rest, index, "--commercial-readiness")?);
+                        index += 2;
+                    }
+                    "--missing-layer" => {
+                        missing_layer = Some(value(rest, index, "--missing-layer")?);
+                        index += 2;
+                    }
+                    "--stale" => {
+                        stale = true;
+                        index += 1;
+                    }
+                    "--max-age-days" => {
+                        max_age_days = value(rest, index, "--max-age-days")?
+                            .parse()
+                            .map_err(|_| "--max-age-days needs a number".to_string())?;
+                        index += 2;
+                    }
+                    other => return Err(format!("unknown capability list option {other}")),
+                }
+            }
+            Ok(Request::Capability(Box::new(CapabilityAction::List {
+                implementation,
+                health,
+                commercial_readiness,
+                missing_layer,
+                stale,
+                max_age_days,
+            })))
+        }
+        "show" => {
+            let id = positional(rest, 1, "capability show ID")?;
+            let max_age_days = max_age_flag(rest, 2, "capability show")?;
+            Ok(Request::Capability(Box::new(CapabilityAction::Show {
+                id,
+                max_age_days,
+            })))
+        }
+        "verify" => {
+            let mut spec = NewVerification {
+                capability_id: positional(rest, 1, "capability verify ID")?,
+                ..NewVerification::default()
+            };
+            let mut index = 2;
+            while let Some(arg) = rest.get(index) {
+                match arg.as_str() {
+                    "--layer" => {
+                        spec.layer = value(rest, index, "--layer")?;
+                        index += 2;
+                    }
+                    "--result" => {
+                        spec.result = value(rest, index, "--result")?;
+                        index += 2;
+                    }
+                    "--implementation-id" => {
+                        spec.implementation_id = value(rest, index, "--implementation-id")?;
+                        index += 2;
+                    }
+                    "--artifact-digest" => {
+                        spec.artifact_digest = value(rest, index, "--artifact-digest")?;
+                        index += 2;
+                    }
+                    "--workload" => {
+                        spec.workload = value(rest, index, "--workload")?;
+                        index += 2;
+                    }
+                    "--command" => {
+                        spec.command = value(rest, index, "--command")?;
+                        index += 2;
+                    }
+                    "--evidence" => {
+                        spec.evidence = value(rest, index, "--evidence")?;
+                        index += 2;
+                    }
+                    "--limitations" => {
+                        spec.limitations = value(rest, index, "--limitations")?;
+                        index += 2;
+                    }
+                    "--verifier" => {
+                        spec.verifier = value(rest, index, "--verifier")?;
+                        index += 2;
+                    }
+                    "--reproduction" => {
+                        spec.reproduction = Some(value(rest, index, "--reproduction")?);
+                        index += 2;
+                    }
+                    "--acceptance" => {
+                        spec.acceptance = value(rest, index, "--acceptance")?;
+                        index += 2;
+                    }
+                    "--observed-at" => {
+                        spec.observed_at = Some(epoch_flag(rest, index, "--observed-at")?);
+                        index += 2;
+                    }
+                    other => return Err(format!("unknown capability verify option {other}")),
+                }
+            }
+            Ok(Request::Capability(Box::new(CapabilityAction::Verify(
+                spec,
+            ))))
+        }
+        "measure" => {
+            let mut spec = NewMeasurement {
+                capability_id: positional(rest, 1, "capability measure ID")?,
+                ..NewMeasurement::default()
+            };
+            let mut index = 2;
+            while let Some(arg) = rest.get(index) {
+                match arg.as_str() {
+                    "--metric" => {
+                        spec.metric = value(rest, index, "--metric")?;
+                        index += 2;
+                    }
+                    "--value" => {
+                        spec.value = value(rest, index, "--value")?
+                            .parse()
+                            .map_err(|_| "--value needs a number".to_string())?;
+                        index += 2;
+                    }
+                    "--unit" => {
+                        spec.unit = value(rest, index, "--unit")?;
+                        index += 2;
+                    }
+                    "--workload" => {
+                        spec.workload = value(rest, index, "--workload")?;
+                        index += 2;
+                    }
+                    "--profile" => {
+                        spec.profile = value(rest, index, "--profile")?;
+                        index += 2;
+                    }
+                    "--samples" => {
+                        spec.samples = Some(
+                            value(rest, index, "--samples")?
+                                .parse()
+                                .map_err(|_| "--samples needs a number".to_string())?,
+                        );
+                        index += 2;
+                    }
+                    "--outcome" => {
+                        spec.domain_outcome = value(rest, index, "--outcome")?;
+                        index += 2;
+                    }
+                    "--evidence" => {
+                        spec.evidence = value(rest, index, "--evidence")?;
+                        index += 2;
+                    }
+                    "--limitations" => {
+                        spec.limitations = value(rest, index, "--limitations")?;
+                        index += 2;
+                    }
+                    "--observed-at" => {
+                        spec.observed_at = Some(epoch_flag(rest, index, "--observed-at")?);
+                        index += 2;
+                    }
+                    other => return Err(format!("unknown capability measure option {other}")),
+                }
+            }
+            Ok(Request::Capability(Box::new(CapabilityAction::Measure(
+                spec,
+            ))))
+        }
+        "decide" => {
+            let mut spec = NewDecision {
+                id: positional(rest, 1, "capability decide ID")?,
+                ..NewDecision::default()
+            };
+            let mut index = 2;
+            while let Some(arg) = rest.get(index) {
+                match arg.as_str() {
+                    "--title" => {
+                        spec.title = value(rest, index, "--title")?;
+                        index += 2;
+                    }
+                    "--status" => {
+                        spec.status = value(rest, index, "--status")?;
+                        index += 2;
+                    }
+                    "--rationale" => {
+                        spec.rationale = value(rest, index, "--rationale")?;
+                        index += 2;
+                    }
+                    "--owner" => {
+                        spec.owner = value(rest, index, "--owner")?;
+                        index += 2;
+                    }
+                    "--affects" => {
+                        spec.affects = split_csv(&value(rest, index, "--affects a,b")?);
+                        index += 2;
+                    }
+                    "--evidence" => {
+                        spec.evidence = value(rest, index, "--evidence")?;
+                        index += 2;
+                    }
+                    "--supersedes" => {
+                        spec.supersedes = split_csv(&value(rest, index, "--supersedes a,b")?);
+                        index += 2;
+                    }
+                    "--decided-at" => {
+                        spec.decided_at = Some(epoch_flag(rest, index, "--decided-at")?);
+                        index += 2;
+                    }
+                    other => return Err(format!("unknown capability decide option {other}")),
+                }
+            }
+            Ok(Request::Capability(Box::new(CapabilityAction::Decide(
+                spec,
+            ))))
+        }
+        "verified" => {
+            let mut layer = None;
+            let mut max_age_days = 30;
+            let mut index = 1;
+            while let Some(arg) = rest.get(index) {
+                match arg.as_str() {
+                    "--layer" => {
+                        layer = Some(value(rest, index, "--layer")?);
+                        index += 2;
+                    }
+                    "--max-age-days" => {
+                        max_age_days = value(rest, index, "--max-age-days")?
+                            .parse()
+                            .map_err(|_| "--max-age-days needs a number".to_string())?;
+                        index += 2;
+                    }
+                    other => return Err(format!("unknown capability verified option {other}")),
+                }
+            }
+            Ok(Request::Capability(Box::new(CapabilityAction::Verified {
+                layer,
+                max_age_days,
+            })))
+        }
+        "gaps" => {
+            let mut layer = None;
+            let mut max_age_days = 30;
+            let mut index = 1;
+            while let Some(arg) = rest.get(index) {
+                match arg.as_str() {
+                    "--layer" => {
+                        layer = Some(value(rest, index, "--layer")?);
+                        index += 2;
+                    }
+                    "--max-age-days" => {
+                        max_age_days = value(rest, index, "--max-age-days")?
+                            .parse()
+                            .map_err(|_| "--max-age-days needs a number".to_string())?;
+                        index += 2;
+                    }
+                    other => return Err(format!("unknown capability gaps option {other}")),
+                }
+            }
+            Ok(Request::Capability(Box::new(CapabilityAction::Gaps {
+                layer: layer.ok_or("capability gaps needs --layer LAYER")?,
+                max_age_days,
+            })))
+        }
+        "stale" => {
+            let max_age_days = max_age_flag(rest, 1, "capability stale")?;
+            Ok(Request::Capability(Box::new(CapabilityAction::Stale {
+                max_age_days,
+            })))
+        }
+        "pilot-blockers" => {
+            let max_age_days = max_age_flag(rest, 1, "capability pilot-blockers")?;
+            Ok(Request::Capability(Box::new(
+                CapabilityAction::PilotBlockers { max_age_days },
+            )))
+        }
+        "baseline" => {
+            let mut metric = None;
+            let mut index = 1;
+            while let Some(arg) = rest.get(index) {
+                match arg.as_str() {
+                    "--metric" => {
+                        metric = Some(value(rest, index, "--metric")?);
+                        index += 2;
+                    }
+                    other => return Err(format!("unknown capability baseline option {other}")),
+                }
+            }
+            Ok(Request::Capability(Box::new(CapabilityAction::Baseline {
+                metric,
+            })))
+        }
+        other => Err(format!(
+            "unknown capability action {other}; use create/update/list/show/verify/measure/decide/verified/gaps/stale/pilot-blockers/baseline"
+        )),
+    }
+}
+
+/// `--max-age-days N` starting at `index`; 30 days when absent.
+fn max_age_flag(rest: &[String], index: usize, command: &str) -> Result<i64, String> {
+    let mut days = 30;
+    let mut index = index;
+    while let Some(arg) = rest.get(index) {
+        match arg.as_str() {
+            "--max-age-days" => {
+                days = value(rest, index, "--max-age-days")?
+                    .parse()
+                    .map_err(|_| "--max-age-days needs a number".to_string())?;
+                index += 2;
+            }
+            other => return Err(format!("unknown {command} option {other}")),
+        }
+    }
+    Ok(days)
+}
+
+fn epoch_flag(rest: &[String], index: usize, flag: &str) -> Result<i64, String> {
+    value(rest, index, flag)?
+        .parse()
+        .map_err(|_| format!("{flag} needs epoch seconds"))
 }
 
 fn no_flags(rest: &[String], request: Request) -> Result<Request, String> {
