@@ -306,3 +306,112 @@ fn a_write_without_a_project_says_which_switch_it_needs() {
     let error = records_exec::execute(&store, &invocation, NOW).unwrap_err();
     assert!(error.contains("--project"), "{error}");
 }
+
+#[test]
+fn revision_is_exposed_and_a_stale_update_is_refused() {
+    let store = Adapter::in_memory().unwrap();
+    let id = ids(&run(
+        &store,
+        &["create", "conditional", "--available-at", "0"],
+    ))
+    .remove(0);
+    let first = run(&store, &["revision", &id]);
+    let revision = first["revision"].as_u64().expect("revision");
+    assert!(revision > 0);
+
+    let error = invoke(
+        &store,
+        &[
+            "update",
+            &id,
+            "--priority",
+            "1",
+            "--expect-revision",
+            &(revision - 1).to_string(),
+        ],
+    )
+    .expect_err("stale revision");
+    assert!(error.contains("revision conflict"), "{error}");
+
+    let updated = run(
+        &store,
+        &[
+            "update",
+            &id,
+            "--priority",
+            "1",
+            "--expect-revision",
+            &revision.to_string(),
+        ],
+    );
+    assert_eq!(updated["priority"], 1);
+
+    let replayed = invoke(
+        &store,
+        &[
+            "update",
+            &id,
+            "--priority",
+            "2",
+            "--expect-revision",
+            &revision.to_string(),
+        ],
+    )
+    .expect_err("the revision has moved");
+    assert!(replayed.contains("revision conflict"), "{replayed}");
+}
+
+#[test]
+fn search_filters_are_bounded_and_do_not_claim_a_total() {
+    let store = Adapter::in_memory().unwrap();
+    let a = ids(&run(
+        &store,
+        &[
+            "create",
+            "alpha ship",
+            "--available-at",
+            "0",
+            "--labels",
+            "sdk",
+        ],
+    ))
+    .remove(0);
+    let b = ids(&run(
+        &store,
+        &["create", "beta quote", "--available-at", "0"],
+    ))
+    .remove(0);
+    run(&store, &["update", &b, "--status", "blocked"]);
+
+    let hits = run(&store, &["search", "--query", "ship", "--limit", "1"]);
+    assert_eq!(hits.as_array().unwrap().len(), 1);
+    assert_eq!(hits[0]["id"], a);
+
+    let blocked = run(&store, &["search", "--blocked", "--limit", "10"]);
+    assert_eq!(blocked.as_array().unwrap().len(), 1);
+    assert_eq!(blocked[0]["id"], b);
+
+    let labelled = run(&store, &["search", "--label", "sdk", "--limit", "10"]);
+    assert_eq!(labelled.as_array().unwrap().len(), 1);
+    assert_eq!(labelled[0]["id"], a);
+}
+
+#[test]
+fn manifest_exports_the_operation_and_authority_contract() {
+    let store = Adapter::in_memory().unwrap();
+    let manifest = run(&store, &["manifest"]);
+    assert_eq!(manifest["schema"], "marbles.command-manifest/1");
+    assert_eq!(manifest["lineage"], "records");
+    let operations = manifest["operations"].as_array().expect("operations");
+    let update = operations
+        .iter()
+        .find(|op| op["name"] == "update")
+        .expect("update operation");
+    assert_eq!(update["mode"], "routine_write");
+    assert_eq!(update["cas"], "--expect-revision");
+    let close = operations
+        .iter()
+        .find(|op| op["name"] == "close")
+        .expect("close operation");
+    assert_eq!(close["mode"], "sensitive");
+}

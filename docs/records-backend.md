@@ -63,8 +63,8 @@ not the only place the surface is written down.
 
 ```text
 burndown claim close create dep doctor epic folder goal history label list
-plan portfolio project projects ready release review show stats supersede
-sweep task touch update
+manifest plan portfolio project projects ready release revision review search
+show stats supersede sweep task touch update
 ```
 
 Rules that matter:
@@ -74,6 +74,13 @@ Rules that matter:
   command that needs one, and says so.
 - `show` prints a one-element array, because Beads clients and `soil-marbles`
   parse `show --json` as a list.
+- `search` is a bounded scan with `--query`, `--status`, `--type`,
+  `--assignee`, `--label`, `--ready`, `--blocked`, `--all`, and `--limit`. It
+  returns a page, not a total; the caller owns the cursor.
+- `revision ID` returns `{id, revision, origin}`. `update --expect-revision N`
+  is a conditional write: a stale revision is refused, never overwritten.
+- `manifest` exports the command/authority contract (`marbles.command-manifest/1`)
+  for a Spore or MCP gateway. It describes commands; it grants nothing.
 - `--json` is accepted anywhere; every answer is already JSON.
 - `--url`, `--token`, `--token-file` are refused by name. This build talks to
   the store the host opened, not to an endpoint of the caller's choosing.

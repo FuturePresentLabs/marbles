@@ -78,6 +78,23 @@ pub struct UpdateArgs {
     pub metadata: Option<String>,
     /// `key=value` sugar for one metadata key; `value` is stored as a JSON string.
     pub set_metadata: Option<(String, String)>,
+    /// If set, the update applies only when the current record revision matches.
+    pub expected_version: Option<u64>,
+}
+
+/// Bounded, read-only filters over the work graph. This is one scan with
+/// predicates, not a search index or a second store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchArgs {
+    pub query: Option<String>,
+    pub status: Option<String>,
+    pub issue_type: Option<String>,
+    pub assignee: Option<String>,
+    pub label: Option<String>,
+    pub ready: bool,
+    pub blocked: bool,
+    pub all: bool,
+    pub limit: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,10 +158,21 @@ pub enum Request {
         id: Option<String>,
         limit: i64,
     },
-    Ready,
+    Ready {
+        /// 0 means every ready issue, for compatibility with the native CLI.
+        limit: i64,
+    },
     Show {
         id: String,
     },
+    /// Current revision of one issue, for a caller that wants conditional writes.
+    Revision {
+        id: String,
+    },
+    /// Bounded read with predicates. No write, no index.
+    Search(Box<SearchArgs>),
+    /// The machine-readable command surface for a Spore or connector.
+    Manifest,
     Create(Box<CreateArgs>),
     Update(Box<UpdateArgs>),
     Claim {
@@ -300,8 +328,11 @@ impl Request {
             _ => matches!(
                 self,
                 Request::List { .. }
-                    | Request::Ready
+                    | Request::Ready { .. }
                     | Request::Show { .. }
+                    | Request::Revision { .. }
+                    | Request::Search { .. }
+                    | Request::Manifest
                     | Request::History { .. }
                     | Request::Stats
                     | Request::Projects
@@ -330,12 +361,15 @@ pub const COMMANDS: &[&str] = &[
     "inventory",
     "label",
     "list",
+    "manifest",
     "plan",
     "portfolio",
     "project",
     "projects",
     "ready",
     "release",
+    "revision",
+    "search",
     "review",
     "show",
     "stats",
@@ -486,10 +520,31 @@ fn parse_command(name: &str, rest: &[String]) -> Result<Request, String> {
             }
             Ok(Request::List { all, id, limit })
         }
-        "ready" => no_flags(rest, Request::Ready),
+        "ready" => {
+            let mut limit = 0;
+            let mut index = 0;
+            while let Some(arg) = rest.get(index) {
+                match arg.as_str() {
+                    "--limit" => {
+                        limit = value(rest, index, "--limit")?
+                            .parse::<i64>()
+                            .map_err(|_| "--limit needs a number".to_string())?
+                            .clamp(0, 200);
+                        index += 2;
+                    }
+                    other => return Err(format!("unknown ready option {other}")),
+                }
+            }
+            Ok(Request::Ready { limit })
+        }
         "show" => Ok(Request::Show {
             id: positional(rest, 0, "show ID")?,
         }),
+        "revision" => Ok(Request::Revision {
+            id: positional(rest, 0, "revision ID")?,
+        }),
+        "manifest" => no_flags(rest, Request::Manifest),
+        "search" => Ok(Request::Search(Box::new(parse_search(rest)?))),
         "history" => Ok(Request::History {
             id: positional(rest, 0, "history ID")?,
         }),
@@ -690,6 +745,66 @@ fn parse_command(name: &str, rest: &[String]) -> Result<Request, String> {
     }
 }
 
+fn parse_search(rest: &[String]) -> Result<SearchArgs, String> {
+    let mut args = SearchArgs {
+        query: None,
+        status: None,
+        issue_type: None,
+        assignee: None,
+        label: None,
+        ready: false,
+        blocked: false,
+        all: false,
+        limit: 50,
+    };
+    let mut index = 0;
+    while let Some(arg) = rest.get(index) {
+        match arg.as_str() {
+            "--query" => {
+                args.query = Some(value(rest, index, "--query")?);
+                index += 2;
+            }
+            "--status" => {
+                args.status = Some(value(rest, index, "--status")?);
+                index += 2;
+            }
+            "--type" => {
+                args.issue_type = Some(value(rest, index, "--type")?);
+                index += 2;
+            }
+            "--assignee" => {
+                args.assignee = Some(value(rest, index, "--assignee")?);
+                index += 2;
+            }
+            "--label" => {
+                args.label = Some(value(rest, index, "--label")?);
+                index += 2;
+            }
+            "--ready" => {
+                args.ready = true;
+                index += 1;
+            }
+            "--blocked" => {
+                args.blocked = true;
+                index += 1;
+            }
+            "--all" => {
+                args.all = true;
+                index += 1;
+            }
+            "--limit" => {
+                args.limit = value(rest, index, "--limit")?
+                    .parse::<i64>()
+                    .map_err(|_| "--limit needs a number".to_string())?
+                    .clamp(1, 200);
+                index += 2;
+            }
+            other => return Err(format!("unknown search option {other}")),
+        }
+    }
+    Ok(args)
+}
+
 fn parse_create(rest: &[String]) -> Result<CreateArgs, String> {
     let mut args = CreateArgs {
         title: positional(rest, 0, "create TITLE")?,
@@ -804,6 +919,7 @@ fn parse_update(rest: &[String]) -> Result<UpdateArgs, String> {
         assignee: None,
         metadata: None,
         set_metadata: None,
+        expected_version: None,
     };
     let mut index = 1;
     while let Some(arg) = rest.get(index) {
@@ -846,6 +962,14 @@ fn parse_update(rest: &[String]) -> Result<UpdateArgs, String> {
                     .split_once('=')
                     .ok_or_else(|| format!("--set-metadata wants key=value, got {pair}"))?;
                 args.set_metadata = Some((key.to_string(), value.to_string()));
+                index += 2;
+            }
+            "--expect-revision" => {
+                args.expected_version = Some(
+                    value(rest, index, "--expect-revision")?
+                        .parse()
+                        .map_err(|_| "--expect-revision needs a number".to_string())?,
+                );
                 index += 2;
             }
             other => return Err(format!("unknown update option {other}")),

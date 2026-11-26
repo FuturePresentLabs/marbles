@@ -25,6 +25,7 @@ pub mod identity;
 pub mod import;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod jsonl;
+pub mod manifest;
 // Plans are a view over ordinary issues and dependencies, and the portfolio and
 // burndown reports are pure functions over `Issue`. Both are portable, so the
 // wasm Spore answers the same commands as the native CLI.

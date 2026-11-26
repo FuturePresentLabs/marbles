@@ -190,6 +190,12 @@ impl Adapter {
         g.store_id.clone()
     }
 
+    /// Current revision of one issue. A caller that wants a conditional write
+    /// reads this first and passes it back as `expected_version`.
+    pub fn issue_version(&self, id: &str) -> Result<crate::records::Version> {
+        self.lock().issue_version(id)
+    }
+
     /// Lock the store for the duration of one operation. Every mutation and read goes through
     /// here, so calls are serialized the way `Db.tx` / `Db.query` serialize against the one
     /// SQLite connection.
@@ -1106,7 +1112,24 @@ impl Inner {
         // SQLite wrote the recomputed expression into the `available_at` column, so persist it
         // too: a substantive edit defers swarm visibility by `edit_deferral_seconds`.
         current.available_at = Some(available_at);
-        self.save_issue(&current)?;
+        if let Some(expected) = patch.expected_version {
+            let actual = self.issue_version(id)?;
+            if actual.revision != expected {
+                return Err(Error::Bad(format!(
+                    "revision conflict for {id}: expected {expected}, current {}",
+                    actual.revision
+                )));
+            }
+            if !self.save_issue_cas(&current, actual)? {
+                let latest = self.issue_version(id)?;
+                return Err(Error::Bad(format!(
+                    "revision conflict for {id}: expected {expected}, current {}",
+                    latest.revision
+                )));
+            }
+        } else {
+            self.save_issue(&current)?;
+        }
         if status_changed {
             self.log_event(id, at, actor, "status", &format!("→ {}", current.status))?;
         }

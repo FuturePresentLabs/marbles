@@ -117,6 +117,9 @@ or one aggregate tool. Both call the same command:
 | `marbles.verified` | `mb capability verified --layer L` | revisions that passed one layer, with freshness |
 | `marbles.pilot_blockers` | `mb capability pilot-blockers` | commercial blockers only |
 | `marbles.ready` | `mb ready` | unblocked, unclaimed work past grace |
+| `marbles.search` | `mb search --query/--status/--type/--assignee/--label/--ready/--blocked --limit` | bounded filtered page; no total |
+| `marbles.revision` | `mb revision ID` | current revision for a conditional write |
+| `marbles.manifest` | `mb manifest` | command/authority contract for gateway discovery |
 | `marbles.decisions` | part of `inventory` | decisions with status and supersession |
 | `marbles.baseline` | `mb capability baseline` | latest measurement per capability+metric |
 | `marbles.lineage` | read the shim policy; do not guess | selected book, records root, native database |
@@ -124,6 +127,29 @@ or one aggregate tool. Both call the same command:
 An orchestration loop is then: `inventory` → choose a `ready_task` → `claim` → inspect the
 capability's evidence before assuming a revision is verified → `review`/`close` with a receipt.
 The capability surface never makes a claim or starts a run.
+
+## Grooming writes through a connector
+
+Read, routine write, and sensitive operations are separate grants:
+
+- **read** is `mcp:read` plus the task-project ACL; a list with no project is
+  labelled store-wide and bounded, never presented as a total.
+- **routine write** is `mcp:tasks:write` plus an explicit project grant. It covers
+  create, update priority/status/title/description/metadata, dependency edges,
+  claim/touch/release, and a bounded bulk apply.
+- **sensitive** is `mcp:tasks:sensitive` plus an explicit approval. Close is a
+  separate tool; `update --status closed`, bulk close, merge, and migration are
+  refused.
+
+`update --expect-revision N` is the CAS gate. `create --id ID` is the idempotency
+gate; a connector derives a stable id from its idempotency key. A bulk plan is a
+dry-run by default, returns before/after diffs, is capped at 20 operations, and
+stops at the first failure. The audit actor is recorded by the normal
+`marbles_event` path; the connector does not add a second audit store.
+
+`mb manifest` (`marbles.command-manifest/1`) is the export a Spore or gateway
+reads for operation names, scope, CAS/idempotency, and authority. It is
+descriptive data and cannot grant authority.
 
 **Authority boundary.** The MCP connector authenticates the caller (Edgerunner grant or the host's
 policy) and passes only a project/actor scope. It must not accept an endpoint, book path, or

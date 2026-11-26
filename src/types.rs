@@ -208,6 +208,9 @@ pub struct IssuePatch {
     /// Shallow-merged into the stored metadata; null values remove their key.
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+    /// Apply only if the current record revision matches this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 
 use crate::adapter::Adapter;
 use crate::capability;
+use crate::manifest;
 use crate::plan;
 use crate::records_cli::{
     CapabilityAction, CreateArgs, FolderAction, GoalAction, Invocation, PlanAction, Request,
@@ -37,11 +38,77 @@ pub fn execute(store: &Adapter, invocation: &Invocation, now: i64) -> Result<Val
             }
             value(&issues)
         }
-        Request::Ready => value(&store.ready(project, now).map_err(err)?),
+        Request::Ready { limit } => {
+            let mut issues = store.ready(project, now).map_err(err)?;
+            if *limit > 0 {
+                issues.truncate(*limit as usize);
+            }
+            value(&issues)
+        }
         // A one-element array: the native CLI prints this shape because Beads
         // clients parse `show --json` as a list, and `soil-marbles` reads it that
         // way too. The records backend answers the same contract.
         Request::Show { id } => value(&[store.get(id).map_err(err)?]),
+        Request::Revision { id } => {
+            let version = store.issue_version(id).map_err(err)?;
+            Ok(json!({
+                "id": id,
+                "revision": version.revision,
+                "origin": version.origin,
+            }))
+        }
+        Request::Search(args) => {
+            let mut issues = if args.ready {
+                store.ready(project, now).map_err(err)?
+            } else {
+                store.list(project, args.all, None).map_err(err)?
+            };
+            let query = args.query.as_deref().map(str::to_lowercase);
+            issues.retain(|issue| {
+                if let Some(status) = &args.status
+                    && &issue.status != status
+                {
+                    return false;
+                }
+                if let Some(kind) = &args.issue_type
+                    && &issue.issue_type != kind
+                {
+                    return false;
+                }
+                if let Some(assignee) = &args.assignee
+                    && issue.assignee.as_deref() != Some(assignee.as_str())
+                {
+                    return false;
+                }
+                if let Some(label) = &args.label
+                    && !issue.labels.iter().any(|value| value == label)
+                {
+                    return false;
+                }
+                if args.blocked && !(issue.status == "blocked" || issue.dependency_count > 0) {
+                    return false;
+                }
+                if let Some(query) = &query {
+                    let haystack = format!(
+                        "{} {} {} {}",
+                        issue.id,
+                        issue.title,
+                        issue.description,
+                        issue.labels.join(" ")
+                    )
+                    .to_lowercase();
+                    if !haystack.contains(query) {
+                        return false;
+                    }
+                }
+                true
+            });
+            if args.limit > 0 {
+                issues.truncate(args.limit as usize);
+            }
+            value(&issues)
+        }
+        Request::Manifest => Ok(manifest::export()),
         Request::Create(args) => {
             let slug = require_project(project, "create")?;
             ensure_project(store, slug, invocation.prefix.as_deref())?;
@@ -353,6 +420,7 @@ fn update(store: &Adapter, args: &UpdateArgs, actor: &str, now: i64) -> Result<V
                 available_at: None,
                 evidence: None,
                 metadata,
+                expected_version: args.expected_version,
             },
             actor,
             now,
