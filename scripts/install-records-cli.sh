@@ -27,6 +27,7 @@ COMMAND_ROOT=${FUNGOS_COMMAND_ROOT:-$HOME/.local/share/fungos/commands}
 BIN_DIR=${MARBLES_BIN_DIR:-$HOME/.local/bin}
 POLICY=${XDG_CONFIG_HOME:-$HOME/.config}/fungos/commands/mb.env
 SOIL_COMMAND=${SOIL_COMMAND:-}
+UNIBUS_CONFIG=${UNIBUS_CONFIG:-}
 DRY_RUN=no
 
 need() { [ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; }; }
@@ -44,6 +45,12 @@ while [ $# -gt 0 ]; do
         *) echo "unknown option $1" >&2; exit 2 ;;
     esac
 done
+
+# Preserve the bus binding across reinstalls. The previous policy is the authority; an empty
+# value would silently stop publishing without failing the command.
+if [ -z "$UNIBUS_CONFIG" ] && [ -r "$POLICY" ]; then
+    UNIBUS_CONFIG=$(sed -n 's/^UNIBUS_CONFIG=//p' "$POLICY" | head -n 1 | tr -d '\"' | tr -d "'")
+fi
 
 if [ -z "$BOOK" ]; then
     # Seed from the binding Mush already uses, so the two cannot disagree by
@@ -126,7 +133,8 @@ else
     mkdir -p "$(dirname "$POLICY")"
     sed -e "s|@RECORDS_ROOT@|$RECORDS_ROOT|" \
         -e "s|@RECORDS_BOOK@|$BOOK|" \
-        -e "s|@RECORDS_COLLECTION@|$COLLECTION|" > "$POLICY" <<'POLICY'
+        -e "s|@RECORDS_COLLECTION@|$COLLECTION|" \
+        -e "s|@UNIBUS_CONFIG@|$UNIBUS_CONFIG|" > "$POLICY" <<'POLICY'
 # Written by marbles scripts/install-records-cli.sh; read by the shim that
 # `soil-command shims` generates for this command. The environment overrides
 # any of the RECORDS_* values below.
@@ -136,7 +144,7 @@ RECORDS_COLLECTION="@RECORDS_COLLECTION@"
 # Optional: a soil-sdk-unibus client config. When set, `mb` publishes its
 # outbox after each successful write; without it the queue stays durable and
 # `mb` still works.
-UNIBUS_CONFIG=${UNIBUS_CONFIG:-}
+UNIBUS_CONFIG="@UNIBUS_CONFIG@"
 export UNIBUS_CONFIG
 # The variables the command may see. The shim forwards exactly these, by name.
 FUNGOS_COMMAND_ENV="MARBLES_ACTOR MARBLES_PROJECT"
