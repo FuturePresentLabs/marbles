@@ -51,7 +51,7 @@ pub fn export() -> Value {
             {
                 "name": "ready",
                 "mode": "read",
-                "args": ["--project"],
+                "args": ["--project", "--limit"],
                 "result": "array of ready issues"
             },
             {
