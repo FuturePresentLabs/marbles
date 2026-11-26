@@ -151,22 +151,26 @@ mutation under the same claim rules; it does not get a private write path.
 ## Backend availability
 
 `mb capability …` and `mb inventory` are implemented in the Rust records CLI in this repository.
-The fleet's installed `mb` is currently the Soil-language port, which answers issue commands but
-not the capability surface; it reports `unknown command`. The connector maps that to
-`-32004 capability records are not available in the installed Marbles backend` with the exact
-required command, rather than exposing a wasm backtrace.
+The live command is now that spore (module SHA-256
+`89e25ba15680d9dfd32b5b4c0c3ce53d00e6b82086ab98c948658460bbd6299c`, built from the
+`capability-evidence` branch for `wasm32-wasip2`). The previous Soil-language port is preserved
+as `~/.local/share/fungos/commands/mb/module.wasm.before-capability-<timestamp>` for rollback.
 
-Installing the Rust `mb` is gated on a healthy portable-target builder:
+Build and install, with the fix that lets bob pass the "already remote" marker through the
+builder limiter:
 
 ```sh
-cargo check --target wasm32-wasip2 --no-default-features --features soil
+fpl-bob remote --host <builder> --artifact target/wasm32-wasip2/release/mb.wasm --   cargo build --release --target wasm32-wasip2 --no-default-features --features soil --bin mb
 scripts/install-records-cli.sh --records-book personal/<you>/marbles
 ```
 
-Until that install, capability evidence is staged in
-`examples/capability_ledger.rs` and cannot be persisted to the live book. Issue writes
-(`create`/`claim`/`review`/`close`) do work through the installed port and were exercised against
-a temporary book; no production task was modified.
+Verify against a throwaway command root and book before the live install by setting
+`XDG_CONFIG_HOME`, `FUNGOS_COMMAND_ROOT`, `MARBLES_BIN_DIR`, and `FUNGOS_RECORDS_ROOT`; the
+script honours all four. The live seed is `docs/capability-ledger-seed.sh` (refuses a second run
+without `--force`).
+
+`mb inventory` is bounded by default: `--limit` caps ready tasks at 50 (max 200) and returns
+`ready_total`/`ready_truncated` so a caller can see what it did not receive.
 
 ## Versioning
 

@@ -216,6 +216,7 @@ pub enum Request {
     /// decisions, and the measurement baseline. No writes, no delivery, no new store.
     Inventory {
         max_age_days: i64,
+        limit: i64,
     },
     Doctor,
 }
@@ -648,6 +649,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<Request, String> {
         "capability" => parse_capability(rest),
         "inventory" => {
             let mut max_age_days = 30;
+            let mut limit = 50;
             let mut index = 0;
             while let Some(arg) = rest.get(index) {
                 match arg.as_str() {
@@ -657,10 +659,20 @@ fn parse_command(name: &str, rest: &[String]) -> Result<Request, String> {
                             .map_err(|_| "--max-age-days needs a number".to_string())?;
                         index += 2;
                     }
+                    "--limit" => {
+                        limit = value(rest, index, "--limit")?
+                            .parse::<i64>()
+                            .map_err(|_| "--limit needs a number".to_string())?
+                            .clamp(1, 200);
+                        index += 2;
+                    }
                     other => return Err(format!("unknown inventory option {other}")),
                 }
             }
-            Ok(Request::Inventory { max_age_days })
+            Ok(Request::Inventory {
+                max_age_days,
+                limit,
+            })
         }
         other => {
             if let Some((_, why)) = NATIVE_ONLY.iter().find(|(command, _)| *command == other) {

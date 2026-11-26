@@ -176,13 +176,19 @@ pub fn execute(store: &Adapter, invocation: &Invocation, now: i64) -> Result<Val
             now,
         ),
         Request::Capability(action) => capability_command(store, action, now),
-        Request::Inventory { max_age_days } => {
+        Request::Inventory {
+            max_age_days,
+            limit,
+        } => {
             if *max_age_days < 0 {
                 return Err("--max-age-days cannot be negative".into());
             }
             let max_age = max_age_days * 24 * 60 * 60;
             let capabilities = capability::views(store, now, max_age);
-            let ready = store.ready(project, now).map_err(err)?;
+            let mut ready = store.ready(project, now).map_err(err)?;
+            let ready_total = ready.len();
+            let limit = (*limit).clamp(1, 200) as usize;
+            ready.truncate(limit);
             let decisions = capability::decisions(store);
             let measurements = capability::baseline(store, None);
             Ok(json!({
@@ -192,6 +198,8 @@ pub fn execute(store: &Adapter, invocation: &Invocation, now: i64) -> Result<Val
                 "counts": {
                     "capabilities": capabilities.len(),
                     "ready_tasks": ready.len(),
+                    "ready_total": ready_total,
+                    "ready_truncated": ready_total > ready.len(),
                     "decisions": decisions.len(),
                     "measurements": measurements.len(),
                 },

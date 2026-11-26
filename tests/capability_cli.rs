@@ -193,6 +193,7 @@ fn inventory_is_one_read_only_call_for_an_orchestrator() {
     seed(&store);
     let inventory = run(&store, &["inventory"]);
     assert_eq!(inventory["counts"]["capabilities"], 1);
+    assert_eq!(inventory["counts"]["ready_total"], 0);
     assert_eq!(
         inventory["capabilities"][0]["id"],
         "transmog.batch-provider"

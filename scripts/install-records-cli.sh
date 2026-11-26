@@ -77,8 +77,11 @@ run() {
 command -v cargo >/dev/null 2>&1 || { echo "cargo is required to build mb.wasm" >&2; exit 2; }
 
 echo "building mb.wasm (wasm32-wasip2, --features soil)"
-run cargo build --release --target wasm32-wasip2 --no-default-features --features soil \
-    --manifest-path "$REPO/Cargo.toml" --bin mb
+# Run from the repo root rather than passing an absolute --manifest-path: bob ships the
+# tree to a builder under a different path, and an absolute local manifest does not
+# exist there. The tree root is the one path that means the same thing on both sides.
+cd "$REPO"
+run cargo build --release --target wasm32-wasip2 --no-default-features --features soil --bin mb
 
 WASM=$REPO/target/wasm32-wasip2/release/mb.wasm
 [ "$DRY_RUN" = yes ] || [ -f "$WASM" ] || { echo "build produced no $WASM" >&2; exit 1; }
